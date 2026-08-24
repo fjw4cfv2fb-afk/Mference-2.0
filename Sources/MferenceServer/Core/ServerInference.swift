@@ -194,7 +194,8 @@ public actor ServerModelSession: ServerInferenceBackend {
 
     public static func load(modelDirectory: URL,
                             maxContext: Int,
-                            promptCacheMode: ServerPromptCacheMode = .singlePrefix) async throws -> ServerModelSession {
+                            promptCacheMode: ServerPromptCacheMode = .singlePrefix,
+                            expertCacheSlots: Int = 32) async throws -> ServerModelSession {
         let family = try ManifestReader.peekFamily(directoryURL: modelDirectory)
         let tokenizerFolder = MFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
@@ -215,18 +216,8 @@ public actor ServerModelSession: ServerInferenceBackend {
             throw MFTokenizerError.missingToolTemplate
         }
         let context = try MetalContext()
-        let streamingMode = RuntimeConfiguration.defaultExpertStreamingMode(
-            for: family,
-            expertPoolBytes: try ExpertPoolInspector.poolByteSize(
-                directoryURL: modelDirectory),
-            coreWeightsBytes: try ExpertPoolInspector.coreWeightsByteSize(
-                directoryURL: modelDirectory))
-        let configSlots: Int
-        switch streamingMode {
-        case .pread(let slots): configSlots = slots
-        case .resident:
-            configSlots = RuntimeConfiguration.allowedExpertCacheSlots.max()!
-        }
+        let streamingMode: ExpertStreamingMode = .pread(slotCount: expertCacheSlots)
+        let configSlots = expertCacheSlots
         let runtime = RuntimeConfiguration(
             expertCacheSlots: configSlots,
             forceLogitsHead: true)
