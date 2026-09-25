@@ -22,6 +22,20 @@ enum GTurboJSON {
         var routedExpert: Int
     }
 
+    /// The W2.1b provenance an original-repo install carries. The quantizer
+    /// nucleus is shared, so the qwen36 measurement covers every family that
+    /// has no control of its own; a family measured against its own vendor
+    /// control records that measurement instead (docs/QUANTIZER_QUALITY.md).
+    static func qualityGateStamp(for family: RepackModelFamily) -> String {
+        switch family {
+        case .minicpm5:
+            return "W2.1b-weight+kld-2026-09-10-vs-openbmb-MiniCPM5-2B-MLX"
+        case .gemma4, .qwen36, .qwen38, .deepseekV4Flash, .inklingSmall, .maple,
+             .qwen38flashnext, .glm53Flash:
+            return "W2.1b-weight+kld-2026-09-02-vs-mlx-community-qwen36"
+        }
+    }
+
     static func encodeManifest(plan: RepackPlan,
                                       modelID: String,
                                       sourceSnapshotHash: String,
@@ -130,6 +144,71 @@ enum GTurboJSON {
             archDict["numDenseLayers"] = arch.numDenseLayers
             archDict["denseIntermediateSize"] = arch.denseIntermediateSize
         }
+        // MiniCPM5: the same dense trio, plus the one axis it is the first
+        // family to set away from the default. Emitted for this family only,
+        // so every other manifest stays byte-identical.
+        if arch.family == .minicpm5 {
+            archDict["numSharedExperts"] = arch.numSharedExperts
+            archDict["numDenseLayers"] = arch.numDenseLayers
+            archDict["denseIntermediateSize"] = arch.denseIntermediateSize
+            archDict["qkNorm"] = arch.qkNorm
+        }
+        // Qwen3.8-Flash-Next: the covered axes are value changes the non-Gemma
+        // block above already publishes. These are the three NEW axes, written
+        // under their own names plus a `requiredAxes` list, so a runtime that
+        // cannot execute them can say which ones it is missing instead of
+        // reporting an unrecognised family.
+        // GLM-5.3-Flash: the low-rank query rank and indexer head shape ride
+        // the V4 `ca*` keys, the KDA geometry the `linear*` keys (already
+        // emitted above), mHC and router fields their DSV4 keys, the dense
+        // leading layers the Inkling keys, then its own axes and the
+        // `requiredAxes` list the capability gate refuses it by.
+        if arch.family == .glm53Flash, let axes = arch.glm53 {
+            archDict["caQLoraRank"] = arch.caQLoraRank
+            archDict["caIndexNHeads"] = arch.caIndexNHeads
+            archDict["caIndexHeadDim"] = arch.caIndexHeadDim
+            archDict["caIndexTopK"] = arch.caIndexTopK
+            archDict["hcMult"] = arch.hcMult
+            archDict["hcSinkhornIters"] = arch.hcSinkhornIters
+            archDict["hcEps"] = arch.hcEps
+            archDict["numHashRoutedLayers"] = arch.numHashRoutedLayers
+            archDict["routerScoringFunc"] = arch.routerScoringFunc
+            archDict["routedScalingFactor"] = arch.routedScalingFactor
+            archDict["swigluLimit"] = arch.swigluLimit
+            archDict["numSharedExperts"] = arch.numSharedExperts
+            archDict["numDenseLayers"] = arch.numDenseLayers
+            archDict["denseIntermediateSize"] = arch.denseIntermediateSize
+            archDict["routerGateBias"] = arch.routerGateBias
+            archDict["routerNormAfterTopK"] = arch.routerNormAfterTopK
+            archDict["qkNorm"] = arch.qkNorm
+            archDict["kvLoraRank"] = axes.kvLoraRank
+            archDict["qkNopeHeadDim"] = axes.qkNopeHeadDim
+            archDict["vHeadDim"] = axes.vHeadDim
+            archDict["indexKPool"] = axes.indexKPool
+            archDict["indexKPoolAlwaysSelectTail"] = axes.indexKPoolAlwaysSelectTail
+            archDict["indexerKNormEps"] = axes.indexerKNormEps
+            archDict["kdaGateLowerBound"] = axes.kdaGateLowerBound
+            archDict["rmsNormEps"] = axes.rmsNormEps
+            archDict["unpaddedVocabSize"] = arch.unpaddedVocabSize
+            archDict["requiredAxes"] = Glm53Axes.requiredAxisNames
+        }
+        if arch.family == .qwen38flashnext, let axes = arch.flashNext {
+            archDict["numSharedExperts"] = arch.numSharedExperts
+            archDict["numDenseLayers"] = arch.numDenseLayers
+            archDict["unpaddedVocabSize"] = arch.unpaddedVocabSize
+            archDict["hcCount"] = axes.hcCount
+            archDict["hcLowRank"] = axes.hcLowRank
+            archDict["indexerNumHeads"] = axes.indexerNumHeads
+            archDict["indexerHeadDim"] = axes.indexerHeadDim
+            archDict["indexerNumKVHeads"] = axes.indexerNumKVHeads
+            archDict["indexerBudget"] = axes.indexerBudget
+            archDict["indexerCompressRatio"] = axes.indexerCompressRatio
+            archDict["pleLayerIDs"] = axes.pleLayerIDs
+            archDict["pleNgramShardCount"] = axes.pleNgramShardCount
+            archDict["pleNgramVocabSizeBase"] = axes.pleNgramVocabSizeBase
+            archDict["pleConvKernelSize"] = axes.pleConvKernelSize
+            archDict["requiredAxes"] = FlashNextAxes.requiredAxisNames
+        }
         if arch.family == .maple {
             archDict["routerScoringFunc"] = arch.routerScoringFunc
             archDict["routedScalingFactor"] = arch.routedScalingFactor
@@ -158,7 +237,19 @@ enum GTurboJSON {
         // Dense family: there is no router, shared expert or routed expert to
         // quantize. Mark the slots absent (Maple's sharedExpert convention);
         // embedding/attention keep the affine INT4 entries from the loop.
-        if arch.family == .qwen38 {
+        // GLM-5.3-Flash's router gate is unquantized BF16; the manifest
+        // records the slot as such rather than the 8-bit default a BF16
+        // tensor would otherwise leave in place.
+        if arch.family == .glm53Flash {
+            quantDict["router"] = [
+                "weightBits": 16,
+                "scheme": "unquantized",
+                "scaleType": "none",
+                "biasType": "none",
+                "groupSize": 0,
+            ]
+        }
+        if arch.family == .qwen38 || arch.family == .minicpm5 {
             let absent: [String: Any] = [
                 "weightBits": 0,
                 "scheme": "none",
@@ -227,6 +318,64 @@ enum GTurboJSON {
             "expertStride": expertStride,
             "bitWidthOverridesHonored": plan.bitsOverrideCount
         ]
+        // --- Additive blocks. Every family that predates them emits none of
+        // these keys, so existing manifests stay byte-identical.
+        if plan.quantizedAtInstall {
+            var quantized: [String: Any] = [
+                "scheme": "affine",
+                // The base width. A mixed-width install records its overrides
+                // below rather than changing this, so the field keeps meaning
+                // the same thing it always did.
+                "weightBits": 4,
+                "groupSize": StreamingInt4Quantizer.groupSize,
+                "sourceDtype": "BF16",
+                // Gate W2.1a is enforced in CI. W2.1b now records BOTH halves;
+                // the string names the control, the method and the date so an
+                // install carries its own provenance rather than a bare "pass".
+                // Both halves are measured on the shared
+                // `Int4AffineEncoder.encodeGroup` nucleus every original-repo
+                // family funnels through, which is why the stamp is not
+                // per-family. Method and numbers: docs/QUANTIZER_QUALITY.md.
+                "parityGate": "W2.1a-bit-parity",
+                "qualityGate": qualityGateStamp(for: arch.family),
+            ]
+            if plan.bitsOverrideCount > 0 {
+                quantized["overrideWeightBits"] = 8
+                quantized["overriddenTensorCount"] = plan.bitsOverrideCount
+            }
+            manifest["quantizedAtInstall"] = quantized
+        }
+        if !plan.sidecarOutcomes.isEmpty {
+            var sidecars: [String: Any] = [:]
+            for outcome in plan.sidecarOutcomes {
+                sidecars[outcome.group] = [
+                    "carried": outcome.carried,
+                    "tensorCount": outcome.tensorCount,
+                ]
+            }
+            manifest["sidecars"] = sidecars
+        }
+        if !plan.auxiliaryExpertPools.isEmpty {
+            manifest["auxiliaryExpertPools"] = plan.auxiliaryExpertPools.map { pool in
+                [
+                    "name": pool.name,
+                    "directory": pool.directoryName,
+                    "expertsPerLayer": pool.layers.first(where: { $0.expertsPerLayer > 0 })?
+                        .expertsPerLayer ?? 0,
+                    "expertStride": pool.layers.first(where: { $0.expertsPerLayer > 0 })?
+                        .expertStride ?? 0,
+                    "layers": pool.layers.filter { $0.expertsPerLayer > 0 }.map {
+                        [
+                            "layer": $0.layerIndex,
+                            "file": ($0.path as NSString).lastPathComponent,
+                        ] as [String: Any]
+                    },
+                ] as [String: Any]
+            }
+        }
+        if !plan.plePools.isEmpty {
+            manifest["plePool"] = encodePlePools(plan.plePools)
+        }
         if let flashHead = plan.flashHead {
             manifest["flashHead"] = [
                 "nClusters": flashHead.nClusters,
@@ -242,6 +391,52 @@ enum GTurboJSON {
         }
         return try JSONSerialization.data(withJSONObject: manifest,
             options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
+    }
+
+    /// The additive `plePool` manifest block. `kind` names the pool format so a
+    /// future revision can be told apart; readers must refuse an unknown kind.
+    ///
+    /// Row `i` of shard `s` lives at
+    /// `shards[s].offset + (i / rowsPerBlock) * blockStride + (i % rowsPerBlock) * rowStride`.
+    /// A row's record is `[rowWeightBytes | rowScaleBytes | rowBiasBytes]` — for
+    /// a BF16 pool the companion sizes are 0 and the record is just the raw row.
+    /// Blocks are page-aligned and rows never straddle a page, so one row costs
+    /// one page fault and a cached page serves `rowsPerBlock` neighbours.
+    static func encodePlePools(_ pools: [PleRowPoolPlan]) -> [String: Any] {
+        [
+            "kind": "rowLookupPoolV1",
+            "layers": pools.map { pool in
+                let quantized = pool.storage == .int4AffineG64
+                return [
+                    "layer": pool.layerIndex,
+                    "file": pool.relativePath,
+                    "sourceTensor": pool.sourceTensorPrefix,
+                    "rows": pool.totalRows,
+                    "rowDim": pool.rowDim,
+                    "storage": pool.storage.rawValue,
+                    "weightBits": pool.bits,
+                    "scheme": quantized ? "affine" : "none",
+                    "scaleType": quantized ? "BF16" : "none",
+                    "biasType": quantized ? "BF16" : "none",
+                    "groupSize": pool.groupSize,
+                    "rowWeightBytes": pool.rowWeightBytes,
+                    "rowScaleBytes": pool.rowCompanionBytes,
+                    "rowBiasBytes": pool.rowCompanionBytes,
+                    "rowStride": pool.rowStride,
+                    "rowsPerBlock": pool.rowsPerBlock,
+                    "blockStride": pool.blockStride,
+                    "fileSize": pool.fileSize,
+                    "shards": pool.shards.map {
+                        [
+                            "shard": $0.shardIndex,
+                            "rows": $0.rows,
+                            "offset": $0.regionOffset,
+                            "size": $0.regionBytes,
+                        ] as [String: Any]
+                    },
+                ] as [String: Any]
+            },
+        ]
     }
 
     static func encodeLayout(plan: RepackPlan,

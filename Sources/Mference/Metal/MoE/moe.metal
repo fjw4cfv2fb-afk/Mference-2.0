@@ -2,7 +2,14 @@
 using namespace metal;
 
 constant constexpr uint kMoEGroupSize = 64;
+// The widest routed tile the DeepSeek-V4 chunked-prefill kernels bind. Unchanged
+// at 8: it bounds `DSV4PrefillRoute.local_slot`, not the argument-buffer array.
 constant constexpr uint kMaxStreamedExperts = 8;
+// Slots in the `RoutedBlobs` argument buffer. Flash-Next routes top-10, so the
+// array is 10 wide; every shipped family binds a prefix of it (6 or 8) and every
+// kernel indexes only `slot < top_k`, so the widening is layout-only — the extra
+// pointers are never dereferenced by a family that does not set them.
+constant constexpr uint kRoutedBlobSlots = 10;
 constant constexpr float kGeluSqrt2OverPi = 0.7978845608028654f;
 constant constexpr float kGeluCubicCoeff = 0.044715f;
 
@@ -96,7 +103,7 @@ struct ExpertOffsets {
 };
 
 struct RoutedBlobs {
-    device const uint8_t* blob[kMaxStreamedExperts];
+    device const uint8_t* blob[kRoutedBlobSlots];
 };
 
 static inline void router_gemv_gemma4_body(
@@ -187,35 +194,45 @@ kernel void router_gemv_bf16_r4(
 // Serial single-thread selection. Superseded in production by the one-SIMD
 // `_par` kernels below; kept because the parity tests compare the parallel
 // results against it bit for bit.
-kernel void router_topk_select_k8(
-    device const float* logits [[buffer(0)]],
-    device const bfloat* per_expert_scale [[buffer(1)]],
-    device uint* out_indices [[buffer(2)]],
-    device half* out_weights [[buffer(3)]],
-    constant uint& num_experts [[buffer(4)]],
-    uint tid [[thread_position_in_threadgroup]]
+//
+// The body is templated on K so the shipped k8 path and the Flash-Next k10 path
+// are the *same* arithmetic in the same order — widening the top-k must not be
+// an opportunity to drift. K is the only degree of freedom; the ascending
+// insertion scan, the `-INFINITY` initialization, the lowest-index tie rule and
+// the softmax-over-the-selected tail are all shared verbatim.
+//
+// Note on semantics: softmax over ALL experts followed by top-k of the probs and
+// a renormalization over the k (the `norm_topk_prob` convention Qwen 3.6 and
+// Qwen4-Exp both use) is algebraically identical to this softmax over the k
+// selected logits, because softmax is strictly monotone in the logit. The port
+// relies on that identity rather than materializing a full prob vector.
+template <uint K>
+static inline void router_topk_select_softmax_serial(
+    device const float* logits,
+    device const bfloat* per_expert_scale,
+    device uint* out_indices,
+    device half* out_weights,
+    uint NE
 ) {
-    if (tid != 0) return;
-    const uint NE = router_fc_num_experts(num_experts);
-    uint top_idx[8];
-    float top_score[8];
-    for (uint i = 0; i < 8; ++i) {
+    uint top_idx[K];
+    float top_score[K];
+    for (uint i = 0; i < K; ++i) {
         top_idx[i] = 0u;
         top_score[i] = -INFINITY;
     }
 
     for (uint e = 0; e < NE; ++e) {
         const float s = logits[e];
-        if (s <= top_score[7]) continue;
-        uint pos = 8u;
-        for (uint i = 0; i < 8; ++i) {
+        if (s <= top_score[K - 1]) continue;
+        uint pos = K;
+        for (uint i = 0; i < K; ++i) {
             if (s > top_score[i] || (s == top_score[i] && e < top_idx[i])) {
                 pos = i;
                 break;
             }
         }
-        if (pos >= 8u) continue;
-        for (uint i = 7; i > pos; --i) {
+        if (pos >= K) continue;
+        for (uint i = K - 1; i > pos; --i) {
             top_idx[i] = top_idx[i - 1];
             top_score[i] = top_score[i - 1];
         }
@@ -225,18 +242,48 @@ kernel void router_topk_select_k8(
 
     const float max_s = top_score[0];
     float sum_exp = 0.0f;
-    float exps[8];
-    for (uint i = 0; i < 8; ++i) {
+    float exps[K];
+    for (uint i = 0; i < K; ++i) {
         const float ex = fast::exp(top_score[i] - max_s);
         exps[i] = ex;
         sum_exp += ex;
     }
-    for (uint i = 0; i < 8; ++i) {
+    for (uint i = 0; i < K; ++i) {
         const uint expert_idx = top_idx[i];
         const float weight = exps[i] / sum_exp;
         out_indices[i] = expert_idx;
         out_weights[i] = half(weight * float(per_expert_scale[expert_idx]));
     }
+}
+
+kernel void router_topk_select_k8(
+    device const float* logits [[buffer(0)]],
+    device const bfloat* per_expert_scale [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device half* out_weights [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    router_topk_select_softmax_serial<8>(
+        logits, per_expert_scale, out_indices, out_weights,
+        router_fc_num_experts(num_experts));
+}
+
+// Flash-Next (`qwen4_exp`): 512 experts, top-10. Same selection and weighting as
+// k8 — only K differs.
+kernel void router_topk_select_k10(
+    device const float* logits [[buffer(0)]],
+    device const bfloat* per_expert_scale [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device half* out_weights [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0) return;
+    router_topk_select_softmax_serial<10>(
+        logits, per_expert_scale, out_indices, out_weights,
+        router_fc_num_experts(num_experts));
 }
 
 // --- One-SIMD parallel top-k selection ------------------------------------
@@ -257,6 +304,10 @@ kernel void router_topk_select_k8(
 // The normalization tail stays serial on lane 0 with the same operations in the
 // same order, so the emitted weights match bit for bit.
 constant constexpr uint kRouterMaxPerLane = 8;   // num_experts <= 256
+// Flash-Next routes over 512 experts, which is 16 per lane across the SIMD. The
+// wide bound is a separate constant so the shipped k6/k8 kernels keep their
+// eight-element lane array and their register footprint unchanged.
+constant constexpr uint kRouterWideMaxPerLane = 16;   // num_experts <= 512
 constant constexpr uint kRouterNoWinner = 0xFFFFFFFFu;
 
 static inline uint router_select_next_one_simd(
@@ -288,38 +339,41 @@ static inline uint router_select_next_one_simd(
     return bi;
 }
 
-kernel void router_topk_select_k8_par(
-    device const float* logits [[buffer(0)]],
-    device const bfloat* per_expert_scale [[buffer(1)]],
-    device uint* out_indices [[buffer(2)]],
-    device half* out_weights [[buffer(3)]],
-    constant uint& num_experts [[buffer(4)]],
-    uint sg_idx [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]
+// `MAXPERLANE` bounds the lane-local candidate array (and therefore the expert
+// count the kernel accepts); `K` is the top-k width. Both are compile-time so
+// the arrays stay in registers.
+template <uint K, uint MAXPERLANE>
+static inline void router_topk_select_softmax_par(
+    device const float* logits,
+    device const bfloat* per_expert_scale,
+    device uint* out_indices,
+    device half* out_weights,
+    uint NE,
+    uint sg_idx,
+    uint lane
 ) {
-    const uint NE = router_fc_num_experts(num_experts);
     // Out-of-contract dispatches are a visible no-op, never an OOB write.
-    if (sg_idx != 0u || NE > 32u * kRouterMaxPerLane) return;
+    if (sg_idx != 0u || NE > 32u * MAXPERLANE) return;
 
     const uint per = (NE + 31u) / 32u;
     const uint base = lane * per;
-    float ch[kRouterMaxPerLane];
+    float ch[MAXPERLANE];
     for (uint j = 0; j < per; ++j) {
         const uint e = base + j;
         ch[j] = (e < NE) ? logits[e] : -INFINITY;
     }
 
     uint taken = 0u;
-    uint top_idx[8];
-    for (uint k = 0; k < 8; ++k) {
+    uint top_idx[K];
+    for (uint k = 0; k < K; ++k) {
         top_idx[k] = router_select_next_one_simd(ch, taken, per, base);
     }
     if (lane != 0u) return;
 
     // Fewer experts than K leaves trailing steps without a winner. The serial
     // kernel leaves those slots at index 0 with score -INFINITY; mirror that.
-    float top_score[8];
-    for (uint i = 0; i < 8; ++i) {
+    float top_score[K];
+    for (uint i = 0; i < K; ++i) {
         if (top_idx[i] == kRouterNoWinner) {
             top_idx[i] = 0u;
             top_score[i] = -INFINITY;
@@ -330,18 +384,84 @@ kernel void router_topk_select_k8_par(
 
     const float max_s = top_score[0];
     float sum_exp = 0.0f;
-    float exps[8];
-    for (uint i = 0; i < 8; ++i) {
+    float exps[K];
+    for (uint i = 0; i < K; ++i) {
         const float ex = fast::exp(top_score[i] - max_s);
         exps[i] = ex;
         sum_exp += ex;
     }
-    for (uint i = 0; i < 8; ++i) {
+    for (uint i = 0; i < K; ++i) {
         const uint expert_idx = top_idx[i];
         const float weight = exps[i] / sum_exp;
         out_indices[i] = expert_idx;
         out_weights[i] = half(weight * float(per_expert_scale[expert_idx]));
     }
+}
+
+// Non-production Flash-Next geometries include top-2 BF16 and top-6 INT4
+// fixtures. Their softmax width must match their output buffers; Gemma's
+// sqrt-softplus top-6 rule is not a substitute. Production keeps k10_par.
+kernel void flashnext_router_topk_select(
+    device const float* logits [[buffer(0)]],
+    device const bfloat* per_expert_scale [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device half* out_weights [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    constant uint& k [[buffer(5)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (tid != 0u || k == 0u || k > 10u || num_experts < k || num_experts > 512u) return;
+    uint indices[10];
+    float scores[10];
+    for (uint i = 0; i < k; ++i) { indices[i] = 0u; scores[i] = -INFINITY; }
+    for (uint e = 0; e < num_experts; ++e) {
+        const float score = logits[e];
+        uint at = k;
+        for (uint i = 0; i < k; ++i) {
+            if (score > scores[i]) { at = i; break; }
+        }
+        if (at == k) continue;
+        for (uint i = k - 1u; i > at; --i) {
+            indices[i] = indices[i - 1u]; scores[i] = scores[i - 1u];
+        }
+        indices[at] = e; scores[at] = score;
+    }
+    float total = 0.0f;
+    const float maximum = scores[0];
+    for (uint i = 0; i < k; ++i) { scores[i] = fast::exp(scores[i] - maximum); total += scores[i]; }
+    for (uint i = 0; i < k; ++i) {
+        out_indices[i] = indices[i];
+        out_weights[i] = half(scores[i] / total * float(per_expert_scale[indices[i]]));
+    }
+}
+
+kernel void router_topk_select_k8_par(
+    device const float* logits [[buffer(0)]],
+    device const bfloat* per_expert_scale [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device half* out_weights [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    router_topk_select_softmax_par<8, kRouterMaxPerLane>(
+        logits, per_expert_scale, out_indices, out_weights,
+        router_fc_num_experts(num_experts), sg_idx, lane);
+}
+
+// Flash-Next: top-10 over up to 512 experts (16 candidates per lane).
+kernel void router_topk_select_k10_par(
+    device const float* logits [[buffer(0)]],
+    device const bfloat* per_expert_scale [[buffer(1)]],
+    device uint* out_indices [[buffer(2)]],
+    device half* out_weights [[buffer(3)]],
+    constant uint& num_experts [[buffer(4)]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    router_topk_select_softmax_par<10, kRouterWideMaxPerLane>(
+        logits, per_expert_scale, out_indices, out_weights,
+        router_fc_num_experts(num_experts), sg_idx, lane);
 }
 
 // Each SIMD computes one affine INT4 row. Four adjacent groups are loaded as
@@ -525,7 +645,9 @@ static inline void moe_phase1_gate_up_act_u16load_body(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         gW, gS, gB, uW, uS, uB, x, f, D, lane);
-    if (lane == 0) acts[slot * F + f] = half(moe_hidden_activation(gu.x) * gu.y);
+    // DeepSeek's swiglu_limit clamp: a no-op unless function constant 5 is set.
+    const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
+    if (lane == 0) acts[slot * F + f] = half(moe_hidden_activation(cgu.x) * cgu.y);
 }
 
 static inline void moe_phase1_gate_up_act_subset_u16load_body(
@@ -561,7 +683,9 @@ static inline void moe_phase1_gate_up_act_subset_u16load_body(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         gW, gS, gB, uW, uS, uB, x, f, D, lane);
-    if (lane == 0) acts[slot * F + f] = half(moe_hidden_activation(gu.x) * gu.y);
+    // DeepSeek's swiglu_limit clamp: a no-op unless function constant 5 is set.
+    const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
+    if (lane == 0) acts[slot * F + f] = half(moe_hidden_activation(cgu.x) * cgu.y);
 }
 
 kernel void moe_phase1_gate_up_act_u16load(
@@ -650,7 +774,8 @@ kernel void moe_phase1_gate_up_act_slotmap(
 
     const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(
         gW, gS, gB, uW, uS, uB, x, f, DD, lane);
-    if (lane == 0) acts[slot * FF + f] = half(moe_hidden_activation(gu.x) * gu.y);
+    const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
+    if (lane == 0) acts[slot * FF + f] = half(moe_hidden_activation(cgu.x) * cgu.y);
 }
 
 kernel void moe_phase2_down_reduce_k8_slotmap(
@@ -690,6 +815,53 @@ kernel void moe_phase2_down_reduce_k8_slotmap(
         float acc = float(residual[d]);
         acc += partial[0]; acc += partial[1]; acc += partial[2]; acc += partial[3];
         acc += partial[4]; acc += partial[5]; acc += partial[6]; acc += partial[7];
+        y[d] = half(acc);
+    }
+}
+
+// Resident expert slabs can address every routed expert directly, so the
+// selected width is the model's actual top-k rather than the historical
+// eight-slot cache width. This generic reduction supports every production
+// width admitted by `MoE` (6, 8, and Flash-Next's 10) while preserving the
+// same rank-order accumulation as the argument-buffer kernels.
+kernel void moe_phase2_down_reduce_slotmap_wide(
+    device const uint8_t* slab [[buffer(0)]],
+    device const uint* slot_offsets [[buffer(1)]],
+    device const uint* all_hit [[buffer(2)]],
+    constant ExpertOffsets& routed_offsets [[buffer(3)]],
+    device const half* acts [[buffer(4)]],
+    device const half* routing_w [[buffer(5)]],
+    device const half* residual [[buffer(6)]],
+    device half* y [[buffer(7)]],
+    constant uint& D [[buffer(8)]],
+    constant uint& F [[buffer(9)]],
+    constant uint& top_k [[buffer(10)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    if (all_hit[0] == 0u) return;
+    threadgroup float partial[kRoutedBlobSlots];
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
+    const uint K = moe_fc_top_k(top_k);
+    if (d >= DD || sg_idx >= K) return;
+
+    device const uint8_t* base = slab + slot_offsets[sg_idx];
+    const ExpertOffsets re = routed_offsets;
+    device const uint8_t* dW = base + re.down_W_off;
+    device const bfloat* dS = (device const bfloat*)(base + re.down_s_off);
+    device const bfloat* dB = (device const bfloat*)(base + re.down_b_off);
+    device const half* act_slot = acts + sg_idx * FF;
+
+    const float value = moe_int4_gemv_row_simd_dev_vec(
+        dW, dS, dB, act_slot, d, FF, lane);
+    if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_idx == 0 && lane == 0) {
+        float acc = float(residual[d]);
+        for (uint rank = 0; rank < K; ++rank) acc += partial[rank];
         y[d] = half(acc);
     }
 }
@@ -1270,6 +1442,49 @@ kernel void moe_phase2_down_reduce_k8(
     }
 }
 
+// Flash-Next's top-10 reduce. Byte-for-byte the `k8` body with two more
+// simdgroups and two more terms in the same residual-first, rank-ordered FP32
+// accumulation; the shipped k6/k8 kernels above are untouched, which is what
+// `MoEFusedFFNTests` and `RouterTopKParityTests` gate.
+kernel void moe_phase2_down_reduce_k10(
+    device const RoutedBlobs& routed [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half* acts [[buffer(2)]],
+    device const half* routing_w [[buffer(3)]],
+    device const half* residual [[buffer(4)]],
+    device half* y [[buffer(5)]],
+    constant uint& D [[buffer(6)]],
+    constant uint& F [[buffer(7)]],
+    uint d [[threadgroup_position_in_grid]],
+    uint sg_idx [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup float partial[10];
+    const uint DD = moe_fc_d(D);
+    const uint FF = moe_fc_f(F);
+    if (d >= DD) return;
+
+    device const uint8_t* base = routed.blob[sg_idx];
+    const ExpertOffsets re = routed_offsets;
+    device const uint8_t* dW = base + re.down_W_off;
+    device const bfloat* dS = (device const bfloat*)(base + re.down_s_off);
+    device const bfloat* dB = (device const bfloat*)(base + re.down_b_off);
+    device const half* act_slot = acts + sg_idx * FF;
+
+    const float value = moe_int4_gemv_row_simd_dev_vec(
+        dW, dS, dB, act_slot, d, FF, lane);
+    if (lane == 0) partial[sg_idx] = float(routing_w[sg_idx]) * value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_idx == 0 && lane == 0) {
+        float acc = float(residual[d]);
+        acc += partial[0]; acc += partial[1]; acc += partial[2]; acc += partial[3];
+        acc += partial[4]; acc += partial[5]; acc += partial[6]; acc += partial[7];
+        acc += partial[8]; acc += partial[9];
+        y[d] = half(acc);
+    }
+}
+
 // ============================================================================
 // DeepSeek-V4 chunked-prefill routed MoE — pair-major (additive; Wave-2B).
 //
@@ -1406,4 +1621,106 @@ kernel void dsv4_prefill_moe_reduce_pairs_k6(
     acc += partials[base + 4u * DD];
     acc += partials[base + 5u * DD];
     y[row] = half(acc);
+}
+
+// ============================================================================
+// GLM-5.3-Flash chunked prefill: routed experts grouped by expert over a
+// chunk. The CPU sorts the chunk's (token, rank) routes by expert into
+// `pair_token` / `pair_rank` with `seg_start[a] ..< seg_start[a + 1]` the
+// routes of active expert `active_experts[a]`; expert `e` lives at
+// `slab + e * expert_stride` (resident slab). Each expert's rows are read once
+// per chunk and applied to every route on it. Same INT4 row math as the
+// decode phase-1 / phase-2 bodies (`moe_int4_gate_up_rows_simd_dev_vec_u16load`,
+// `moe_int4_gemv_row_simd_dev_vec`, `moe_swiglu_clamp`).
+// ============================================================================
+
+// Grid (ceil(F/8), active_count): simdgroup = one f row of one expert, looped
+// over the expert's routes. acts[pair][F].
+kernel void glm53p_moe_grouped_phase1(
+    device const uint8_t* slab          [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half*    x             [[buffer(2)]],   // [T][D]
+    device half*          acts          [[buffer(3)]],   // [pairs][F]
+    device const uint*    pair_token    [[buffer(4)]],
+    device const uint*    seg_start     [[buffer(5)]],   // [active_count + 1]
+    device const uint*    active_experts [[buffer(6)]],
+    constant uint&        D             [[buffer(7)]],
+    constant uint&        F             [[buffer(8)]],
+    constant uint&        expert_stride [[buffer(9)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    const uint f = tg.x * 8u + sg;
+    if (f >= F) return;
+    const uint a = tg.y;
+    const uint e = active_experts[a];
+    device const uint8_t* base = slab + uint(e) * expert_stride;
+    const ExpertOffsets re = routed_offsets;
+    device const uint8_t* gW = base + re.gate_W_off;
+    device const uint8_t* uW = base + re.up_W_off;
+    device const bfloat* gS = (device const bfloat*)(base + re.gate_s_off);
+    device const bfloat* uS = (device const bfloat*)(base + re.up_s_off);
+    device const bfloat* gB = (device const bfloat*)(base + re.gate_b_off);
+    device const bfloat* uB = (device const bfloat*)(base + re.up_b_off);
+    const uint p0 = seg_start[a], p1 = seg_start[a + 1u];
+    for (uint p = p0; p < p1; ++p) {
+        device const half* xt = x + pair_token[p] * D;
+        const float2 gu = moe_int4_gate_up_rows_simd_dev_vec_u16load(gW, gS, gB, uW, uS, uB, xt, f, D, lane);
+        const float2 cgu = moe_swiglu_clamp(gu.x, gu.y);
+        if (lane == 0) acts[p * F + f] = half(moe_hidden_activation(cgu.x) * cgu.y);
+    }
+}
+
+// Grid (ceil(D/8), active_count): simdgroup = one d row, looped over the
+// expert's routes. partial[pair][D] = down_e(act[pair]).
+kernel void glm53p_moe_grouped_down(
+    device const uint8_t* slab          [[buffer(0)]],
+    constant ExpertOffsets& routed_offsets [[buffer(1)]],
+    device const half*    acts          [[buffer(2)]],   // [pairs][F]
+    device float*         partial       [[buffer(3)]],   // [pairs][D] fp32, as the decode reduce's per-rank term
+    device const uint*    seg_start     [[buffer(4)]],
+    device const uint*    active_experts [[buffer(5)]],
+    constant uint&        D             [[buffer(6)]],
+    constant uint&        F             [[buffer(7)]],
+    constant uint&        expert_stride [[buffer(8)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  sg   [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]]
+) {
+    const uint d = tg.x * 8u + sg;
+    if (d >= D) return;
+    const uint a = tg.y;
+    const uint e = active_experts[a];
+    device const uint8_t* base = slab + uint(e) * expert_stride;
+    const ExpertOffsets re = routed_offsets;
+    device const uint8_t* dW = base + re.down_W_off;
+    device const bfloat* dS = (device const bfloat*)(base + re.down_s_off);
+    device const bfloat* dB = (device const bfloat*)(base + re.down_b_off);
+    const uint p0 = seg_start[a], p1 = seg_start[a + 1u];
+    for (uint p = p0; p < p1; ++p) {
+        const float v = moe_int4_gemv_row_simd_dev_vec(dW, dS, dB, acts + p * F, d, F, lane);
+        if (lane == 0) partial[p * D + d] = v;
+    }
+}
+
+// y[t][d] = residual[t][d] + sum_k w[t][k] * partial[route_pair[t*K + k]][d].
+// Grid (D, T). The reduce order (rank 0 first) matches the decode reduce.
+kernel void glm53p_moe_route_reduce(
+    device const float* partial    [[buffer(0)]],   // [pairs][D]
+    device const uint*  route_pair [[buffer(1)]],   // [T][K]
+    device const half*  weights    [[buffer(2)]],   // [T][K]
+    device const half*  residual   [[buffer(3)]],   // [T][D]
+    device half*        y          [[buffer(4)]],   // [T][D]
+    constant uint&      D          [[buffer(5)]],
+    constant uint&      K          [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint d = gid.x, t = gid.y;
+    if (d >= D) return;
+    float acc = float(residual[t * D + d]);
+    for (uint k = 0; k < K; ++k) {
+        acc += float(weights[t * K + k]) * partial[route_pair[t * K + k] * D + d];
+    }
+    y[t * D + d] = half(acc);
 }

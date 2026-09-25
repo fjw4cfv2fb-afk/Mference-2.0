@@ -1,6 +1,13 @@
 import Foundation
 import Metal
 
+extension Qwen38ForwardRunner: RuntimeMemoryReporting {
+    var diagnosticKVStateBytes: UInt64? {
+        kv.diagnosticBufferBytes + gdnState.diagnosticBufferBytes
+            + (pagedKV?.store.diagnosticBufferBytes ?? 0)
+    }
+}
+
 public enum Qwen38ForwardRunnerError: Error, CustomStringConvertible {
     case invalidConfiguration(String)
     case invalidInput(String)
@@ -245,6 +252,7 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
     private let prefillEmbed: PrefillEmbedLookupInt4
     private let prefillRMS: PrefillRMSNorm
     private let prefillQMM: PrefillInt4QMM
+    private let prefillUsesDecodeOrder: Bool
     private let prefillMPPInt4: MPPPrefillInt4QMM
     private let prefillQKVEpilogue: PrefillQKVEpilogue
     private let prefillAttention: PrefillAttention
@@ -253,6 +261,9 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
     private let mlpWeightBits: Int
     private var prefillScratch: PrefillScratch?
     private var prefillChunkState = PrefillChunkCommitState()
+    /// Test-only failure seam after a drained layer. Nil preserves production
+    /// command-buffer batching; cancellation checks add no GPU synchronization.
+    var prefillDidCompleteLayer: ((Int) throws -> Void)?
 
     // Decode scratch, allocated once. FP16 unless noted. At production shape
     // (D 5120, F 17408, qDim 24*256 = 6144, gdn qkvDim 10240, valueDim 6144)
@@ -289,7 +300,8 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
     public var usesFusedGreedyHead: Bool { useFusedGreedyHead }
 
     /// MTP speculative decoding, present when the install carries the
-    /// `mtp.*` draft tensors and `MFERENCE_MTP` is not "0". Greedy-only:
+    /// `mtp.*` draft tensors and `MFERENCE_MTP` is not "0" (Swift-Qwen
+    /// instead requires explicit "1" until qualification). Greedy-only:
     /// rounds run only through the fused-greedy `produce` path, which the
     /// generation loop already restricts to temperature 0 with no
     /// repetition penalty. Internal var so tests can disable it per-instance.
@@ -304,6 +316,8 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
         public let draftNanos: UInt64
         public let verifyNanos: UInt64
         public let acceptNanos: UInt64
+        public let positionTrials: [Int]
+        public let positionAccepts: [Int]
     }
 
     public var mtpSpecStats: MTPSpecStats? {
@@ -315,7 +329,9 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                          rollbacks: $0.stats.rollbacks,
                          draftNanos: $0.stats.draftNanos,
                          verifyNanos: $0.stats.verifyNanos,
-                         acceptNanos: $0.stats.acceptNanos)
+                         acceptNanos: $0.stats.acceptNanos,
+                         positionTrials: $0.stats.positionTrials,
+                         positionAccepts: $0.stats.positionAccepts)
         }
     }
 
@@ -369,7 +385,13 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
         self.fusedQKVGEMV = try FusedQKVGEMV(context: context)
         self.prefillEmbed = try PrefillEmbedLookupInt4(context: context)
         self.prefillRMS = try PrefillRMSNorm(context: context)
-        self.prefillQMM = try PrefillInt4QMM(context: context)
+        // Swift's installed numerical gate exposes error amplification across
+        // 64 layers with QMM arithmetic differing from decode. Preserve its
+        // affine factoring/reduction order while keeping a token-parallel
+        // dispatch. Base Qwen retains its existing qualified dispatch policy.
+        self.prefillUsesDecodeOrder = model.modelID == CheckpointIdentity.swiftQwen38
+        self.prefillQMM = try PrefillInt4QMM(context: context,
+                                           decodeOrder: prefillUsesDecodeOrder)
         self.prefillMPPInt4 = MPPPrefillInt4QMM(context: context)
         self.prefillQKVEpilogue = try PrefillQKVEpilogue(context: context)
         self.prefillAttention = try PrefillAttention(context: context)
@@ -452,7 +474,11 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                 isLinear: isLinear)
         }
 
-        if ProcessInfo.processInfo.environment["MFERENCE_MTP"] != "0" {
+        // Swift carries its own draft weights, but acceptance/parity must be
+        // qualified independently of base Qwen. Plain decode is its default.
+        let mtpSetting = ProcessInfo.processInfo.environment["MFERENCE_MTP"]
+        let enableMTP = CheckpointIdentity.qwenMTPEnabled(modelID: model.modelID, setting: mtpSetting)
+        if enableMTP {
             self.mtp = try Qwen38MTPSpeculator.probe(model: model,
                                                      context: context,
                                                      config: cfg,
@@ -462,6 +488,13 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                                                      maxContext: maxContext,
                                                      mlpWeightBits: mlpWeightBits,
                                                      paged: pagedKV)
+            // MFERENCE_DFLASH2_DIR swaps the round's draft source to the
+            // DFlash2 block-diffusion drafter; the verify/accept machinery
+            // (and therefore emitted bytes) is unchanged.
+            if let mtp {
+                mtp.dflash2 = try Qwen38DFlash2Drafter.probe(
+                    context: context, model: model, targetConfig: cfg)
+            }
         }
     }
 
@@ -553,6 +586,7 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                         config: PrefillRuntimeConfig,
                         into logits: MTLBuffer,
                         onProgress: (Int) -> Void) async throws -> PrefillResult {
+        var execution = PrefillExecutionReport()
         try prefillChunkState.requireClean(operation: "prefillChunked")
         guard config.mode == .chunked else {
             throw PrefillError.chunkedUnsupported(
@@ -567,7 +601,7 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                 "Qwen 3.8 prefill range starting at \(startPosition) with \(tokens.count) tokens exceeds maxContext \(maxContext)")
         }
         guard !tokens.isEmpty else {
-            return PrefillResult(newPosition: startPosition, seed: .logitsWritten)
+            return PrefillResult(newPosition: startPosition, seed: .logitsWritten, execution: execution)
         }
         guard tokens.allSatisfy({ $0 >= 0 && $0 < Int32(cfg.vocabSize) }) else {
             throw Qwen38ForwardRunnerError.invalidInput(
@@ -582,6 +616,18 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
         }
 
         let scratch = try ensurePrefillScratch(config: config)
+        // DFlash2 conditioning: the prompt's trailing tap rows (one drafter
+        // context window) prime the first draft rounds — without them the
+        // drafter starts blind and early acceptance craters. Restart the
+        // drafter at the window base; each chunk stages its in-window rows.
+        var dflash2TapBase = Int.max
+        if let drafter = mtp?.dflash2 {
+            drafter.reset()
+            let finalPosition = startPosition + tokens.count
+            dflash2TapBase = max(startPosition,
+                                 finalPosition - drafter.contextWindowRows)
+            drafter.alignPositionBase(dflash2TapBase)
+        }
         let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
                                               startPosition: startPosition,
                                               config: config)
@@ -594,15 +640,17 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                                     outputMode: outputMode,
                                     logits: logits,
                                     scratch: scratch,
-                                    writeFinalHead: spanIndex == spans.count - 1)
+                                    writeFinalHead: spanIndex == spans.count - 1,
+                                    dflash2TapBase: dflash2TapBase)
+            execution.recordBatch(span.tokenCount)
             onProgress(span.completedCount)
         }
         if outputMode == .greedyIfAvailable, useFusedGreedyHead {
             return PrefillResult(newPosition: startPosition + tokens.count,
-                                 seed: .greedyToken(lastGreedyToken))
+                                 seed: .greedyToken(lastGreedyToken), execution: execution)
         }
         return PrefillResult(newPosition: startPosition + tokens.count,
-                             seed: .logitsWritten)
+                             seed: .logitsWritten, execution: execution)
     }
 
     private func ensurePrefillScratch(config: PrefillRuntimeConfig) throws -> PrefillScratch {
@@ -626,7 +674,8 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                                      outputMode: PrefillOutputMode,
                                      logits: MTLBuffer,
                                      scratch: PrefillScratch,
-                                     writeFinalHead: Bool) throws {
+                                     writeFinalHead: Bool,
+                                     dflash2TapBase: Int = .max) throws {
         let t = tokens.count
         precondition(t > 0 && t <= scratch.chunkTokens,
                      "prefill chunk exceeds its scratch capacity")
@@ -688,6 +737,25 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                                           hidden: scratch.hidden,
                                           delta: scratch.mlpOut,
                                           count: t * D)
+            if let drafter = mtp?.dflash2, drafter.isTapLayer(index),
+               dflash2TapBase < startPosition + t {
+                let local = max(0, dflash2TapBase - startPosition)
+                drafter.encodeTapCapture(
+                    commandBuffer: cb,
+                    layerIndex: index,
+                    src: scratch.hidden,
+                    srcOffset: local * D * MemoryLayout<Float16>.stride,
+                    rows: t - local)
+            }
+            if let hook = prefillDidCompleteLayer {
+                try withExtendedLifetime(tokenBuffer) { try finish(cb) }
+                try hook(index)
+                cb = try commandBuffer()
+            }
+            try Task.checkCancellation()
+        }
+        if let drafter = mtp?.dflash2, dflash2TapBase < startPosition + t {
+            drafter.commitTapRows(t - max(0, dflash2TapBase - startPosition))
         }
 
         let emitGreedyHead = outputMode == .greedyIfAvailable && useFusedGreedyHead
@@ -1262,7 +1330,7 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
                                 biases: MTLBuffer, biasesOffset: Int,
                                 x: MTLBuffer, y: MTLBuffer,
                                 t: Int, n: Int, k: Int) {
-        if prefillMPPInt4.isAvailable {
+        if prefillMPPInt4.isAvailable && !prefillUsesDecodeOrder {
             let path = prefillMPPInt4.encode(commandBuffer: cb,
                                              weights: weights, weightsOffset: weightsOffset,
                                              scales: scales, scalesOffset: scalesOffset,

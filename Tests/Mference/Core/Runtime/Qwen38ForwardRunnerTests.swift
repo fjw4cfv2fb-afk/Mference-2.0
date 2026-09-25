@@ -5,8 +5,8 @@ import Testing
 
 /// Qwen 3.8 dense runtime integration against the qwen38 toy fixture:
 /// factory dispatch, deterministic decode replay across runner instances,
-/// KV + GDN state reset correctness, and the sequential-replay prefill v1
-/// matching pure decode.
+/// KV + GDN state reset correctness, and batched production prefill matching
+/// the explicit sequential-decode reference on this fixture.
 @Suite struct Qwen38ForwardRunnerTests {
     private static let vocab = 1024
 
@@ -59,7 +59,7 @@ import Testing
         #expect(runtime.producer is any HeadlessSequentialPrefillRunner)
         #expect(runtime.producer is any ExactPrefillLogitProducer)
         #expect(runtime.prefillConfig == requested.prefillConfig)
-        #expect(runtime.executedPrefillMode == .chunked)
+        #expect(runtime.executedPrefillMode == .unreported)
         #expect(runtime.kvStorageMode == .fp16)
         #expect((runtime.producer as? any FusedHeadLogitProducer)?.usesFusedGreedyHead == true)
 
@@ -117,9 +117,8 @@ import Testing
         #expect(runner.lastGreedyToken == first)
     }
 
-    /// Prefill v1 is a sequential decode replay, so prefilling a prompt then
-    /// decoding must match pure decode from a fresh state exactly (shared
-    /// KV + GDN recurrent state + conv tail).
+    /// Batched prefill followed by decode must match the sequential reference
+    /// on this short fixture (shared KV + GDN recurrent state + conv tail).
     @Test func prefillChunked_matchesPureDecode() async throws {
         let (dir, ctx, runner) = try makeRunner()
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -196,7 +195,10 @@ import Testing
             config: .production(chunkTokens: chunkTokens),
             into: logits,
             onProgress: { progress.append($0) })
-        #expect(result == PrefillResult(newPosition: prompt.count, seed: .logitsWritten))
+        #expect(result.newPosition == prompt.count)
+        #expect(result.seed == .logitsWritten)
+        #expect(result.execution?.batchedTokens == prompt.count)
+        #expect(result.execution?.replayedTokens == 0)
         #expect(progress.last == prompt.count)
         #expect(runner.continuationPosition == prompt.count)
         var chunked: [[UInt16]] = [bits(logits)]

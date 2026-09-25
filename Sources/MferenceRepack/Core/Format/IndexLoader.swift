@@ -36,9 +36,35 @@ enum IndexLoader {
         let shardFilenames: [String]
         /// Optional Maple FlashHead metadata from `config.json`.
         let flashHead: MapleFlashHeadMetadata?
+        /// The source ships unquantized BF16 weights and carries no
+        /// `config.json -> quantization` block; the installer quantizes in
+        /// flight, so `baseBits`/`baseGroupSize`/`baseMode` describe the
+        /// *output* rather than the input.
+        let sourceIsUnquantized: Bool
     }
 
-    static func load(snapshotDir: String) throws -> SourceMetadata {
+    /// `model_type` values whose repos are the vendor's own BF16 upload rather
+    /// than an MLX conversion. Only these may omit `quantization`; for every
+    /// other source a missing block still means a broken conversion.
+    ///
+    /// Membership is not "this family is always unquantized" — it is "for this
+    /// `model_type`, a missing `quantization` block is a legitimate original
+    /// upload rather than a broken conversion". `qwen3_5_moe` appears on both
+    /// sides: the mlx-community Qwen3.6 conversion declares `quantization` and
+    /// takes the pre-quantized path, while the vendor's own BF16 upload of the
+    /// same checkpoint omits it and is quantized in flight. That pairing is
+    /// deliberate — it is the control the W2.1b quality gate is measured
+    /// against (see docs/QUANTIZER_QUALITY.md).
+    static let unquantizedSourceModelTypes: Set<String> = ["qwen4_exp", "qwen3_5_moe"]
+
+    /// `acceptsUnquantizedSource` is set by the caller when the repo being
+    /// installed is a pinned `SupportedModelSource` of kind
+    /// `originalRepoQuantize`. It is the second way a missing `quantization`
+    /// block is legitimate, and the one that does not key on `model_type`:
+    /// MiniCPM5's `model_type` is the generic `"llama"`, which must never be
+    /// allowlisted on its own or any llama repo would be claimed.
+    static func load(snapshotDir: String,
+                     acceptsUnquantizedSource: Bool = false) throws -> SourceMetadata {
         let indexPath  = (snapshotDir as NSString).appendingPathComponent("model.safetensors.index.json")
         let configPath = (snapshotDir as NSString).appendingPathComponent("config.json")
 
@@ -69,7 +95,31 @@ enum IndexLoader {
                 throw RepackError.configJsonInvalid(path: configPath, detail: "not a JSON object")
             }
             guard let quant = root["quantization"] as? [String: Any] else {
-                throw RepackError.configJsonInvalid(path: configPath, detail: "no quantization slot")
+                // An original-repo BF16 checkpoint has nothing to declare. The
+                // installer quantizes it (INT4 affine group-64, the only
+                // supported target), so the recorded base describes the output.
+                guard acceptsUnquantizedSource
+                        || ((root["model_type"] as? String).map(
+                            unquantizedSourceModelTypes.contains) ?? false) else {
+                    throw RepackError.configJsonInvalid(path: configPath,
+                                                        detail: "no quantization slot")
+                }
+                var shards: [String] = []
+                var seenShards = Set<String>()
+                for key in weightMap.keys.sorted() {
+                    let shard = weightMap[key]!
+                    if seenShards.insert(shard).inserted { shards.append(shard) }
+                }
+                return SourceMetadata(indexPath: indexPath, configPath: configPath,
+                                      indexSha256Hex: indexSha,
+                                      weightMap: weightMap,
+                                      baseBits: 4,
+                                      baseGroupSize: StreamingInt4Quantizer.groupSize,
+                                      baseMode: "affine",
+                                      bitsOverrides: [:],
+                                      shardFilenames: shards,
+                                      flashHead: nil,
+                                      sourceIsUnquantized: true)
             }
             let isMaple = (root["model_type"] as? String) == "maple"
             if isMaple {
@@ -143,7 +193,8 @@ enum IndexLoader {
                               baseMode: baseMode,
                               bitsOverrides: overrides,
                               shardFilenames: shards,
-                              flashHead: flashHead)
+                              flashHead: flashHead,
+                              sourceIsUnquantized: false)
     }
 
     /// Resolves the bits/group for one tensor name (with or without `.weight`).

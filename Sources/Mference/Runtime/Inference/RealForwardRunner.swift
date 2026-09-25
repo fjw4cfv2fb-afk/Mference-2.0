@@ -1,6 +1,14 @@
 import Foundation
 import Metal
 
+extension RealForwardRunner: RuntimeMemoryReporting {
+    var diagnosticKVStateBytes: UInt64? {
+        let convBuffers = inklingConvStates.flatMap { [$0.k, $0.v, $0.attn, $0.mlp] }
+        return (kv?.diagnosticBufferBytes ?? 0) + (gdnState?.diagnosticBufferBytes ?? 0)
+            + (dsv4State?.diagnosticBufferBytes ?? 0) + uniqueBufferBytes(convBuffers)
+    }
+}
+
 /// Faults detected at the Inkling output head. Both cases mean an
 /// intermediate went non-finite somewhere in the 42-layer stack; the head is
 /// simply the first place that can see it cheaply.
@@ -333,6 +341,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Lazily built layer-major DeepSeek-V4 prefill; see
     /// `RealForwardRunner+DSV4Prefill.swift`.
     private var dsv4Prefill: DSV4ChunkedPrefill?
+    /// Internal fault-injection boundary; production leaves this unset.
+    var dsv4PrefillDidCompleteLayer: ((Int) throws -> Void)?
+    /// Test-only failure seam. Prior layer work is drained at this boundary;
+    /// production leaves it nil and adds no GPU synchronization.
+    var prefillWillEncodeLayer: ((Int) throws -> Void)?
 
     private static let rdadviseBoundedMissCap = 12
     private static let rdadviseBoundedMaxCallNanos: UInt64 = 250_000
@@ -991,6 +1004,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     }
 
     public func prepareForContinuation(expectedPosition: Int) throws {
+        try prefillChunkState.requireClean(operation: "prepareForContinuation")
         guard let kv else {
             throw PrefillError.prefillCursorMismatch(
                 "continuation requires an initialized KV cache")
@@ -1437,6 +1451,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                config: PrefillRuntimeConfig,
                                into logits: MTLBuffer,
                                onProgress: (Int) -> Void) async throws -> PrefillResult {
+        var execution = PrefillExecutionReport()
         try prefillChunkState.requireClean(operation: "prefillChunked")
         // Prompt prefill and decode share these counters; drop the prompt's
         // contribution on the way out so the phase report describes decode.
@@ -1459,7 +1474,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 "chunked prefill range starting at \(startPosition) with \(tokens.count) tokens exceeds maxContext \(maxContext)")
         }
         guard !tokens.isEmpty else {
-            return PrefillResult(newPosition: startPosition, seed: .logitsWritten)
+            return PrefillResult(newPosition: startPosition, seed: .logitsWritten, execution: execution)
         }
 
         if cfg.family == .inklingSmall {
@@ -1478,6 +1493,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                   into: logits,
                                                   emitHead: isLast,
                                                   outputMode: outputMode)
+                    execution.recordReplay(1, reason: "inkling_reference_override")
                     pos += 1
                     index += 1
                     if index % 16 == 0 { onProgress(index) }
@@ -1489,6 +1505,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 let step = max(1, min(config.chunkTokens, inklingChunkCapacity))
                 var offset = 0
                 while offset < tokens.count {
+                    try Task.checkCancellation()
                     let count = min(step, tokens.count - offset)
                     let lower = tokens.index(tokens.startIndex, offsetBy: offset)
                     let upper = tokens.index(lower, offsetBy: count)
@@ -1501,6 +1518,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         outputMode: outputMode,
                         into: logits)
                     prefillChunkState.markCommitted()
+                    execution.recordBatch(count)
                     pos += count
                     offset += count
                     onProgress(offset)
@@ -1509,19 +1527,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             onProgress(tokens.count)
             if outputMode == .greedyIfAvailable, useFusedGreedyHead {
                 return PrefillResult(newPosition: pos,
-                                     seed: .greedyToken(lastGreedyToken))
+                                     seed: .greedyToken(lastGreedyToken), execution: execution)
             }
-            return PrefillResult(newPosition: pos, seed: .logitsWritten)
+            return PrefillResult(newPosition: pos, seed: .logitsWritten, execution: execution)
         }
 
         if cfg.hasCompressedAttentionLayers {
             // DeepSeek-V4 prefill runs layer-major over each chunk (see
             // `RealForwardRunner+DSV4Prefill.swift`), which amortizes the
             // routed-expert reads over the chunk instead of paying them per
-            // token. Spans that the batched path cannot serve — currently only
-            // those long enough to trigger lightning-indexer selection — fall
-            // back to the token-by-token decode replay, which is the
-            // correctness reference for both.
+            // token. GPU sparse selection keeps long prompts on this path;
+            // explicit reference and unsupported geometry controls retain
+            // truthful decode-replay diagnostics.
             let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
                                                   startPosition: startPosition,
                                                   config: config)
@@ -1530,9 +1547,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             var done = 0
             for (spanIndex, span) in spans.enumerated() {
                 let isLastSpan = spanIndex == spans.count - 1
-                // A span crossing the lightning-selection cutover keeps its
-                // eligible prefix batched; only the remainder replays
-                // token-by-token.
+                try Task.checkCancellation()
                 var batchedCount = DSV4ChunkedPrefill.batchedTokenPrefix(
                     config: cfg,
                     startPosition: span.startPosition,
@@ -1573,13 +1588,29 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                       startPosition: span.startPosition,
                                                       emitHead: isLastSpan && batchedCount == span.tokenCount,
                                                       outputMode: outputMode,
-                                                      logits: logits)
+                                                      logits: logits,
+                                                      didCompleteLayer: dsv4PrefillDidCompleteLayer)
                     if let greedy { lastGreedyToken = greedy }
                     for _ in 0..<batchedCount { kv?.advance() }
+                    execution.recordBatch(batchedCount)
                     pos += batchedCount
                     prefillChunkState.markCommitted()
                 }
                 if batchedCount < span.tokenCount {
+                    let replayReason: String
+                    if !DSV4ChunkedPrefill.batchedPathEnabled {
+                        replayReason = "deepseek_batched_prefill_disabled"
+                    } else if dsv4 == nil || moeDSV4 == nil || dsv4State == nil {
+                        replayReason = "deepseek_batched_engine_unavailable"
+                    } else if let expertSlots, expertSlots < 1 {
+                        replayReason = "deepseek_expert_slots_unavailable"
+                    } else if cfg.routerScoringFunc != "sqrtsoftplus"
+                                || cfg.topKExperts != MoEDeepseekV4.topK
+                                || cfg.compressedAttention.csaCompressRate <= 0 {
+                        replayReason = "deepseek_unsupported_geometry"
+                    } else {
+                        replayReason = "deepseek_unsupported_geometry"
+                    }
                     let remainder = span.tokenCount - batchedCount
                     let lower = tokens.index(tokens.startIndex,
                                              offsetBy: span.tokenOffset + batchedCount)
@@ -1591,6 +1622,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                    into: logits,
                                                    emitHead: isLast,
                                                    outputMode: outputMode)
+                        execution.recordReplay(1, reason: replayReason)
                         pos += 1
                         index += 1
                     }
@@ -1600,9 +1632,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             }
             if outputMode == .greedyIfAvailable, useFusedGreedyHead {
                 return PrefillResult(newPosition: pos,
-                                     seed: .greedyToken(lastGreedyToken))
+                                     seed: .greedyToken(lastGreedyToken), execution: execution)
             }
-            return PrefillResult(newPosition: pos, seed: .logitsWritten)
+            return PrefillResult(newPosition: pos, seed: .logitsWritten, execution: execution)
         }
 
         let scratch = try ensurePrefillScratch(config: config)
@@ -1610,6 +1642,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                               startPosition: startPosition,
                                               config: config)
         for (spanIndex, span) in spans.enumerated() {
+            try Task.checkCancellation()
             let lower = tokens.index(tokens.startIndex, offsetBy: span.tokenOffset)
             let upper = tokens.index(lower, offsetBy: span.tokenCount)
             try await executePrefillChunk(
@@ -1620,14 +1653,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 scratch: scratch,
                 config: config,
                 writeFinalHead: spanIndex == spans.count - 1)
+            execution.recordBatch(span.tokenCount)
             onProgress(span.completedCount)
         }
         if outputMode == .greedyIfAvailable, useFusedGreedyHead {
             return PrefillResult(newPosition: startPosition + tokens.count,
-                                 seed: .greedyToken(lastGreedyToken))
+                                 seed: .greedyToken(lastGreedyToken), execution: execution)
         }
         return PrefillResult(newPosition: startPosition + tokens.count,
-                             seed: .logitsWritten)
+                             seed: .logitsWritten, execution: execution)
     }
 
     @discardableResult
@@ -1900,6 +1934,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             outScale: embedOutScale)
 
         for L in 0..<cfg.numLayers {
+            try prefillWillEncodeLayer?(L)
+            try Task.checkCancellation()
             model.beginOpeningRoutedExpertStreamer(layer: L)
             let views = layerViews[L]
             let isLinear = cfg.layerIsLinear(L)
@@ -2310,15 +2346,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                                                    weights: routeWeights,
                                                                    queryCount: t,
                                                                    topK: cfg.topKExperts)
-                    let schedulerConfig = Self.prefillRoutedTileSchedulerConfig
+                    let requestedScheduler = Self.prefillRoutedTileSchedulerConfig
+                    let schedulerConfig: PrefillRoutedTileSchedulerConfig
                     let routeTileExpertCount: Int
                     if let slotCount = model.routedExpertCacheSlotCount(layer: L) {
-                        guard schedulerConfig.fitsSlotBudget(slotCount: slotCount) else {
+                        guard let bounded = requestedScheduler.fittingSlotBudget(slotCount: slotCount) else {
                             throw PrefillError.chunkedUnsupported(
-                                "prefill routed tile depth \(schedulerConfig.maxPendingDepth) with \(schedulerConfig.tileExperts) experts/tile needs \((schedulerConfig.maxPendingDepth + 1) * schedulerConfig.tileExperts) slots, has \(slotCount)")
+                                "prefill routed tile depth \(requestedScheduler.maxPendingDepth) needs at least \(requestedScheduler.maxPendingDepth + 1) slots, has \(slotCount)")
                         }
-                        routeTileExpertCount = min(schedulerConfig.tileExperts, slotCount)
+                        schedulerConfig = bounded
+                        routeTileExpertCount = bounded.tileExperts
                     } else {
+                        schedulerConfig = requestedScheduler
                         routeTileExpertCount = schedulerConfig.tileExperts
                     }
                     let routes = try PrefillMoEGrouping.groupTokenExpertPairs(
@@ -4216,6 +4255,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let isDense = L < cfg.numDenseLayers
             let conv = inklingConvStates[L]
             let inNorm = try model.inputNorm(layer: L)
+            try prefillWillEncodeLayer?(L)
+            try Task.checkCancellation()
             let mlpNorm = try model.postAttnNorm(layer: L)
             let q = try model.inklingWqDu(layer: L)
             let k = try model.inklingWkDv(layer: L)
@@ -4514,6 +4555,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if let error = pending.cb.error { throw error }
             }
             for (index, range) in routedRanges.enumerated() {
+                try Task.checkCancellation()
                 let t0 = now()
                 let blob: TensorView
                 let blobSlots: [Int]

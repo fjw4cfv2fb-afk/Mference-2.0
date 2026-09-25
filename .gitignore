@@ -29,6 +29,8 @@ weights/
 models/
 Model/
 !Tests/**/Model/
+# Committed parity goldens are small (KiB-scale) .safetensors test fixtures, not weights.
+!Tests/Mference/Fixtures/**/*.safetensors
 # Repacked .gturbo directories (manifest.json/layout.json inside aren't caught by *.bin)
 *.gturbo/
 
@@ -59,3 +61,7 @@ notes/
 __pycache__/
 *.pyc
 .venv/
+
+# Open WebUI writes its session-signing secret into the working directory when
+# WEBUI_SECRET_KEY is not set; the launcher sets it from the data directory.
+.webui_secret_key

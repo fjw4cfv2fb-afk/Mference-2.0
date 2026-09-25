@@ -31,6 +31,27 @@ public struct MoEExpertOffsets {
 final class MoE {
     static let maxStreamedExperts = 8
 
+    /// Slots in the `RoutedBlobs` argument buffer, mirroring `kRoutedBlobSlots`
+    /// in `moe.metal`. Flash-Next streams top-10; the shipped families bind a
+    /// 6- or 8-wide prefix and every kernel indexes only `slot < top_k`, so the
+    /// wider array is layout-only. `maxStreamedExperts` stays 8 because it means
+    /// something else — the width the shipped decode path plans and eager-fills.
+    static let routedBlobSlots = 10
+
+    /// Top-k widths the routed INT4 expert-compute path implements.
+    static let routedComputeWidths: Set<UInt32> = [6, 8, 10]
+
+    /// The widest expert count the router path accepts. Bounded by the one-SIMD
+    /// selection kernels' lane arrays (`kRouterWideMaxPerLane` = 16 over 32
+    /// lanes) and by the router-logits staging buffer sized below. Flash-Next
+    /// routes over 512; the shipped families use 128 or 256.
+    static let maxRouterExperts: UInt32 = 512
+
+    /// Top-k widths the router selection kernels implement. 8 is Gemma 4 /
+    /// Qwen 3.6; 10 is Flash-Next. (DeepSeek V4's 6 goes through its own
+    /// sqrtsoftplus kernels in `MoEDeepseekV4`.)
+    static let routerTopKWidths: Set<UInt32> = [8, 10]
+
     private let realDecodeD: UInt32
     private let realDecodeF: UInt32
     private let realDecodeTopK: UInt32
@@ -40,6 +61,8 @@ final class MoE {
     private let routerGemvSpecializedPSO: MTLComputePipelineState
     private let routerSelectK8PSO: MTLComputePipelineState
     private let routerSelectK8SpecializedPSO: MTLComputePipelineState
+    private let routerSelectK10PSO: MTLComputePipelineState
+    private let routerSelectK10SpecializedPSO: MTLComputePipelineState
     private let routerLogits: MTLBuffer
     private let phase1U16PSO: MTLComputePipelineState
     private let phase1U16SpecializedPSO: MTLComputePipelineState
@@ -48,6 +71,8 @@ final class MoE {
     private let phase1SlotmapSpecializedPSO: MTLComputePipelineState
     private let phase2SlotmapPSO: MTLComputePipelineState
     private let phase2SlotmapSpecializedPSO: MTLComputePipelineState
+    private let phase2SlotmapWidePSO: MTLComputePipelineState
+    private let phase2SlotmapWideSpecializedPSO: MTLComputePipelineState
     private let residualAddGuardedPSO: MTLComputePipelineState
     private let phase1SubsetU16PSO: MTLComputePipelineState
     private let phase1SubsetU16SpecializedPSO: MTLComputePipelineState
@@ -55,6 +80,8 @@ final class MoE {
     private let phase2ReduceK8SpecializedPSO: MTLComputePipelineState
     private let phase2ReduceK6PSO: MTLComputePipelineState
     private let phase2ReduceK6SpecializedPSO: MTLComputePipelineState
+    private let phase2ReduceK10PSO: MTLComputePipelineState
+    private let phase2ReduceK10SpecializedPSO: MTLComputePipelineState
     private let routedArgEncoder: MTLArgumentEncoder
     private let reusableRoutedArgBuffer: MTLBuffer
 
@@ -67,16 +94,26 @@ final class MoE {
          specializedD: UInt32 = 2816,
          specializedF: UInt32 = 704,
          specializedNumExperts: UInt32 = 128,
-         specializedTopK: UInt32 = 8) throws {
-        precondition(specializedTopK == 6 || specializedTopK == 8,
-                     "routed INT4 decode supports top-k 6 or 8")
+         specializedTopK: UInt32 = 8,
+         swigluLimit: Float = 0) throws {
+        precondition(Self.routedComputeWidths.contains(specializedTopK),
+                     "routed INT4 decode supports top-k "
+                     + "\(Self.routedComputeWidths.sorted())")
         self.realDecodeD = specializedD
         self.realDecodeF = specializedF
         self.realDecodeTopK = specializedTopK
         self.realDecodeNumExperts = specializedNumExperts
-        let activationConstants: [MetalFunctionConstant] = siluActivation
+        var activationConstants: [MetalFunctionConstant] = siluActivation
             ? [MetalFunctionConstant(index: 4, value: .bool(true))]
             : []
+        // `swigluLimit > 0` bakes DeepSeek's asymmetric pre-activation clamp
+        // (gate `<= limit`, up in `[-limit, limit]`) into the INT4 phase-1
+        // kernels through function constant 5 (`moe_swiglu_clamp`). Zero, the
+        // default, leaves the constant undefined so every existing caller's
+        // pipelines are byte-identical.
+        if swigluLimit > 0 {
+            activationConstants.append(MetalFunctionConstant(index: 5, value: .float(swigluLimit)))
+        }
         let moeConstants: [MetalFunctionConstant] = [
             MetalFunctionConstant(index: 0, value: .uint32(specializedD)),
             MetalFunctionConstant(index: 1, value: .uint32(specializedF)),
@@ -104,6 +141,12 @@ final class MoE {
         self.routerSelectK8SpecializedPSO = try context.pipeline(
             "router_topk_select_k8_par",
             constants: routerConstants)
+        // Flash-Next's top-10 over 512 experts. Same selection body, wider K and
+        // a 16-deep lane array; see `router_topk_select_softmax_par`.
+        self.routerSelectK10PSO = try context.pipeline("router_topk_select_k10_par")
+        self.routerSelectK10SpecializedPSO = try context.pipeline(
+            "router_topk_select_k10_par",
+            constants: routerConstants)
         self.phase1U16PSO = try context.pipeline(
             "moe_phase1_gate_up_act_u16load", constants: activationConstants)
         self.phase1U16SpecializedPSO = try context.pipeline(
@@ -118,6 +161,10 @@ final class MoE {
             "moe_phase2_down_reduce_k8_slotmap")
         self.phase2SlotmapSpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k8_slotmap", constants: moeConstants)
+        self.phase2SlotmapWidePSO = try context.pipeline(
+            "moe_phase2_down_reduce_slotmap_wide")
+        self.phase2SlotmapWideSpecializedPSO = try context.pipeline(
+            "moe_phase2_down_reduce_slotmap_wide", constants: moeConstants)
         self.residualAddGuardedPSO = try context.pipeline("residual_add_fp16_guarded")
         self.phase1SubsetU16PSO = try context.pipeline(
             "moe_phase1_gate_up_act_subset_u16load", constants: activationConstants)
@@ -132,9 +179,14 @@ final class MoE {
         self.phase2ReduceK6SpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_k6",
             constants: moeConstants)
+        // Flash-Next's top-10 width. The k6/k8 pipelines above are unchanged.
+        self.phase2ReduceK10PSO = try context.pipeline("moe_phase2_down_reduce_k10")
+        self.phase2ReduceK10SpecializedPSO = try context.pipeline(
+            "moe_phase2_down_reduce_k10",
+            constants: moeConstants)
 
         guard let logits = context.device.makeBuffer(
-            length: 256 * MemoryLayout<Float>.stride,
+            length: Int(Self.maxRouterExperts) * MemoryLayout<Float>.stride,
             options: .storageModeShared),
               let phase1Function = context.library.makeFunction(
                 name: "moe_phase1_gate_up_act_u16load") else {
@@ -163,8 +215,10 @@ final class MoE {
                                    d: UInt32,
                                    topK: UInt32) {
         precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
-        precondition(numExperts <= 256)
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(numExperts <= Self.maxRouterExperts,
+                     "router supports at most \(Self.maxRouterExperts) experts")
+        precondition(Self.routerTopKWidths.contains(topK),
+                     "router selection implements top-k \(Self.routerTopKWidths.sorted())")
 
         var expertCount = numExperts
         var dimension = d
@@ -188,8 +242,16 @@ final class MoE {
         }
 
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
-            encoder.setComputePipelineState(
-                useSpecialized ? routerSelectK8SpecializedPSO : routerSelectK8PSO)
+            let selectPSO: MTLComputePipelineState
+            switch topK {
+            case 10:
+                selectPSO = useSpecialized
+                    ? routerSelectK10SpecializedPSO : routerSelectK10PSO
+            default:
+                selectPSO = useSpecialized
+                    ? routerSelectK8SpecializedPSO : routerSelectK8PSO
+            }
+            encoder.setComputePipelineState(selectPSO)
             encoder.setBuffer(routerLogits, offset: 0, index: 0)
             encoder.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 1)
             encoder.setBuffer(outIndices, offset: 0, index: 2)
@@ -307,7 +369,7 @@ final class MoE {
                           allHit: MTLBuffer,
                           numExperts: UInt32,
                           topK: UInt32) {
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(Self.routedComputeWidths.contains(topK))
         var expertCount = numExperts
         var k = topK
         var stride = UInt32(slotStride)
@@ -323,6 +385,161 @@ final class MoE {
         encoder.dispatchThreadgroups(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    /// GPU-direct routed FFN for an immutable resident layer slab. The
+    /// identity slot table turns router ids into byte offsets, so routing,
+    /// expert compute, and reduction remain in the command buffer with no CPU
+    /// readback. Unlike `encodeSlotMapGuardedFFN`, this returns only the routed
+    /// result; Flash-Next applies its hyper-connection injection afterwards.
+    func encodeResidentSlabRouted(
+        commandBuffer: MTLCommandBuffer,
+        slab: MTLBuffer,
+        table: MTLBuffer,
+        slotStride: Int,
+        indices: MTLBuffer,
+        slotOffsets: MTLBuffer,
+        allHit: MTLBuffer,
+        routedOffsets: MoEExpertOffsets,
+        x: MTLBuffer,
+        acts: MTLBuffer,
+        routingWeights: MTLBuffer,
+        residual: MTLBuffer,
+        y: MTLBuffer,
+        d: UInt32,
+        f: UInt32,
+        numExperts: UInt32,
+        topK: UInt32
+    ) {
+        precondition(Self.routedComputeWidths.contains(topK))
+        encodeSlotLookup(commandBuffer: commandBuffer, indices: indices,
+                         table: table, slotStride: slotStride,
+                         slotOffsets: slotOffsets, allHit: allHit,
+                         numExperts: numExperts, topK: topK)
+
+        var offsets = routedOffsets
+        var dimension = d
+        var intermediate = f
+        var k = topK
+        let specialized = useRealDecodeConstants(d: d, f: f, topK: topK)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            preconditionFailure("resident-slab routed FFN: no compute encoder")
+        }
+        encoder.useResource(slab, usage: .read)
+        encoder.setComputePipelineState(
+            specialized ? phase1SlotmapSpecializedPSO : phase1SlotmapPSO)
+        encoder.setBuffer(slab, offset: 0, index: 0)
+        encoder.setBuffer(slotOffsets, offset: 0, index: 1)
+        encoder.setBuffer(allHit, offset: 0, index: 2)
+        encoder.setBytes(&offsets,
+                         length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+        encoder.setBuffer(x, offset: 0, index: 4)
+        encoder.setBuffer(acts, offset: 0, index: 5)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride,
+                         index: 7)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+        encoder.setComputePipelineState(
+            specialized ? phase2SlotmapWideSpecializedPSO : phase2SlotmapWidePSO)
+        encoder.setBuffer(slab, offset: 0, index: 0)
+        encoder.setBuffer(slotOffsets, offset: 0, index: 1)
+        encoder.setBuffer(allHit, offset: 0, index: 2)
+        encoder.setBytes(&offsets,
+                         length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+        encoder.setBuffer(acts, offset: 0, index: 4)
+        encoder.setBuffer(routingWeights, offset: 0, index: 5)
+        encoder.setBuffer(residual, offset: 0, index: 6)
+        encoder.setBuffer(y, offset: 0, index: 7)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride,
+                         index: 9)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 10)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: Int(d), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: Int(topK) * 32,
+                                           height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    /// Resident experts routed on the GPU (GLM-5.3-Flash). `indices` (the
+    /// router's top-k, uint32) resolve through `identityTable` (`slot_of[e] =
+    /// e`, Int16) to byte offsets `e * expertStride` inside `slab` (bound at
+    /// `slabOffset`), then the slot-map phase-1 / phase-2 bodies run the routed
+    /// FFN — no CPU round trip and no residual add: `y = residual + Σ_k w_k ·
+    /// down_k(act_k)`. The identity table makes `all_hit` always 1, so the
+    /// guarded bodies always run; the math bodies are the production ones, so
+    /// the output is byte-identical to the argument-buffer path fed the same
+    /// experts and weights. Sibling of `encodeResidentSlabRouted` (Flash-Next,
+    /// top-10 through the wide reduce); this one is the top-8 k8 reduce with a
+    /// slab offset.
+    func encodeRoutedResidentFFN(commandBuffer: MTLCommandBuffer,
+                                 slab: MTLBuffer,
+                                 slabOffset: Int,
+                                 expertStride: Int,
+                                 indices: MTLBuffer,
+                                 identityTable: MTLBuffer,
+                                 slotOffsets: MTLBuffer,
+                                 allHit: MTLBuffer,
+                                 routedOffsets: MoEExpertOffsets,
+                                 x: MTLBuffer,
+                                 acts: MTLBuffer,
+                                 routingWeights: MTLBuffer,
+                                 residual: MTLBuffer,
+                                 y: MTLBuffer,
+                                 numExperts: UInt32,
+                                 d: UInt32,
+                                 f: UInt32,
+                                 topK: UInt32) {
+        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(UInt64(expertStride) * UInt64(numExperts - 1) <= UInt64(UInt32.max),
+                     "resident slab offsets must fit 32 bits")
+        encodeSlotLookup(commandBuffer: commandBuffer, indices: indices, table: identityTable,
+                         slotStride: expertStride, slotOffsets: slotOffsets, allHit: allHit,
+                         numExperts: numExperts, topK: topK)
+        var offsets = routedOffsets
+        var dimension = d
+        var intermediate = f
+        var k = topK
+        let specialized = useRealDecodeConstants(d: d, f: f, topK: topK)
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            preconditionFailure("resident routed FFN: no compute encoder")
+        }
+        encoder.useResource(slab, usage: .read)
+        encoder.setComputePipelineState(
+            specialized ? phase1SlotmapSpecializedPSO : phase1SlotmapPSO)
+        encoder.setBuffer(slab, offset: slabOffset, index: 0)
+        encoder.setBuffer(slotOffsets, offset: 0, index: 1)
+        encoder.setBuffer(allHit, offset: 0, index: 2)
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+        encoder.setBuffer(x, offset: 0, index: 4)
+        encoder.setBuffer(acts, offset: 0, index: 5)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+        encoder.setComputePipelineState(
+            specialized ? phase2SlotmapSpecializedPSO : phase2SlotmapPSO)
+        encoder.setBuffer(slab, offset: slabOffset, index: 0)
+        encoder.setBuffer(slotOffsets, offset: 0, index: 1)
+        encoder.setBuffer(allHit, offset: 0, index: 2)
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+        encoder.setBuffer(acts, offset: 0, index: 4)
+        encoder.setBuffer(routingWeights, offset: 0, index: 5)
+        encoder.setBuffer(residual, offset: 0, index: 6)
+        encoder.setBuffer(y, offset: 0, index: 7)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: Int(d), height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         encoder.endEncoding()
     }
 
@@ -415,10 +632,14 @@ final class MoE {
         var intermediate = f
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         let specialized = useRealDecodeConstants(d: d, f: f, topK: topK)
-        if topK == 6 {
+        switch topK {
+        case 6:
             encoder.setComputePipelineState(
                 specialized ? phase2ReduceK6SpecializedPSO : phase2ReduceK6PSO)
-        } else {
+        case 10:
+            encoder.setComputePipelineState(
+                specialized ? phase2ReduceK10SpecializedPSO : phase2ReduceK10PSO)
+        default:
             encoder.setComputePipelineState(
                 specialized ? phase2ReduceK8SpecializedPSO : phase2ReduceK8PSO)
         }
@@ -440,9 +661,13 @@ final class MoE {
     }
 
     private func validate(routedBlobs: [(buffer: MTLBuffer, offset: Int)], topK: UInt32) {
-        precondition(topK == 6 || topK == 8,
-                     "routed INT4 decode supports top-k 6 or 8")
+        precondition(Self.routedComputeWidths.contains(topK),
+                     "routed INT4 decode supports top-k "
+                     + "\(Self.routedComputeWidths.sorted())")
         precondition(routedBlobs.count == Int(topK))
+        precondition(routedBlobs.count <= Self.routedBlobSlots,
+                     "the RoutedBlobs argument buffer holds "
+                     + "\(Self.routedBlobSlots) slots")
     }
 
     private func encodeRoutedArgumentBuffer(_ buffer: MTLBuffer,

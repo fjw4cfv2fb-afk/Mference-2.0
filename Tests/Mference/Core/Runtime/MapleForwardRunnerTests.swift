@@ -243,7 +243,7 @@ import Testing
         #expect(model.integrityPolicy == .sizeCheckTrustedReceipt)
         #expect(model.routedExpertCacheSlotCount(layer: 0) == 8)
         #expect(runtime.prefillConfig == requested.prefillConfig)
-        #expect(runtime.executedPrefillMode == .chunked)
+        #expect(runtime.executedPrefillMode == .unreported)
         #expect(runtime.kvStorageMode == .bf16)
         #expect(runtime.producer is any ChunkedPrefillRunner)
         #expect(!(runtime.producer is any FusedHeadLogitProducer))
@@ -324,7 +324,7 @@ import Testing
                                                        useMapleFlashHead: true))
         let runner = try #require(runtime.producer as? MapleForwardRunner)
         #expect(runtime.prefillConfig == .off)
-        #expect(runtime.executedPrefillMode == .off)
+        #expect(runtime.executedPrefillMode == .unreported)
         #expect(runtime.kvStorageMode == .bf16)
 
         let logits = try makeLogits(fixture.context)
@@ -336,6 +336,42 @@ import Testing
         let prefill: any ExactPrefillLogitProducer = runner
         try await prefill.produceExactPrefill(token: 0, position: 0, into: logits)
         #expect(bits(logits).allSatisfy { $0 == 0 })
+    }
+
+    @Test func interruptedWarmAppendRequiresReset() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let runner = try MapleForwardRunner(model: fixture.model(), context: fixture.context,
+                                            maxContext: 8)
+        let logits = try makeLogits(fixture.context)
+        let tokens: [Int32] = [0, 0, 0, 0]
+        _ = try await runner.prefillChunked(tokens: tokens.prefix(2), startPosition: 0,
+            outputMode: .logits, config: .production(chunkTokens: 64),
+            into: logits, onProgress: { _ in })
+        let reference = bits(logits)
+        runner.prefillWillEncodeLayer = { if $0 == 1 { throw CancellationError() } }
+        do {
+            _ = try await runner.prefillChunked(tokens: tokens[2..<4], startPosition: 2,
+                outputMode: .logits, config: .production(chunkTokens: 64),
+                into: logits, onProgress: { _ in })
+            Issue.record("expected cancellation after the first layer")
+        } catch is CancellationError {}
+        #expect(throws: (any Error).self) {
+            try runner.prepareForContinuation(expectedPosition: 2)
+        }
+        do {
+            try await runner.produce(token: 0, position: 2, into: logits)
+            Issue.record("dirty state must reject decode")
+        } catch is PrefillError {}
+        runner.prefillWillEncodeLayer = nil
+        runner.reset()
+        _ = try await runner.prefillChunked(tokens: tokens.prefix(2), startPosition: 0,
+            outputMode: .logits, config: .production(chunkTokens: 64),
+            into: logits, onProgress: { _ in })
+        #expect(bits(logits) == reference)
+        try runner.prepareForContinuation(expectedPosition: 2)
+        try await runner.produce(token: 0, position: 2, into: logits)
+        #expect(bits(logits).allSatisfy { Float16(bitPattern: $0).isFinite })
     }
 
     @Test func mapleChunkedPrefill_matchesSequentialLogitsAndContinuation() async throws {
@@ -359,7 +395,10 @@ import Testing
             config: .production(chunkTokens: 32), into: chunkedLogits,
             onProgress: { progress.append($0) })
 
-        #expect(result == PrefillResult(newPosition: 2, seed: .logitsWritten))
+        #expect(result.newPosition == 2)
+        #expect(result.seed == .logitsWritten)
+        #expect(result.execution?.batchedTokens == 2)
+        #expect(result.execution?.replayedTokens == 0)
         #expect(progress == [2])
         #expect(bits(chunkedLogits) == expected)
         #expect(chunked.continuationPosition == 2)
@@ -485,7 +524,7 @@ import Testing
         #expect(runtime.producer is RealForwardRunner)
         #expect(runtime.producer is any ChunkedPrefillRunner)
         #expect(runtime.prefillConfig == requested.prefillConfig)
-        #expect(runtime.executedPrefillMode == .chunked)
+        #expect(runtime.executedPrefillMode == .unreported)
         #expect(runtime.kvStorageMode == .fp16)
         #expect((runtime.producer as? any FusedHeadLogitProducer)?.usesFusedGreedyHead == true)
     }

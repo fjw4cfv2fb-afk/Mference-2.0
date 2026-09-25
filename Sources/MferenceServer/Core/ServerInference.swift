@@ -4,23 +4,29 @@ import Mference
 
 public enum ServerInferenceEvent: Equatable, Sendable {
     case content(String)
+    case reasoning(String)
     case toolCall(ParsedToolCall)
 }
 
 public struct ServerCompletion: Equatable, Sendable {
+    public var reasoningContent: String? = nil
     public let content: String
     public let toolCalls: [ParsedToolCall]
     public let finishReason: String
     public let usage: OpenAIUsage
+    /// Operator-only diagnostics, not part of the OpenAI response body.
+    public let diagnostics: RuntimeDiagnostics?
 
     public init(content: String,
                 toolCalls: [ParsedToolCall],
                 finishReason: String,
-                usage: OpenAIUsage) {
+                usage: OpenAIUsage,
+                diagnostics: RuntimeDiagnostics? = nil) {
         self.content = content
         self.toolCalls = toolCalls
         self.finishReason = finishReason
         self.usage = usage
+        self.diagnostics = diagnostics
     }
 }
 
@@ -40,6 +46,8 @@ public struct PreparedGeneration: Sendable {
 }
 
 public protocol ServerInferenceBackend: Sendable {
+    var usesSwiftQwenTemplate: Bool { get }
+    var supportsQwenReasoningEffort: Bool { get }
     /// Everything that can reject a request must happen here, because the
     /// caller commits the response status once `generate` starts: a streaming
     /// request has `200` and the SSE head on the wire by then, and no status
@@ -51,6 +59,8 @@ public protocol ServerInferenceBackend: Sendable {
 }
 
 extension ServerInferenceBackend {
+    public var usesSwiftQwenTemplate: Bool { false }
+    public var supportsQwenReasoningEffort: Bool { usesSwiftQwenTemplate }
     /// Backends that do not tokenize inherit a pass-through. A backend that
     /// renders a prompt must override this, or `generate` receives no tokens.
     public func prepare(_ request: ValidatedChatRequest) async throws -> PreparedGeneration {
@@ -165,21 +175,17 @@ public actor ServerCoordinator {
     public var isActive: Bool { active }
 }
 
-public actor ServerModelSession: ServerInferenceBackend {
+public actor ServerModelSession: ServerLoadedModel {
+    public nonisolated let usesSwiftQwenTemplate: Bool
+    public nonisolated let supportsQwenReasoningEffort: Bool
     /// Chat dialect of the loaded tokenizer; drives request-validation rules.
     public nonisolated let chatDialect: ChatDialect
     /// Family-derived API model identifier used when --model-id is absent.
     public nonisolated var defaultModelID: String {
-        switch modelFamily {
-        case .gemma4: return "gemma-4-26b-a4b-it"
-        case .qwen36: return "qwen3.6-35b-a3b"
-        case .qwen38: return "qwen3.8-27b-4bit"
-        case .deepseekV4Flash: return "deepseek-v4-flash-2bit-dq"
-        case .inklingSmall: return "inkling-small-4bit"
-        case .maple: return "maple-preview-2bit-mlx"
-        }
+        ServerFamilyModelID.modelID(for: modelFamily, checkpointID: checkpointID)
     }
     private nonisolated let modelFamily: ModelFamily
+    private nonisolated let checkpointID: String
 
     private let context: MetalContext
     private let model: Model
@@ -202,13 +208,18 @@ public actor ServerModelSession: ServerInferenceBackend {
             throw MFTokenizerError.missingToolTemplate
         }
         let templateURL = tokenizerFolder.appendingPathComponent("chat_template.jinja")
-        let tokenizer = try await MFTokenizer.load(from: tokenizerFolder, family: family)
+        let tokenizer = try await MFTokenizer.load(forModelDirectory: modelDirectory)
         // DeepSeek ships no chat_template.jinja — its chat framing is native
         // Swift — so the prompt-cache identity hashes a pinned constant that
         // changes only when that native render does. Every other dialect
         // still requires the bundled template.
         let templateData: Data
-        if FileManager.default.fileExists(atPath: templateURL.path) {
+        if tokenizer.dialect == .glm5 {
+            // GLM-5.3 ships a chat_template.jinja but the dialect renders
+            // natively (`Glm5ChatTemplate.swift`); the identity follows the
+            // native render, not the sidecar.
+            templateData = Data("native:glm5:v1".utf8)
+        } else if FileManager.default.fileExists(atPath: templateURL.path) {
             templateData = try Data(contentsOf: templateURL)
         } else if tokenizer.dialect == .deepseek {
             templateData = Data("native:deepseek:v1".utf8)
@@ -278,8 +289,11 @@ public actor ServerModelSession: ServerInferenceBackend {
         self.context = context
         self.model = model
         self.tokenizer = tokenizer
+        self.usesSwiftQwenTemplate = tokenizer.isSwiftQwen
+        self.supportsQwenReasoningEffort = tokenizer.supportsQwenReasoningEffort
         self.chatDialect = tokenizer.dialect
         self.modelFamily = model.config.family
+        self.checkpointID = model.modelID
         self.runner = runner
         self.scratch = scratch
         self.prefillConfig = prefillConfig
@@ -297,11 +311,12 @@ public actor ServerModelSession: ServerInferenceBackend {
                 $0.role == .developer || $0.role == .tool || !$0.toolCalls.isEmpty
             }
         let promptIDs: [Int32]
-        if needsToolTemplate {
-            promptIDs = try tokenizer.encodeToolChat(messages: request.messages, tools: request.tools)
-        } else {
-            let rendered = try tokenizer.applyChatTemplate(request.messages)
-            promptIDs = tokenizer.encode(rendered, addBOS: false)
+        do {
+            promptIDs = try tokenizer.encodeChat(messages: request.messages, tools: request.tools,
+                                                reasoningEffort: request.reasoningEffort)
+        } catch {
+            throw ServerRequestError.invalid(message: String(describing: error),
+                                              param: "messages", code: "invalid_chat_template")
         }
         guard promptIDs.count < maxContext else {
             throw ServerRequestError.invalid(
@@ -363,14 +378,26 @@ public actor ServerModelSession: ServerInferenceBackend {
             maxContext - effectivePromptIDs.count)
         config.stopStrings = []
 
-        let decoder = needsToolTemplate || tokenizer.generationPromptStartsInThinking
+        let startsInThinking = tokenizer.startsInThinking(
+            reasoningEffort: request.reasoningEffort, promptIDs: effectivePromptIDs)
+        let countsPayloadTokens = tokenizer.dialect == .chatml
+            || tokenizer.dialect == .glm5 || tokenizer.dialect == .minicpm
+        let decoder = countsPayloadTokens || needsToolTemplate || startsInThinking
             ? StructuredAssistantDecoder(
                 tokenizer: tokenizer,
                 allowedTools: Set(request.tools.map(\.name)),
-                startsInThought: tokenizer.generationPromptStartsInThinking)
+                startsInThought: startsInThinking,
+                toolDefinitions: request.tools)
             : nil
         var stopMatcher = StreamingStopMatcher(stops: request.generationConfig.stopStrings)
         var content = ""
+        var reasoning = ""
+        if tokenizer.usesSourceQwenTemplate(reasoningEffort: request.reasoningEffort) {
+            decoder?.onReasoning = { text in
+                reasoning += text
+                onEvent(.reasoning(text))
+            }
+        }
         var calls: [ParsedToolCall] = []
         var decodingError: Error?
         var shouldStop = false
@@ -475,16 +502,26 @@ public actor ServerModelSession: ServerInferenceBackend {
                 content: content,
                 calls: calls,
                 result: result,
+                reasoningContent: reasoning.isEmpty ? nil : reasoning,
                 stopStringFiltered: stopMatcher.isStopped)
         }
         completed = true
-        return ServerCompletion(
+        var completion = ServerCompletion(
             content: content,
             toolCalls: calls,
             finishReason: reason,
             usage: OpenAIUsage(promptTokens: result.prefillTokens,
                                completionTokens: result.newTokens,
                                totalTokens: result.prefillTokens + result.newTokens,
-                               cachedTokens: result.cachedPromptTokens))
+                               cachedTokens: result.cachedPromptTokens,
+                               completionTokensDetails: decoder?.payloadTokenCounts.map {
+                                   .init(reasoningTokens: $0.reasoning,
+                                         visibleTokens: stopMatcher.isStopped ? nil : $0.visible)
+                               }),
+            diagnostics: RuntimeDiagnostics.enabled ? RuntimeDiagnostics(
+                result: result,
+                memory: .capture(model: model, producer: runner, scratch: scratch)) : nil)
+        completion.reasoningContent = reasoning.isEmpty ? nil : reasoning
+        return completion
     }
 }

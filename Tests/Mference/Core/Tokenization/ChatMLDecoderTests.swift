@@ -45,6 +45,32 @@ struct ChatMLDecoderTests {
         #expect(!d.hasToolCalls)
     }
 
+    @Test("Payload counts exclude markers, tools, stop tokens and flushes")
+    func payloadCounts() throws {
+        let d = StructuredAssistantDecoder(tokenizer: tok, allowedTools: ["get_weather"],
+                                           startsInThought: true)
+        let hidden = "hidden reasoning"
+        let visible = "visible answer"
+        _ = try feed(hidden + "</think>" + visible, into: d)
+        _ = try feed("<tool_call>\n<function=get_weather>\n</function>\n</tool_call>", into: d)
+        _ = try d.consumeFlushedText("buffered tail")
+        let counts = try #require(d.payloadTokenCounts)
+        #expect(counts.reasoning == tok.encode(hidden, addBOS: false).count)
+        #expect(counts.visible == tok.encode(visible, addBOS: false).count)
+        _ = try d.consume(tokenID: tok.endOfTurnID, delta: "")
+        #expect(d.payloadTokenCounts == counts)
+    }
+
+    @Test("A buffered byte token counts even before it emits text")
+    func emptyDeltaCounts() throws {
+        let d = decoder()
+        let token = try #require(tok.encode("a", addBOS: false).first)
+        _ = try d.consume(tokenID: token, delta: "")
+        _ = try d.consumeFlushedText("a")
+        #expect(d.payloadTokenCounts?.visible == 1)
+        #expect(d.payloadTokenCounts?.reasoning == 0)
+    }
+
     @Test("Think spans are suppressed, text after them is visible")
     func thinkSuppression() throws {
         let d = decoder()
@@ -79,6 +105,26 @@ struct ChatMLDecoderTests {
         #expect(visibleText(events) == "Checking the weather now.\n\n")
         #expect(d.hasToolCalls)
         _ = try d.finish()
+    }
+
+    @Test(arguments: ["boolean", "string"])
+    func streamedCaseVariantUsesDeclaredType(type: String) throws {
+        let tool = MFTokenizer.FunctionDefinition(name: "set_preview", description: "Set preview",
+            parameters: .object(["type": .string("object"), "properties": .object([
+                "enabled": .object(["type": .string(type)])
+            ])]))
+        let d = StructuredAssistantDecoder(tokenizer: tok, allowedTools: [tool.name],
+            startsInThought: true, toolDefinitions: [tool], idGenerator: { "call_fixed" })
+        var events = try feed("The preview must be disabled.</think>", into: d)
+        events += try feed("<tool_call>\n<function=set_preview>\n<parameter=enabled>\nFalse\n</parameter>\n</function>\n</tool_call>", into: d)
+        events += try d.finish()
+        let calls = events.compactMap { event -> ParsedToolCall? in
+            if case .toolCall(let call) = event { return call }
+            return nil
+        }
+        #expect(calls.count == 1)
+        #expect(calls.first?.arguments == .object(["enabled": type == "boolean" ? .bool(false) : .string("False")]))
+        #expect(!visibleText(events).contains("preview must"))
     }
 
     @Test("Unknown tool inside a call fails closed")

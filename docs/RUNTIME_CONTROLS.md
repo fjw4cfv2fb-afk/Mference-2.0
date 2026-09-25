@@ -1,16 +1,10 @@
 # Runtime controls
 
-The Mac app exposes generation and runtime controls in its collapsible right
-settings pane. Use the right-sidebar button in the status bar or
-<kbd>Shift</kbd>+<kbd>Command</kbd>+<kbd>I</kbd> to hide or restore it.
-Existing families use FP16 KV; Maple uses native BF16 KV. Generation settings
-apply to the next request; load-time settings require a reload.
-
-Chat navigation lives separately in the collapsible left sidebar. Use its
-**New chat** button or <kbd>Command</kbd>+<kbd>N</kbd> to create an independent
-context. The left-sidebar buttons or
-<kbd>Control</kbd>+<kbd>Command</kbd>+<kbd>S</kbd> toggle the chat list without
-changing the right settings pane.
+The CLI and the loopback server expose Mference's generation and runtime
+controls; Open WebUI reaches the same generation controls through the server's
+Chat Completions request fields. Existing families use FP16 KV; Maple uses
+native BF16 KV. Generation settings apply to the next request; load-time
+settings are fixed for the life of a loaded model.
 
 ## CLI modes
 
@@ -47,13 +41,14 @@ conversation is left untouched.
 
 ## Generation controls
 
-The Mac app and CLI expose these generation controls:
+The CLI and server expose these generation controls:
 
-| Control | Mac values | CLI flag | Default | Effect |
+| Control | Values | CLI flag | Default | Effect |
 | --- | --- | --- | --- | --- |
-| Maximum response | Automatic | `--max-new` | App: remaining context; CLI: 1,024 tokens | The app can use the context space left after formatting the prompt. The CLI uses its explicit or default `--max-new` limit. |
-| Maximum context | 4K, 8K, 16K, 32K, 64K, 128K | `--max-context` | 4K | Sets prompt plus response capacity. The app shows the selected model's KV-memory delta. Maple supports 128000 tokens in the runtime, CLI, and server; other family or product limits may differ. |
-| Temperature | 0...2 in 0.05 steps | `--temperature` | 0.2 | `0` is greedy; positive values sample. |
+| Maximum response | 1 up to the remaining context | `--max-new` | 1,024 tokens | Caps generated tokens, including hidden reasoning. A request may use only the context space left after formatting the prompt; a limit reached during reasoning can leave the visible answer empty. |
+| Maximum context | 4K, 8K, 16K, 32K, 64K, 128K | `--max-context` | CLI 4K; server/UI 16K | Sets prompt plus response capacity. Maple supports 128000 tokens in the runtime, CLI, and server; other family or product limits may differ. A selectable context is not a fresh hardware qualification. |
+| Qwen 3.8 reasoning effort | `xhigh`, `medium`, `low`, `none` | `--reasoning-effort` | Swift: `xhigh`; base: unchanged legacy policy when omitted | Base/Swift Qwen 3.8 only; chat/messages mode, not raw completion. Server field: `reasoning_effort`. An explicit value selects the installed source template for either checkpoint. `medium` adds no effort instruction; `none` closes thinking in the prompt. Other checkpoints reject this explicit parameter. |
+| Temperature | 0...2 | `--temperature` | 0.2 | `0` is greedy; positive values sample. |
 | Top-K | Off or 1...256 | `--top-k` | 64 | Keeps at most K candidates. CLI `0` turns it off. |
 | Top-P | Off or 0.01...1 | `--top-p` | 0.95 | Applies nucleus truncation before Top-K and is effective only while Top-K is enabled. |
 
@@ -63,21 +58,24 @@ Generation controls apply to the next request and do not require a model
 reload. They are interactive product settings, not the fixed community
 benchmark protocol.
 
+If a CLI chat exhausts its token budget before emitting visible text, stderr
+now explains the truncation and points to budget controls (and Swift's supported
+effort controls when applicable). It does not invent an answer, change settings
+automatically, or treat a truncated reply as an end-of-turn success.
+
 ## Runtime settings
 
 | Control | Values | CLI flag | Production default | Effect |
 | --- | --- | --- | --- | --- |
-| Expert-cache slots | 8, 16, 24, 32, 64, 96, 128; CLI also accepts resident and auto | `--expert-cache-slots` | App: 16; CLI/server auto | Auto always uses the slot cache: Qwen gets 96 slots on hosts with at least 24 GiB, 32 with at least 16 GiB, and 16 otherwise; other families get 16. `resident` maps every layer file once and skips the slot cache entirely — it lost the community A/B to the slot rungs (page-cache thrash), so it remains an explicit opt-in. More slots retain more routed experts and reduce later reads at the cost of RAM. |
-| Prompt prefill | On, off | — | On | On requests the family prefill path. Maple uses a native-BF16 chunked path that preserves token-ordered K/V commits and attention; other families use their own supported paths. Off selects correctness-first scalar replay rather than skipping prompt processing. |
+| Expert-cache slots | 8, 16, 24, 32, 64, 96, 128; CLI also accepts resident and auto | `--expert-cache-slots` | CLI/server auto | Qwen 3.6 auto uses 96 slots on hosts with at least 24 GiB, 32 with at least 16 GiB, and 16 otherwise. Flash-Next auto maps the routed-expert pool on hosts with at least 192 GiB when that pool plus the core leaves 32 GiB of headroom; otherwise it uses 16 slots. GLM selects resident when its pool plus core plus 48 GiB of reserve fits physical memory; otherwise it uses 16 slots. Other families use 16. `resident` maps every layer file once and skips the slot cache. This won for Flash-Next on the 256 GiB M3 Ultra but lost the Qwen 3.6 community A/B on 24 GiB because of page-cache pressure, so it is not a universal default. More slots retain more routed experts and reduce later reads at the cost of RAM. Ordinary RSS substantially undercounts clean file-backed pages in resident mode. |
+| Prompt prefill | On, off | — | On | On requests chunked prefill. The merged GLM bounded-expert path and DeepSeek sparse-cutover path now batch rather than replaying the full model per prompt token. Real-checkpoint and hardware coverage remains separate: see the [qualification matrix](PREFILL_QUALIFICATION.md). Recurrent scans inside a layer-major GPU batch still advance in token order where required. Off selects scalar replay, not skipped prompt processing. [Runtime diagnostics](RUNTIME_DIAGNOSTICS.md) reports actual per-request counts and separate memory metrics. |
 | RDADVISE | Off, Default, Bounded, Adaptive | `--rdadvise` | Off | Applies experimental read advice. Its effect depends on the workload; it may help a short decode and slow a long one. |
 | Prefill chunk tokens | 32, 64, 128, 256, 512, 1024, 2048, 4096, or auto | `--prefill-chunk` | Auto (one-shot); 128 (`--chat`) | Tokens processed per prefill chunk. Larger chunks re-read the routed experts fewer times, which lowers prefill I/O and time. `auto` picks the smallest allowed size that covers a one-shot prompt; interactive `--chat` resolves auto to 128 for its growing conversation. Maple stages each chunk layer-major but preserves its fixed 512-slot sliding-cache semantics by committing and attending rows in time order. |
 | Maple FlashHead | Off, on | `--flash-head` | Off | Enables Maple's approximate singleton-decode candidate head when the install carries validated FlashHead tensors. It leaves all non-candidates at negative infinity, so sampling is restricted to selected rows. Prefill and the default decode head remain exact; an install without the data falls back to the exact head. |
-| Model verification | Full SHA-256, trusted receipt | `--verify` | Full SHA-256 | `full-sha256` re-hashes each routed-expert file on first touch, which for a 145 GB expert pool costs about 59 s inside the first prefill. `trusted-receipt` instead checks each file's size against the receipt written at install time; the receipt itself is still validated against the manifest hash, and `model_weights.bin` and `layout.json` are still hashed. It trades detection of size-preserving corruption for that time. The Mac app exposes the same choice. |
+| Model verification | Full SHA-256, trusted receipt | `--verify` | Full SHA-256 | `full-sha256` re-hashes each routed-expert file on first touch, which for a 145 GB expert pool costs about 59 s inside the first prefill. `trusted-receipt` instead checks each file's size against the receipt written at install time; the receipt itself is still validated against the manifest hash, and `model_weights.bin` and `layout.json` are still hashed. It trades detection of size-preserving corruption for that time. |
 
-The prefill chunk size and FlashHead switch are CLI controls; the Mac app uses the default exact head. The Mac
-app also keeps its explicit 16-slot default so an existing memory preference is
-never silently enlarged; Qwen users on larger Macs can select a larger rung in
-the inspector.
+The prefill chunk size and FlashHead switch are CLI-only controls; every other
+surface uses the default exact head.
 The CLI applies these settings when it loads the model, so each run uses the
 values passed on its command line. Setting `MFERENCE_PHASES=1` makes the
 CLI print the decode phase report after the timing footer: `cb1` and `cb2`
@@ -100,8 +98,16 @@ selects the speculative-prefetch mode — shadow prefetch is the accepted
 DeepSeek-V4-Flash default, off elsewhere — and `MFERENCE_SHADOW_BUDGET` caps
 its per-layer speculative reads. For Qwen 3.8, `MFERENCE_MTP=0` disables MTP
 speculative decoding (on by default for greedy decode when the install
-carries the attached MTP tensors) and `MFERENCE_MTP_K` (1–6, default 3) sets
-the draft depth. All are byte-identical toggles, not quality controls.
+carries the attached MTP tensors; **off by default for the Swift-Qwen candidate**)
+and `MFERENCE_MTP_K` (1–6, default 3) sets
+the draft depth. `MFERENCE_DFLASH2_DIR` points at a DFlash2 drafter
+checkpoint and swaps the round's draft source to it (draft depth defaults
+to 6; see docs/QWEN38_DFLASH2.md); `MFERENCE_DFLASH2_BF16=1` skips its
+load-time INT4 quantization for reference runs. All are byte-identical
+toggles, not quality controls.
+
+Flash-Next's installer carries an MTP sidecar, but native Flash-Next speculative
+execution is not implemented. The dense Qwen MTP switches do not activate it.
 
 Changing context length, expert-cache slots, RDADVISE, model verification,
 prompt-prefill enablement, the prefill chunk size, or FlashHead selection
@@ -110,10 +116,9 @@ Some sampling changes also require a reload because greedy and sampled
 generation use different output-head paths.
 
 Multi-turn chat history is fitted with the model tokenizer before generation.
-When older complete turns no longer fit, the app runs a bounded local
-compression pass and replaces those turns in model context with a rolling
-summary. The full transcript stays available in the UI, and each chat keeps a
-separate summary. The current user turn is never silently discarded.
+The bounded local compression pass that replaced older turns with a rolling
+summary belonged to the removed Mac app; the CLI and server instead drop the
+oldest messages, and never silently discard the current user turn.
 
 ## Run an experiment
 

@@ -11,6 +11,98 @@ enum RepackModelFamily: String, Sendable, Equatable {
     case deepseekV4Flash = "deepseekV4Flash"
     case inklingSmall = "inklingSmall"
     case maple = "maple"
+    /// Qwen3.8-Flash-Next. Repacked from the vendor's original BF16 repo and
+    /// executed by `FlashNextForwardRunner`; its capability gate was lifted on
+    /// 2026-09-10, so `ManifestReader.peekFamily` resolves it like any other
+    /// shipped family.
+    case qwen38flashnext = "qwen38flashnext"
+    /// MiniCPM5-2B: plain-llama dense. Installed from the vendor's BF16 repo
+    /// (quantize-in-flight) and, as the W2.1b control, from the vendor's own
+    /// MLX INT4 conversion (pre-quantized path). Bare `model.` prefix and a
+    /// top-level `lm_head.weight` on both.
+    case minicpm5 = "minicpm5"
+    /// GLM-5.3-Flash. Installed from PipeNetwork's mixed 4/8-bit MLX
+    /// conversion (pre-quantized path) under its `language_model.` names.
+    /// Gated in `ManifestReader.familiesWithoutRunner` until its runner lands.
+    case glm53Flash = "glm53Flash"
+}
+
+/// Axes GLM-5.3-Flash introduces beyond the shipped families' geometry.
+/// Mirrored into `manifest.json -> arch` under these exact field names so the
+/// runtime validates them field by field against `Glm53Config`, and published
+/// with `requiredAxes` so the capability gate can refuse the install by axis
+/// name until the kernels exist.
+struct Glm53Axes: Sendable, Equatable {
+    /// The tokenizer's id count behind the 154,880-row embedding: 154,820 BPE
+    /// entries plus 36 added tokens (`<|endoftext|>` … `<|video|>`). The
+    /// runtime masks the padding rows at the head.
+    static let unpaddedVocabSize = 154_856
+    /// The pinned checkpoint's embedding / head row count; only a config with
+    /// this `vocab_size` carries the padding above.
+    static let paddedVocabSize = 154_880
+
+    /// Width of the shared attention latent (K = V) on sparse layers.
+    let kvLoraRank: Int
+    /// Query head width on sparse layers; there is no rotary part.
+    let qkNopeHeadDim: Int
+    /// Per-head output width unfolded from the latent.
+    let vHeadDim: Int
+    /// Consecutive tokens pooled into one indexer key.
+    let indexKPool: Int
+    let indexKPoolAlwaysSelectTail: Bool
+    /// The indexer key LayerNorm's epsilon (the reference hard-codes 1e-6).
+    let indexerKNormEps: Double
+    /// `linear_attn_config.gate_lower_bound`: the KDA decay's log-space floor.
+    let kdaGateLowerBound: Double
+    /// `rms_norm_eps` verbatim (1e-5 in production).
+    let rmsNormEps: Double
+
+    /// Axis names the runner must implement before this family can decode.
+    /// Published verbatim as `arch.requiredAxes`; the runtime's
+    /// `ManifestReader.glm53RequiredAxes` is the same list.
+    static let requiredAxisNames = [
+        "kimiDeltaAttention",
+        "nopeLatentSparseAttention",
+        "pooledLightningIndexer",
+    ]
+}
+
+/// Axes Qwen3.8-Flash-Next introduces beyond the shipped families' geometry.
+/// They are mirrored into `manifest.json -> arch` under these exact field names
+/// so the runtime validates them field by field against its own baseline — and
+/// so a capability gate, in the era before a family's kernels land, can refuse
+/// an install **by axis name** rather than guessing from dimensions.
+struct FlashNextAxes: Sendable, Equatable {
+    /// Low-rank hyper-connections: `hc_count` residual streams mixed through an
+    /// `hc_lowrank` factorization per sub-block.
+    let hcCount: Int
+    let hcLowRank: Int
+    /// DSA-style learned sparse-attention indexer.
+    let indexerNumHeads: Int
+    let indexerHeadDim: Int
+    let indexerNumKVHeads: Int
+    let indexerBudget: Int
+    let indexerCompressRatio: Int
+    /// Per-layer n-gram embedding (PLE / engram).
+    let pleLayerIDs: [Int]
+    /// `split_ngram_parts`: how many shards the n-gram table arrives in.
+    let pleNgramShardCount: Int
+    /// `ngram_vocab_size_base` **verbatim**. This is the PER-HEAD base vocab
+    /// (20,000,000 in production), *not* the table's row count: the real total
+    /// is the sum of `ngram_heads_vocab_sizes` (~320M). True row counts are
+    /// derived from the shard headers at plan time and published in
+    /// `manifest.plePool.layers[].rows` and `...shards[].rows`; nothing
+    /// validates against this field.
+    let pleNgramVocabSizeBase: Int
+    let pleConvKernelSize: Int
+
+    /// Axis names the runner must implement before this family can decode.
+    /// Published verbatim as `arch.requiredAxes`.
+    static let requiredAxisNames = [
+        "hyperConnectionsLowRank",
+        "attentionIndexer",
+        "pleNgramEmbedding",
+    ]
 }
 
 /// Architecture facts mirrored into `manifest.json -> arch`. Cross-checked by
@@ -107,6 +199,16 @@ struct ArchInfo: Sendable, Equatable {
     let routerGlobalScale: Bool
     let unpaddedVocabSize: Int
 
+    /// Qwen3.8-Flash-Next's three new axes. Nil for every other family, so
+    /// their manifests are unchanged.
+    let flashNext: FlashNextAxes?
+    /// Per-head q/k RMSNorm gains on full-attention layers. Defaults to the
+    /// Gemma behavior; only plain-llama families (MiniCPM5) set it false.
+    let qkNorm: Bool
+    /// GLM-5.3-Flash's new axes. Nil for every other family, so their
+    /// manifests are unchanged.
+    let glm53: Glm53Axes?
+
     init(hiddenSize: Int,
          intermediateSize: Int,
          moeIntermediateSize: Int,
@@ -177,7 +279,13 @@ struct ArchInfo: Sendable, Equatable {
          routerGateBias: Bool = false,
          routerNormAfterTopK: Bool = false,
          routerGlobalScale: Bool = false,
-         unpaddedVocabSize: Int = 0) {
+         unpaddedVocabSize: Int = 0,
+         flashNext: FlashNextAxes? = nil,
+         qkNorm: Bool = true,
+         glm53: Glm53Axes? = nil) {
+        self.flashNext = flashNext
+        self.qkNorm = qkNorm
+        self.glm53 = glm53
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
         self.moeIntermediateSize = moeIntermediateSize
@@ -264,8 +372,19 @@ struct ArchInfo: Sendable, Equatable {
         if (root["model_type"] as? String) == "maple" {
             return try loadMaple(configPath: configPath, tc: root)
         }
+        // MiniCPM5 is a flat `LlamaForCausalLM` config. The loader is keyed on
+        // the llama model type because that is all a config carries; the
+        // production cross-check below refuses any llama config that is not
+        // the pinned MiniCPM5-2B shape, and the installer's source
+        // fingerprint refuses any repo that is not the pinned one.
+        if (root["model_type"] as? String) == "llama" {
+            return try loadMiniCPM5(configPath: configPath, root: root)
+        }
         guard let tc = root["text_config"] as? [String: Any] else {
             throw RepackError.configJsonInvalid(path: configPath, detail: "no text_config")
+        }
+        if (root["model_type"] as? String) == "glm5_next" {
+            return try loadGlm53Flash(configPath: configPath, tc: tc)
         }
         if (root["model_type"] as? String) == "qwen3_5_moe" {
             return try loadQwen36(configPath: configPath, tc: tc)
@@ -273,10 +392,259 @@ struct ArchInfo: Sendable, Equatable {
         if (root["model_type"] as? String) == "qwen3_5" {
             return try loadQwen38(configPath: configPath, tc: tc)
         }
+        if (root["model_type"] as? String) == "qwen4_exp" {
+            return try loadQwen38FlashNext(configPath: configPath, tc: tc)
+        }
         if (root["model_type"] as? String) == "inkling_mm_model" {
             return try loadInklingSmall(configPath: configPath, tc: tc)
         }
         return try loadGemma4(configPath: configPath, tc: tc)
+    }
+
+    // MARK: - GLM-5.3-Flash (`model_type == "glm5_next"`)
+
+    /// `tc` is `config.json -> text_config` of the `glm5_next` checkpoint (the
+    /// vision tower rides `vision_config` and is dropped by the planner).
+    ///
+    /// The layer kinds ride `layer_types`: `linear_attention` is Kimi Delta
+    /// Attention (mask 7) and `deepseek_sparse_attention` the NoPE latent
+    /// sparse attention (mask 8). `first_k_dense_replace` leading layers run a
+    /// dense FFN of `intermediate_size`; `mlp_layer_types` must agree with it.
+    /// Anything this runtime has no code for — a rotary part on the sparse
+    /// layers, expert groups, an unclamped or non-sigmoid router, a
+    /// non-vector (`safe_gate` off) KDA decay — is refused rather than guessed.
+    private static func loadGlm53Flash(configPath: String,
+                                       tc: [String: Any]) throws -> ArchInfo {
+        func i(_ k: String) throws -> Int {
+            guard let n = (tc[k] as? Int) ?? (tc[k] as? NSNumber)?.intValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return n
+        }
+        func d(_ k: String) throws -> Double {
+            guard let n = (tc[k] as? Double) ?? (tc[k] as? NSNumber)?.doubleValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return n
+        }
+        func b(_ k: String, default value: Bool) -> Bool {
+            (tc[k] as? Bool) ?? value
+        }
+        let numLayers = try i("num_hidden_layers")
+        guard let layerTypes = tc["layer_types"] as? [String], layerTypes.count == numLayers else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "layer_types must list every one of \(numLayers) layers")
+        }
+        var mask: [UInt8] = []
+        mask.reserveCapacity(numLayers)
+        for t in layerTypes {
+            switch t {
+            case "linear_attention":          mask.append(7)
+            case "deepseek_sparse_attention": mask.append(8)
+            default:
+                throw RepackError.configJsonInvalid(
+                    path: configPath, detail: "unknown layer_types entry \"\(t)\"")
+            }
+        }
+        let numDense = try i("first_k_dense_replace")
+        if let mlpTypes = tc["mlp_layer_types"] as? [String] {
+            guard mlpTypes.count == numLayers else {
+                throw RepackError.configJsonInvalid(
+                    path: configPath, detail: "mlp_layer_types must list every layer")
+            }
+            for (idx, t) in mlpTypes.enumerated() {
+                let expectedKind = idx < numDense ? "dense" : "sparse"
+                guard t == expectedKind else {
+                    throw RepackError.configJsonInvalid(
+                        path: configPath,
+                        detail: "mlp_layer_types[\(idx)] is \(t); first_k_dense_replace \(numDense) implies \(expectedKind)")
+                }
+            }
+        }
+        guard try i("qk_rope_head_dim") == 0, b("mla_use_nope", default: true) else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "glm5_next runtime is NoPE only; qk_rope_head_dim must be 0")
+        }
+        guard (try? i("n_group")) ?? 1 == 1, (try? i("topk_group")) ?? 1 == 1 else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "expert groups are not supported (n_group / topk_group must be 1)")
+        }
+        let scoring = (tc["scoring_func"] as? String) ?? "sigmoid"
+        guard scoring == "sigmoid", b("norm_topk_prob", default: true),
+              ((tc["topk_method"] as? String) ?? "noaux_tc") == "noaux_tc" else {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "router must be sigmoid / noaux_tc with norm_topk_prob; got \(scoring)")
+        }
+        guard let la = tc["linear_attn_config"] as? [String: Any] else {
+            throw RepackError.configJsonInvalid(path: configPath, detail: "missing linear_attn_config")
+        }
+        func li(_ k: String) throws -> Int {
+            guard let n = (la[k] as? Int) ?? (la[k] as? NSNumber)?.intValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing linear_attn_config.\(k)")
+            }
+            return n
+        }
+        guard let lowerBound = (la["gate_lower_bound"] as? Double)
+                ?? (la["gate_lower_bound"] as? NSNumber)?.doubleValue else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "linear_attn_config.gate_lower_bound is required (safe-gate KDA)")
+        }
+        let linearHeads = try li("num_heads")
+        let linearHeadDim = try li("head_dim")
+        let qkNope = try i("qk_nope_head_dim")
+        let numShared = (tc["n_shared_experts"] as? Int) ?? (tc["n_shared_experts"] as? NSNumber)?.intValue ?? 0
+        let moeIntermediate = try i("moe_intermediate_size")
+        let axes = Glm53Axes(
+            kvLoraRank: try i("kv_lora_rank"),
+            qkNopeHeadDim: qkNope,
+            vHeadDim: try i("v_head_dim"),
+            indexKPool: try i("index_kpool"),
+            indexKPoolAlwaysSelectTail: b("index_kpool_always_select_tail", default: true),
+            indexerKNormEps: 1.0e-6,
+            kdaGateLowerBound: lowerBound,
+            rmsNormEps: try d("rms_norm_eps"))
+        let arch = ArchInfo(
+            hiddenSize: try i("hidden_size"),
+            // The shared expert is `n_shared_experts` copies of the MoE width.
+            intermediateSize: moeIntermediate * max(numShared, 1),
+            moeIntermediateSize: moeIntermediate,
+            numHeads: try i("num_attention_heads"),
+            numKVHeads: 1,
+            numFullKVHeads: 1,
+            headDim: qkNope,
+            fullHeadDim: qkNope,
+            vocabSize: try i("vocab_size"),
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: 0.0,
+            fullRopeTheta: 0.0,
+            partialRotaryFactor: 0.0,
+            numLayers: numLayers,
+            numExperts: try i("n_routed_experts"),
+            topKExperts: try i("num_experts_per_tok"),
+            tieWordEmbeddings: b("tie_word_embeddings", default: false),
+            attentionKEqV: true,
+            fullAttentionLayerMask: mask,
+            hiddenActivation: (tc["hidden_act"] as? String) ?? "silu",
+            family: .glm53Flash,
+            attnOutputGate: false,
+            attentionScale: 1.0 / Double(qkNope).squareRoot(),
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: false,
+            ropeNeoxSubdim: false,
+            linearNumKHeads: linearHeads,
+            linearNumVHeads: linearHeads,
+            linearKeyHeadDim: linearHeadDim,
+            linearValueHeadDim: linearHeadDim,
+            linearConvKernelSize: try li("short_conv_kernel_size"),
+            caQLoraRank: try i("q_lora_rank"),
+            caIndexNHeads: try i("index_n_heads"),
+            caIndexHeadDim: try i("index_head_dim"),
+            caIndexTopK: try i("index_topk"),
+            hcMult: try i("hc_mult"),
+            hcSinkhornIters: try i("hc_sinkhorn_iters"),
+            hcEps: try d("hc_eps"),
+            numHashRoutedLayers: 0,
+            routerScoringFunc: scoring,
+            routedScalingFactor: try d("routed_scaling_factor"),
+            swigluLimit: try d("swiglu_limit"),
+            numSharedExperts: numShared,
+            numDenseLayers: numDense,
+            denseIntermediateSize: try i("intermediate_size"),
+            routerGateBias: true,
+            routerNormAfterTopK: true,
+            // The pinned checkpoint's 154,880 embedding rows sit over 154,856
+            // tokenizer ids (154,820 BPE + 36 added); the runtime masks the
+            // padding rows at the head. Any other vocabulary (the parity toys)
+            // records no padding.
+            unpaddedVocabSize: try i("vocab_size") == Glm53Axes.paddedVocabSize
+                ? Glm53Axes.unpaddedVocabSize : 0,
+            qkNorm: false,
+            glm53: axes)
+        try crossCheckProductionGlm53Flash(arch, configPath: configPath)
+        return arch
+    }
+
+    /// Production GLM-5.3-Flash 320B-A18B baseline (mirrors the runtime's
+    /// `ArchConfig.glm53Flash_320B_A18B`). A config matching the production
+    /// shape (hidden 4096, 45 layers) must agree on every field; toy /
+    /// synthetic configs are exempt.
+    private static func crossCheckProductionGlm53Flash(_ a: ArchInfo,
+                                                       configPath: String) throws {
+        guard a.hiddenSize == 4096, a.numLayers == 45 else { return }
+        var expectedMask = [UInt8](repeating: 7, count: 45)
+        for i in stride(from: 3, to: 45, by: 4) { expectedMask[i] = 8 }
+        let expected = ArchInfo(
+            hiddenSize: 4096,
+            intermediateSize: 2048,
+            moeIntermediateSize: 2048,
+            numHeads: 64,
+            numKVHeads: 1,
+            numFullKVHeads: 1,
+            headDim: 256,
+            fullHeadDim: 256,
+            vocabSize: 154_880,
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: 0.0,
+            fullRopeTheta: 0.0,
+            partialRotaryFactor: 0.0,
+            numLayers: 45,
+            numExperts: 288,
+            topKExperts: 8,
+            tieWordEmbeddings: false,
+            attentionKEqV: true,
+            fullAttentionLayerMask: expectedMask,
+            hiddenActivation: "silu",
+            family: .glm53Flash,
+            attnOutputGate: false,
+            attentionScale: 0.0625,
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: false,
+            ropeNeoxSubdim: false,
+            linearNumKHeads: 64,
+            linearNumVHeads: 64,
+            linearKeyHeadDim: 128,
+            linearValueHeadDim: 128,
+            linearConvKernelSize: 4,
+            caQLoraRank: 1536,
+            caIndexNHeads: 32,
+            caIndexHeadDim: 128,
+            caIndexTopK: 2048,
+            hcMult: 4,
+            hcSinkhornIters: 20,
+            hcEps: 1.0e-6,
+            numHashRoutedLayers: 0,
+            routerScoringFunc: "sigmoid",
+            routedScalingFactor: 2.5,
+            swigluLimit: 10.0,
+            numSharedExperts: 1,
+            numDenseLayers: 3,
+            denseIntermediateSize: 12_288,
+            routerGateBias: true,
+            routerNormAfterTopK: true,
+            unpaddedVocabSize: Glm53Axes.unpaddedVocabSize,
+            qkNorm: false,
+            glm53: Glm53Axes(
+                kvLoraRank: 512,
+                qkNopeHeadDim: 256,
+                vHeadDim: 256,
+                indexKPool: 4,
+                indexKPoolAlwaysSelectTail: true,
+                indexerKNormEps: 1.0e-6,
+                kdaGateLowerBound: -5.0,
+                rmsNormEps: 1.0e-5))
+        guard a == expected else {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "glm5_next config does not match the pinned "
+                    + "GLM-5.3-Flash-320B-A18B architecture baseline")
+        }
     }
 
     // MARK: - Maple
@@ -953,6 +1321,270 @@ struct ArchInfo: Sendable, Equatable {
                 detail: "qwen3_5 config does not match the pinned "
                     + "Qwen3.8-27B architecture baseline")
         }
+    }
+
+    // MARK: - MiniCPM5 (`model_type == "llama"`, `LlamaForCausalLM`)
+
+    /// Plain-llama dense stack read from a flat `config.json`: every layer is
+    /// full attention (no `layer_types`), one SwiGLU MLP per layer, no
+    /// experts, no q/k norm, no output gate, full-head NeoX RoPE. Everything
+    /// the runner hard-codes is checked here rather than assumed:
+    /// `rms_norm_eps` must be the runtime's compile-time 1e-6, `rope_scaling`
+    /// must be null, and `attention_bias` / `mlp_bias` must be off (the
+    /// tensor contract has no bias tensors).
+    private static func loadMiniCPM5(configPath: String,
+                                     root: [String: Any]) throws -> ArchInfo {
+        func i(_ k: String) throws -> Int {
+            guard let n = (root[k] as? Int) ?? (root[k] as? NSNumber)?.intValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return n
+        }
+        func d(_ k: String) throws -> Double {
+            guard let n = (root[k] as? Double) ?? (root[k] as? NSNumber)?.doubleValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return n
+        }
+        guard (root["architectures"] as? [String]) == ["LlamaForCausalLM"] else {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "llama config must declare architectures [\"LlamaForCausalLM\"]")
+        }
+        guard root["rope_scaling"] is NSNull || root["rope_scaling"] == nil else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "rope_scaling must be null for minicpm5")
+        }
+        guard try d("rms_norm_eps") == 1e-6 else {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "rms_norm_eps must be 1e-6: the runtime hard-codes that epsilon")
+        }
+        for bias in ["attention_bias", "mlp_bias"] {
+            guard (root[bias] as? Bool ?? false) == false else {
+                throw RepackError.configJsonInvalid(
+                    path: configPath, detail: "\(bias) must be false for minicpm5")
+            }
+        }
+        let numLayers = try i("num_hidden_layers")
+        let hidden = try i("hidden_size")
+        let numHeads = try i("num_attention_heads")
+        let numKV = try i("num_key_value_heads")
+        let headDim = (root["head_dim"] as? Int) ?? hidden / numHeads
+        let intermediate = try i("intermediate_size")
+        let theta = try d("rope_theta")
+        let tie = (root["tie_word_embeddings"] as? Bool) ?? false
+        let act = (root["hidden_act"] as? String) ?? "silu"
+
+        let arch = ArchInfo(
+            hiddenSize: hidden,
+            intermediateSize: intermediate,
+            moeIntermediateSize: 0,
+            numHeads: numHeads,
+            numKVHeads: numKV,
+            numFullKVHeads: numKV,
+            headDim: headDim,
+            fullHeadDim: headDim,
+            vocabSize: try i("vocab_size"),
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: theta,
+            fullRopeTheta: theta,
+            partialRotaryFactor: 1.0,
+            numLayers: numLayers,
+            numExperts: 0,
+            topKExperts: 0,
+            tieWordEmbeddings: tie,
+            attentionKEqV: false,
+            fullAttentionLayerMask: [UInt8](repeating: 1, count: numLayers),
+            hiddenActivation: act,
+            family: .minicpm5,
+            attnOutputGate: false,
+            // `LlamaAttention.scaling = head_dim ** -0.5`; `pow` reproduces it
+            // bit-exactly (1 / sqrt is one ulp off, and the manifest check is
+            // an exact Double comparison against the runtime baseline).
+            attentionScale: pow(Double(headDim), -0.5),
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: false,
+            ropeNeoxSubdim: true,
+            linearNumKHeads: 0,
+            linearNumVHeads: 0,
+            linearKeyHeadDim: 0,
+            linearValueHeadDim: 0,
+            linearConvKernelSize: 0,
+            numSharedExperts: 0,
+            numDenseLayers: numLayers,
+            denseIntermediateSize: intermediate,
+            qkNorm: false)
+        try crossCheckProductionMiniCPM5(arch, configPath: configPath)
+        return arch
+    }
+
+    /// Production MiniCPM5-2B baseline (mirrors the runtime's
+    /// `ArchConfig.miniCPM5_2B`). A config that matches the production shape
+    /// (hidden 2048, 42 layers) must agree on every field; toy configs are
+    /// exempt.
+    private static func crossCheckProductionMiniCPM5(_ a: ArchInfo,
+                                                     configPath: String) throws {
+        guard a.hiddenSize == 2048, a.numLayers == 42 else { return }
+        let expected = ArchInfo(
+            hiddenSize: 2048,
+            intermediateSize: 6144,
+            moeIntermediateSize: 0,
+            numHeads: 16,
+            numKVHeads: 2,
+            numFullKVHeads: 2,
+            headDim: 128,
+            fullHeadDim: 128,
+            vocabSize: 130_560,
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: 5_000_000.0,
+            fullRopeTheta: 5_000_000.0,
+            partialRotaryFactor: 1.0,
+            numLayers: 42,
+            numExperts: 0,
+            topKExperts: 0,
+            tieWordEmbeddings: false,
+            attentionKEqV: false,
+            fullAttentionLayerMask: [UInt8](repeating: 1, count: 42),
+            hiddenActivation: "silu",
+            family: .minicpm5,
+            attnOutputGate: false,
+            attentionScale: 0.08838834764831845,   // pow(128, -0.5)
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: false,
+            ropeNeoxSubdim: true,
+            linearNumKHeads: 0,
+            linearNumVHeads: 0,
+            linearKeyHeadDim: 0,
+            linearValueHeadDim: 0,
+            linearConvKernelSize: 0,
+            numSharedExperts: 0,
+            numDenseLayers: 42,
+            denseIntermediateSize: 6144,
+            qkNorm: false)
+        guard a == expected else {
+            throw RepackError.configJsonInvalid(
+                path: configPath,
+                detail: "llama config does not match the pinned MiniCPM5-2B "
+                    + "architecture baseline")
+        }
+    }
+
+    // MARK: - Qwen3.8-Flash-Next (`model_type == "qwen4_exp"`)
+
+    /// Text stack of the multimodal Qwen3.8-Flash-Next checkpoint. The hybrid
+    /// gated-DeltaNet / full-attention schedule, gated attention output,
+    /// partial NeoX RoPE, gated shared expert and untied head are all axes the
+    /// Qwen 3.6 path already carries at different values. The three genuinely
+    /// new axes — low-rank hyper-connections, the attention indexer and the
+    /// per-layer n-gram embedding — travel in `FlashNextAxes` and are published
+    /// by name so the runtime can gate on them.
+    ///
+    /// There is deliberately no production cross-check here (the shipped
+    /// families each pin one): the repacker has never seen this checkpoint's
+    /// real `config.json`, so asserting a baseline would encode a guess as a
+    /// contract. See `docs/families/QWEN38_FLASH_NEXT.md`.
+    private static func loadQwen38FlashNext(configPath: String,
+                                            tc: [String: Any]) throws -> ArchInfo {
+        func i(_ k: String) throws -> Int {
+            guard let n = (tc[k] as? Int) ?? (tc[k] as? NSNumber)?.intValue else {
+                throw RepackError.configJsonInvalid(path: configPath, detail: "missing \(k)")
+            }
+            return n
+        }
+        func optionalInt(_ k: String, default fallback: Int) -> Int {
+            (tc[k] as? Int) ?? (tc[k] as? NSNumber)?.intValue ?? fallback
+        }
+        guard let layerTypes = tc["layer_types"] as? [String] else {
+            throw RepackError.configJsonInvalid(path: configPath, detail: "missing layer_types")
+        }
+        var mask: [UInt8] = []
+        mask.reserveCapacity(layerTypes.count)
+        for t in layerTypes {
+            switch t {
+            case "linear_attention": mask.append(2)
+            case "full_attention":   mask.append(1)
+            default:
+                throw RepackError.configJsonInvalid(
+                    path: configPath, detail: "unknown layer_types entry \"\(t)\"")
+            }
+        }
+        let rope = (tc["rope_parameters"] as? [String: Any]) ?? [:]
+        guard let theta = (rope["rope_theta"] as? Double)
+            ?? (rope["rope_theta"] as? NSNumber)?.doubleValue else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "missing rope_parameters.rope_theta")
+        }
+        guard let prf = (rope["partial_rotary_factor"] as? Double)
+            ?? (rope["partial_rotary_factor"] as? NSNumber)?.doubleValue else {
+            throw RepackError.configJsonInvalid(
+                path: configPath, detail: "missing rope_parameters.partial_rotary_factor")
+        }
+        let headDim = try i("head_dim")
+        let pleLayerIDs = ((tc["ple_layer_ids"] as? [Any]) ?? []).compactMap {
+            ($0 as? Int) ?? ($0 as? NSNumber)?.intValue
+        }
+        let axes = FlashNextAxes(
+            hcCount: try i("hc_count"),
+            hcLowRank: try i("hc_lowrank"),
+            // Key names verified against the real config.json @ de4b8e4d
+            // (text_config): indexer_n_heads / indexer_kv_heads, and the
+            // n-gram table is described by split_ngram_parts (shard count)
+            // and ngram_vocab_size_base (per-head base vocab, not row count).
+            indexerNumHeads: optionalInt("indexer_n_heads", default: 0),
+            indexerHeadDim: optionalInt("indexer_head_dim", default: 0),
+            indexerNumKVHeads: optionalInt("indexer_kv_heads", default: 0),
+            indexerBudget: optionalInt("indexer_budget", default: 0),
+            indexerCompressRatio: optionalInt("indexer_compress_ratio", default: 0),
+            pleLayerIDs: pleLayerIDs,
+            pleNgramShardCount: optionalInt("split_ngram_parts", default: 0),
+            pleNgramVocabSizeBase: optionalInt("ngram_vocab_size_base", default: 0),
+            pleConvKernelSize: optionalInt("ple_conv_kernel_size", default: 0))
+
+        return ArchInfo(
+            hiddenSize: try i("hidden_size"),
+            intermediateSize: try i("shared_expert_intermediate_size"),
+            moeIntermediateSize: try i("moe_intermediate_size"),
+            numHeads: try i("num_attention_heads"),
+            numKVHeads: try i("num_key_value_heads"),
+            numFullKVHeads: try i("num_key_value_heads"),
+            headDim: headDim,
+            fullHeadDim: headDim,
+            vocabSize: try i("vocab_size"),
+            slidingWindow: 0,
+            finalLogitSoftcap: 0.0,
+            ropeTheta: theta,
+            fullRopeTheta: theta,
+            partialRotaryFactor: prf,
+            numLayers: try i("num_hidden_layers"),
+            numExperts: try i("num_experts"),
+            topKExperts: try i("num_experts_per_tok"),
+            tieWordEmbeddings: (tc["tie_word_embeddings"] as? Bool) ?? false,
+            attentionKEqV: false,
+            fullAttentionLayerMask: mask,
+            hiddenActivation: (tc["hidden_act"] as? String) ?? "silu",
+            family: .qwen38flashnext,
+            attnOutputGate: (tc["attn_output_gate"] as? Bool)
+                ?? ((tc["output_gate_type"] as? String) == "sigmoid"),
+            attentionScale: 1.0 / Double(headDim).squareRoot(),
+            embeddingScaledBySqrtHidden: false,
+            routerScaled: false,
+            ffnSandwichNorms: false,
+            sharedExpertGated: true,
+            ropeNeoxSubdim: true,
+            linearNumKHeads: try i("linear_num_key_heads"),
+            linearNumVHeads: try i("linear_num_value_heads"),
+            linearKeyHeadDim: try i("linear_key_head_dim"),
+            linearValueHeadDim: try i("linear_value_head_dim"),
+            linearConvKernelSize: try i("linear_conv_kernel_dim"),
+            unpaddedVocabSize: optionalInt("unpadded_vocab_size", default: 0),
+            flashNext: axes)
     }
 
     // MARK: - DeepSeek-V4-Flash (`model_type == "deepseek_v4"`)

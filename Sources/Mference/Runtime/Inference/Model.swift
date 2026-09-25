@@ -118,30 +118,61 @@ public struct Model {
     /// is text-only and uses the bare `model.` prefix. Inkling is multimodal
     /// but names its towers as siblings (`model.llm.`, `model.visual.`,
     /// `model.audio.`).
+    /// Qwen3.8-Flash-Next keeps the vendor's own container order
+    /// (`model.language_model.`), the mirror image of the earlier Qwen
+    /// conversions' `language_model.model.`, and carries a bare `lm_head`.
     var trunkPrefix: String {
         switch config.family {
         case .gemma4, .qwen36, .qwen38: return "language_model.model."
         case .deepseekV4Flash, .maple: return "model."
         case .inklingSmall: return "model.llm."
+        case .qwen38flashnext: return "model.language_model."
+        case .minicpm5: return "model."
+        // PipeNetwork's mlx-vlm conversion keeps the multimodal container
+        // order: `language_model.model.` for the text trunk and a
+        // `language_model.lm_head`, with `vision_model.` dropped at install.
+        case .glm53Flash: return "language_model.model."
         }
     }
     private var lmHeadName: String {
         switch config.family {
         case .gemma4, .qwen36, .qwen38: return "language_model.lm_head.weight"
-        case .deepseekV4Flash, .maple: return "lm_head.weight"
+        case .deepseekV4Flash, .maple, .qwen38flashnext: return "lm_head.weight"
         case .inklingSmall: return "model.llm.unembed.weight"
+        case .minicpm5: return "lm_head.weight"
+        case .glm53Flash: return "language_model.lm_head.weight"
         }
     }
     /// Inkling names the token embedding `embed`, not `embed_tokens`.
     private var embeddingName: String {
         switch config.family {
-        case .gemma4, .qwen36, .qwen38, .deepseekV4Flash:
+        case .gemma4, .qwen36, .qwen38, .deepseekV4Flash, .qwen38flashnext:
             return "\(trunkPrefix)embed_tokens.weight"
         case .maple:
             return "\(trunkPrefix)word_embeddings.weight"
         case .inklingSmall:
             return "\(trunkPrefix)embed.weight"
+        case .minicpm5, .glm53Flash:
+            return "\(trunkPrefix)embed_tokens.weight"
         }
+    }
+
+    /// Named refusal for an accessor this family has no tensor for.
+    ///
+    /// The name is reported verbatim, so the failure points at the accessor a
+    /// runner asked for rather than reading as a corrupt install. It is
+    /// deliberately independent of `ManifestReader.familiesWithoutRunner`: that
+    /// table is empty now that every installable family has a runner, and an
+    /// accessor a family structurally lacks must still refuse by name — the
+    /// family's own runner never calls it, and a runner written for a different
+    /// family that does is the bug being reported.
+    ///
+    /// For `qwen38flashnext` the two callers are `inputNorm` and
+    /// `postAttnNorm`: the hyper-connection sites carry those norms, so no
+    /// `input_layernorm` / `post_attention_layernorm` tensor exists to return.
+    private func accessorNotAvailable(_ accessor: String) -> ModelError {
+        .familyRunnerNotImplemented(family: config.family.rawValue,
+                                    missingAxes: [accessor])
     }
 
     public var embedding: TensorView {
@@ -180,16 +211,25 @@ public struct Model {
         switch config.family {
         case .gemma4:
             return try resident(name: "language_model.model.layers.\(L).router.proj.weight")
-        case .qwen36, .qwen38:
+        case .qwen36, .qwen38, .qwen38flashnext:
             // Qwen 3.8 is dense and has no router tensor; the accessor throws
             // tensorNotFound if a caller ever asks.
-            return try resident(name: "language_model.model.layers.\(L).mlp.gate.weight")
+            return try resident(name: "\(trunkPrefix)layers.\(L).mlp.gate.weight")
         case .deepseekV4Flash:
             return try resident(name: "model.layers.\(L).ffn.gate.weight")
         case .inklingSmall:
             return try resident(name: "model.llm.layers.\(L).mlp.gate.weight")
         case .maple:
             return try resident(name: "model.layers.\(L).mlp.gate.weight")
+        case .minicpm5:
+            // Dense: no router tensor exists; the accessor throws
+            // tensorNotFound if a caller ever asks.
+            return try resident(name: "\(trunkPrefix)layers.\(L).mlp.gate.weight")
+        case .glm53Flash:
+            // Unquantized BF16 `[numExperts, hidden]` on the MoE layers; the
+            // selection bias is `glm53RouterCorrectionBias`. The three dense
+            // layers have none.
+            return try resident(name: "\(trunkPrefix)layers.\(L).mlp.gate.weight")
         }
     }
     /// Shared-expert FFN. Gemma emits `.mlp.{gate,up,down}_proj.weight`
@@ -210,29 +250,46 @@ public struct Model {
             // For dense Qwen 3.8 these accessors serve the per-layer MLP,
             // which the checkpoint names exactly like Gemma's shared FFN.
             return "language_model.model.layers.\(L).mlp.\(proj).weight"
-        case .qwen36:
-            return "language_model.model.layers.\(L).mlp.shared_expert.\(proj).weight"
+        case .qwen36, .qwen38flashnext:
+            return "\(trunkPrefix)layers.\(L).mlp.shared_expert.\(proj).weight"
         case .deepseekV4Flash:
             return "model.layers.\(L).ffn.shared_experts.\(proj).weight"
         case .inklingSmall:
             return "model.llm.layers.\(L).mlp.shared_experts.\(proj).weight"
         case .maple:
             return "model.layers.\(L).mlp.shared_expert.\(proj).weight"
+        case .minicpm5:
+            // Dense llama: the per-layer MLP under the bare `.mlp.` names.
+            return "\(trunkPrefix)layers.\(L).mlp.\(proj).weight"
+        case .glm53Flash:
+            // MoE layers keep the source's `.mlp.shared_experts.` container;
+            // the three dense layers' FFN is `glm53DenseFFN`.
+            return "\(trunkPrefix)layers.\(L).mlp.shared_experts.\(proj).weight"
         }
     }
     /// Qwen-only scalar gate on the shared-expert branch: a `[1, hidden]`
     /// 8-bit projection whose sigmoid multiplies the shared FFN output.
     public func sharedExpertScalarGate(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).mlp.shared_expert_gate.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).mlp.shared_expert_gate.weight")
     }
+    /// Pre-attention norm. Qwen3.8-Flash-Next has none: the attention
+    /// hyper-connection's group norm stands in its place, so a caller asking
+    /// for one is a runner that has not been written for this family.
+    /// `FlashNextForwardRunner` never calls it.
     public func inputNorm(layer L: Int) throws -> TensorView {
         switch config.family {
         case .gemma4, .qwen36, .qwen38, .maple:
             return try resident(name: "\(trunkPrefix)layers.\(L).input_layernorm.weight")
         case .deepseekV4Flash, .inklingSmall:
             return try resident(name: "\(trunkPrefix)layers.\(L).attn_norm.weight")
+        case .qwen38flashnext:
+            throw accessorNotAvailable("inputNorm")
+        case .minicpm5, .glm53Flash:
+            return try resident(name: "\(trunkPrefix)layers.\(L).input_layernorm.weight")
         }
     }
+    /// Pre-FFN norm. Absent for Qwen3.8-Flash-Next for the same reason as
+    /// `inputNorm`: the MLP hyper-connection carries the norm.
     public func postAttnNorm(layer L: Int) throws -> TensorView {
         switch config.family {
         case .gemma4, .qwen36, .qwen38, .maple:
@@ -241,11 +298,24 @@ public struct Model {
             return try resident(name: "\(trunkPrefix)layers.\(L).ffn_norm.weight")
         case .inklingSmall:
             return try resident(name: "\(trunkPrefix)layers.\(L).mlp_norm.weight")
+        case .qwen38flashnext:
+            throw accessorNotAvailable("postAttnNorm")
+        case .minicpm5, .glm53Flash:
+            return try resident(name: "\(trunkPrefix)layers.\(L).post_attention_layernorm.weight")
         }
     }
+    /// Final trunk norm before `lm_head`.
+    ///
+    /// Qwen3.8-Flash-Next ships **no** final norm — the global
+    /// `hyper_connection_mixer` collapses the 4-stream residual straight into
+    /// `lm_head`'s input — so `hasFinalNorm` is false there and this accessor
+    /// has no tensor to return. It stays non-throwing for the families that do
+    /// have one; check `hasFinalNorm` before reaching for it.
     public var finalNorm: TensorView {
         try! resident(name: "\(trunkPrefix)norm.weight")
     }
+    /// Whether the architecture carries a final trunk norm at all.
+    public var hasFinalNorm: Bool { !config.hasLowRankHyperConnections }
 
     // MARK: - Per-head attention norms (Q/K only)
     //
@@ -312,35 +382,35 @@ public struct Model {
     // weight, A_log, dt_bias, and the gated output norm are BF16.
 
     public func linearInProjQKV(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_qkv.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.in_proj_qkv.weight")
     }
     public func linearInProjZ(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_z.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.in_proj_z.weight")
     }
     public func linearInProjA(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_a.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.in_proj_a.weight")
     }
     public func linearInProjB(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.in_proj_b.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.in_proj_b.weight")
     }
     public func linearOutProj(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.out_proj.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.out_proj.weight")
     }
     /// Depthwise causal conv weight, source shape `[convDim, kernel, 1]`, BF16.
     public func linearConv1d(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.conv1d.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.conv1d.weight")
     }
     /// Per-value-head decay base, shape `[numVHeads]`, BF16.
     public func linearALog(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.A_log")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.A_log")
     }
     /// Per-value-head dt bias, shape `[numVHeads]`, BF16.
     public func linearDtBias(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.dt_bias")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.dt_bias")
     }
     /// Gated RMSNorm weight over the value head dim, shape `[valueHeadDim]`.
     public func linearNorm(layer L: Int) throws -> TensorView {
-        try resident(name: "language_model.model.layers.\(L).linear_attn.norm.weight")
+        try resident(name: "\(trunkPrefix)layers.\(L).linear_attn.norm.weight")
     }
 
     // MARK: - DeepSeek-V4 compressed attention, mHC, and MoE auxiliaries
@@ -524,11 +594,11 @@ public struct Model {
         }
         return TensorView(
             buffer: chunk.buffer,
-            offset: relativeOffset - chunk.start,
+            offset: relativeOffset - chunk.start + chunk.bufferOffset,
             length: entry.sizeBytes,
-            scaleOffset: entry.scaleSize > 0 ? scaleRel - chunk.start : 0,
+            scaleOffset: entry.scaleSize > 0 ? scaleRel - chunk.start + chunk.bufferOffset : 0,
             scaleLength: entry.scaleSize,
-            biasOffset:  entry.biasSize > 0 ? biasRel - chunk.start : 0,
+            biasOffset:  entry.biasSize > 0 ? biasRel - chunk.start + chunk.bufferOffset : 0,
             biasLength:  entry.biasSize,
             shape: entry.shape,
             dtype: entry.dtype)
@@ -617,8 +687,18 @@ public struct Model {
         case .resident:
             streamersBox.streamers[L] = .resident(try ResidentExpertStreamer(
                 layout: layout,
-                device: device))
+                device: device,
+                strategy: Self.residentStrategy(for: config.family)))
         }
+    }
+
+    /// How `.resident` holds a layer's experts. GLM-5.3-Flash's runner
+    /// addresses experts by GPU-side index inside one layer buffer and its
+    /// 171 GB set is meant to live in memory outright, so it takes the copied
+    /// strategy (see `ResidentExpertStreamer`); every other family keeps the
+    /// mapped one it shipped with.
+    static func residentStrategy(for family: ModelFamily) -> ResidentExpertStreamer.Strategy {
+        family == .glm53Flash ? .copied : .mapped
     }
 
     /// Resident mode: open every routed layer and touch its mapping so page-in

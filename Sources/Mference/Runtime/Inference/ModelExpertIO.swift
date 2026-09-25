@@ -16,7 +16,29 @@ public struct RoutedExpertFetchPlan: Sendable {
     }
 }
 
+/// Resident mode only: one buffer over a layer's whole expert file, so a kernel
+/// can address expert `e` at `baseOffset + e * expertStride` from a GPU-side
+/// index with no CPU round trip.
+public struct ResidentExpertSlab: @unchecked Sendable {
+    public let buffer: MTLBuffer
+    public let baseOffset: Int
+    public let expertStride: Int
+}
+
 extension Model {
+    /// The layer's expert slab in resident mode; nil under the slot cache, for
+    /// a layer without routed experts, or when the experts are not laid out at
+    /// a uniform stride.
+    public func residentExpertSlab(layer L: Int) throws -> ResidentExpertSlab? {
+        guard !packedExpertsLayout.layers[L].experts.isEmpty else { return nil }
+        try ensureLayerOpened(L)
+        guard case .resident(let streamer) = expertBackend(L), let view = streamer.slabView else {
+            return nil
+        }
+        return ResidentExpertSlab(buffer: view.buffer, baseOffset: view.baseOffset,
+                                  expertStride: view.expertStride)
+    }
+
     public func routedExpertOffsets(layer: Int) -> MoEExpertOffsets {
         let expert = packedExpertsLayout.expert(layer: layer, expert: 0)
         func offset(_ role: String) -> UInt32 {
@@ -167,6 +189,21 @@ extension Model {
             return streamer.slotMapBinding
         case .resident:
             return nil
+        }
+    }
+
+    /// Resident-only contiguous layer binding for GPU-direct expert routing.
+    /// Unlike the bounded slot-cache binding, every table entry is a hit and
+    /// the table maps an expert id to its stable on-disk slot.
+    public func routedResidentSlabBinding(layer: Int) throws
+        -> (slab: MTLBuffer, table: MTLBuffer, slotStride: Int)? {
+        try ensureLayerOpened(layer)
+        switch expertBackend(layer) {
+        case .pread:
+            return nil
+        case .resident(let streamer):
+            guard let binding = streamer.contiguousSlabBinding else { return nil }
+            return (binding.slab, binding.table, binding.expertStride)
         }
     }
 

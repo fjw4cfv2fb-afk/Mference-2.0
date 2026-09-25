@@ -3,6 +3,20 @@ import Mference
 @testable import MferenceCLICore
 
 @Suite struct CLIArgumentsTests {
+    @Test func emptyTruncationHasActionableNoticeWithoutChangingSuccessOutput() throws {
+        let swift = try #require(emptyResponseLimitNotice(reason: .maxTokens,
+            hasVisibleText: false, isSwiftQwen: true))
+        #expect(swift.contains("--max-new"))
+        #expect(swift.contains("--max-context"))
+        #expect(swift.contains("--reasoning-effort medium or low"))
+        let base = try #require(emptyResponseLimitNotice(reason: .maxTokens,
+            hasVisibleText: false, isSwiftQwen: false))
+        #expect(!base.contains("--reasoning-effort"))
+        #expect(emptyResponseLimitNotice(reason: .maxTokens,
+            hasVisibleText: true, isSwiftQwen: true) == nil)
+        #expect(emptyResponseLimitNotice(reason: .endOfTurn,
+            hasVisibleText: false, isSwiftQwen: true) == nil)
+    }
     @Test func usageListsMaple() {
         #expect(Args.usage.contains("Maple"))
     }
@@ -72,7 +86,7 @@ import Mference
             "--temperature", "--top-k", "--top-p", "--repetition-penalty",
             "--seed", "--stop", "--prefill-chunk", "--quiet", "--help",
             "--rdadvise", "--expert-cache-slots", "--flash-head", "--verify",
-            "--kv-paged", "--kv-topk", "--kv-pool-pages",
+            "--kv-paged", "--kv-topk", "--kv-pool-pages", "--reasoning-effort",
         ]
         let words = Args.usage.split { $0.isWhitespace || $0 == "(" || $0 == ")" }
         let options = Set(words.map(String.init).filter { $0.hasPrefix("--") })

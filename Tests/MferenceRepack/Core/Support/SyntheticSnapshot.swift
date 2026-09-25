@@ -6,7 +6,15 @@ import Foundation
 enum SyntheticSnapshot {
 
     struct Snapshot {
+        /// First (or only) shard. Single-shard fixtures use this directly.
         let shardPath: String
+        /// Every shard the fixture wrote, in index order.
+        let shardPaths: [String]
+
+        init(shardPath: String, shardPaths: [String]? = nil) {
+            self.shardPath = shardPath
+            self.shardPaths = shardPaths ?? [shardPath]
+        }
     }
 
     enum MapleTensorMutation {
@@ -593,6 +601,7 @@ enum SyntheticSnapshot {
     }
 
     static func buildQwen38(at dir: String,
+                            originalBF16: Bool = false,
                             seed: UInt64 = 0x0038_D0C5_E11A_B1E5) throws -> Snapshot {
         try? FileManager.default.removeItem(atPath: dir)
         try FileManager.default.createDirectory(atPath: dir,
@@ -698,6 +707,53 @@ enum SyntheticSnapshot {
         appendUnquantizedBF16(name: "vision_tower.patch_embed.proj.weight",
                               shape: [arch.hidden, arch.hidden], into: &tensors, rng: &rng)
 
+        if originalBF16 {
+            var source: [(String, String, [Int], [UInt8])] = []
+            for (name, dtype, shape, bytes) in tensors {
+                if name.hasSuffix(".scales") || name.hasSuffix(".biases") { continue }
+                let renamed = name.replacingOccurrences(of: "language_model.model.", with: "model.language_model.")
+                    .replacingOccurrences(of: "language_model.lm_head.", with: "lm_head.")
+                    .replacingOccurrences(of: "vision_tower.", with: "model.visual.")
+                var logical = shape
+                if dtype == "U32" {
+                    logical[logical.count - 1] *= 8
+                    appendUnquantizedBF16(name: renamed, shape: logical, into: &source, rng: &rng)
+                } else {
+                    if name.hasSuffix(".conv1d.weight") { logical = [shape[0], 1, shape[1]] }
+                    source.append((renamed, dtype, logical, bytes))
+                }
+            }
+            // The same 15 dense MTP tensors as the pinned Swift checkpoint.
+            for (name, shape) in [
+                ("fc.weight", [arch.hidden, 2 * arch.hidden]),
+                ("norm.weight", [arch.hidden]),
+                ("pre_fc_norm_embedding.weight", [arch.hidden]),
+                ("pre_fc_norm_hidden.weight", [arch.hidden]),
+                ("layers.0.input_layernorm.weight", [arch.hidden]),
+                ("layers.0.post_attention_layernorm.weight", [arch.hidden]),
+                ("layers.0.self_attn.q_norm.weight", [arch.headDim]),
+                ("layers.0.self_attn.k_norm.weight", [arch.headDim]),
+                ("layers.0.self_attn.q_proj.weight", [2 * arch.numHeads * arch.headDim, arch.hidden]),
+                ("layers.0.self_attn.k_proj.weight", [arch.numKVHeads * arch.headDim, arch.hidden]),
+                ("layers.0.self_attn.v_proj.weight", [arch.numKVHeads * arch.headDim, arch.hidden]),
+                ("layers.0.self_attn.o_proj.weight", [arch.hidden, arch.numHeads * arch.headDim]),
+                ("layers.0.mlp.gate_proj.weight", [arch.intermediate, arch.hidden]),
+                ("layers.0.mlp.up_proj.weight", [arch.intermediate, arch.hidden]),
+                ("layers.0.mlp.down_proj.weight", [arch.hidden, arch.intermediate])
+            ] {
+                appendUnquantizedBF16(name: "mtp." + name, shape: shape, into: &source, rng: &rng)
+            }
+            // Existing pre-quantized fixtures use arbitrary passthrough bytes.
+            // Original-source quantization needs finite numeric BF16 values.
+            tensors = source.map { name, dtype, shape, bytes in
+                let finite = (0..<(bytes.count / 2)).flatMap { i -> [UInt8] in
+                    let bits = UInt16(0x3d00 + i % 128) | (i % 2 == 0 ? 0 : 0x8000)
+                    return [UInt8(truncatingIfNeeded: bits), UInt8(truncatingIfNeeded: bits >> 8)]
+                }
+                return (name, dtype, shape, finite)
+            }
+        }
+
         // -- Encode safetensors.
         let shardName = "model-00001-of-00001.safetensors"
         let shardPath = (dir as NSString).appendingPathComponent(shardName)
@@ -729,12 +785,13 @@ enum SyntheticSnapshot {
             "rms_norm_eps": 1e-6,
             "hidden_act": "silu"
         ]
-        let config: [String: Any] = [
+        var config: [String: Any] = [
             "architectures": ["Qwen3_5ForConditionalGeneration"],
             "model_type": "qwen3_5",
             "quantization": ["bits": 4, "group_size": arch.groupSize, "mode": "affine"],
             "text_config": textConfig
         ]
+        if originalBF16 { config.removeValue(forKey: "quantization") }
         let configData = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
         try configData.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("config.json")))
 
@@ -1045,6 +1102,783 @@ enum SyntheticSnapshot {
         let indexData = try JSONSerialization.data(withJSONObject: indexObj, options: [.sortedKeys])
         let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
         try indexData.write(to: URL(fileURLWithPath: indexPath))
+        return Snapshot(shardPath: shardPath)
+    }
+
+    // MARK: - Qwen3.8-Flash-Next variant (original-repo BF16)
+
+    /// Tiny `qwen4_exp`-shaped architecture read the way the real checkpoint is
+    /// read: **unquantized BF16 across several shards, with no
+    /// `config.json -> quantization` block**, so the installer has to quantize
+    /// in flight.
+    ///
+    /// Two text layers (one gated-DeltaNet, one full-attention carrying the new
+    /// indexer tensors), four routed experts top-2 with the gate|up halves
+    /// fused into a single per-layer tensor, a tiny two-shard PLE n-gram table,
+    /// low-rank hyper-connections on both sub-blocks, plus an `mtp.*` draft
+    /// group and a `model.visual.*` tower for the sidecar policy to act on.
+    struct FlashNextArch {
+        let hidden: Int = 128
+        let moeIntermediate: Int = 64
+        let sharedIntermediate: Int = 64
+        let numHeads: Int = 2
+        let numKVHeads: Int = 1
+        let headDim: Int = 64
+        let vocab: Int = 256
+        let numLayers: Int = 2
+        let numExperts: Int = 4
+        let topK: Int = 2
+        let hcCount: Int = 4
+        let hcLowRank: Int = 64
+        let indexerNumHeads: Int = 2
+        let indexerHeadDim: Int = 64
+        let indexerNumKVHeads: Int = 1
+        let indexerBudget: Int = 128
+        let indexerCompressRatio: Int = 4
+        let linearNumKHeads: Int = 2
+        let linearNumVHeads: Int = 4
+        let linearKeyHeadDim: Int = 32
+        let linearValueHeadDim: Int = 32
+        let linearConvKernelSize: Int = 4
+        /// PLE lives on layer 1; two shards, deliberately sized so each one is
+        /// two whole 16 KB blocks plus a partial tail block.
+        let pleLayer: Int = 1
+        let pleShardCount: Int = 2
+        /// 130 rows per shard is two whole 16 KiB blocks (51 rows each) plus a
+        /// 28-row tail, so both the block and the tail copy paths run.
+        let pleRowsPerShard: Int = 130
+        /// Deliberately NOT a multiple of 64: the real table is 160 wide (16
+        /// n-gram heads x 160 = ple_embed_dim 2560), which group-64 cannot
+        /// quantize, so the pool must fall back to BF16 rows.
+        let pleNgramDim: Int = 160
+        /// n-gram heads; sizes the I64 head tables.
+        let pleNgramHeads: Int = 2
+        /// `ngram_vocab_size_base` is the PER-HEAD base vocab in the real
+        /// config, not the table's row count. Deliberately unequal to
+        /// `pleRows` here so the install cannot quietly start validating one
+        /// against the other.
+        let pleNgramVocabSizeBase: Int = 4_096
+        let pleConvKernelSize: Int = 4
+        // layer 0 = gated DeltaNet, layer 1 = full attention (+ indexer, PLE)
+        let layerTypes: [String] = ["linear_attention", "full_attention"]
+
+        var qkvDim: Int {
+            2 * linearNumKHeads * linearKeyHeadDim + linearNumVHeads * linearValueHeadDim
+        }
+        var valueDim: Int { linearNumVHeads * linearValueHeadDim }
+        var pleRows: Int { pleShardCount * pleRowsPerShard }
+    }
+
+    enum FlashNextMutation {
+        /// Give `gate_up_proj` a row count that is not twice the intermediate
+        /// size, breaking the fused axis order the planner assumes.
+        case brokenFusedExpertShape
+    }
+
+    static func buildQwen38FlashNext(at dir: String,
+                                     seed: UInt64 = 0xF1A5_4E47_0001_0001,
+                                     mutation: FlashNextMutation? = nil) throws
+        -> Snapshot {
+        try? FileManager.default.removeItem(atPath: dir)
+        try FileManager.default.createDirectory(atPath: dir,
+                                                withIntermediateDirectories: true)
+        let arch = FlashNextArch()
+        var rng = SplitMix64(seed: seed)
+
+        // Shard 0: the resident text tower. Shard 1: the fused expert tensors.
+        // Shard 2: the PLE table, the MTP group and the vision tower. Splitting
+        // this way proves the planner resolves tensors across shards.
+        var tower: [(String, String, [Int], [UInt8])] = []
+        var experts: [(String, String, [Int], [UInt8])] = []
+        var extras: [(String, String, [Int], [UInt8])] = []
+
+        let text = "model.language_model."
+        appendBF16(name: text + "embed_tokens.weight",
+                   shape: [arch.vocab, arch.hidden], into: &tower, rng: &rng)
+        appendBF16(name: "lm_head.weight",
+                   shape: [arch.vocab, arch.hidden], into: &tower, rng: &rng)
+        appendBF16(name: text + "hyper_connection_mixer.hc_norm.weight",
+                   shape: [arch.hidden], into: &tower, rng: &rng)
+        appendBF16(name: text + "hyper_connection_mixer.input_mix_weight_down.weight",
+                   shape: [arch.hcLowRank, arch.hidden], into: &tower, rng: &rng)
+        appendBF16(name: text + "hyper_connection_mixer.input_mix_weight_up.weight",
+                   shape: [arch.hidden, arch.hcLowRank], into: &tower, rng: &rng)
+
+        for layer in 0..<arch.numLayers {
+            let prefix = text + "layers.\(layer)"
+            for site in ["attn_hyper_connection", "mlp_hyper_connection"] {
+                appendBF16(name: "\(prefix).\(site).hc_norm.weight",
+                           shape: [arch.hidden], into: &tower, rng: &rng)
+                appendBF16(name: "\(prefix).\(site).input_mix_weight_down.weight",
+                           shape: [arch.hcLowRank, arch.hidden], into: &tower, rng: &rng)
+                appendBF16(name: "\(prefix).\(site).input_mix_weight_up.weight",
+                           shape: [arch.hidden, arch.hcLowRank], into: &tower, rng: &rng)
+                appendBF16(name: "\(prefix).\(site).block_inject_weight.weight",
+                           shape: [arch.hcCount, arch.hidden], into: &tower, rng: &rng)
+            }
+            if arch.layerTypes[layer] == "full_attention" {
+                appendFlashNextAttention(prefix: prefix, arch: arch,
+                                         into: &tower, rng: &rng)
+            } else {
+                appendFlashNextLinearAttention(prefix: prefix, arch: arch,
+                                               into: &tower, rng: &rng)
+            }
+            // Router, gated shared expert.
+            appendBF16(name: "\(prefix).mlp.gate.weight",
+                       shape: [arch.numExperts, arch.hidden], into: &tower, rng: &rng)
+            appendBF16(name: "\(prefix).mlp.shared_expert_gate.weight",
+                       shape: [1, arch.hidden], into: &tower, rng: &rng)
+            appendBF16(name: "\(prefix).mlp.shared_expert.gate_proj.weight",
+                       shape: [arch.sharedIntermediate, arch.hidden], into: &tower, rng: &rng)
+            appendBF16(name: "\(prefix).mlp.shared_expert.up_proj.weight",
+                       shape: [arch.sharedIntermediate, arch.hidden], into: &tower, rng: &rng)
+            appendBF16(name: "\(prefix).mlp.shared_expert.down_proj.weight",
+                       shape: [arch.hidden, arch.sharedIntermediate], into: &tower, rng: &rng)
+            appendBF16(name: "\(prefix).input_layernorm.weight",
+                       shape: [arch.hidden], into: &tower, rng: &rng)
+            appendBF16(name: "\(prefix).post_attention_layernorm.weight",
+                       shape: [arch.hidden], into: &tower, rng: &rng)
+
+            // Fused routed experts: gate|up concatenated on the row axis.
+            appendBF16(name: "\(prefix).mlp.experts.gate_up_proj",
+                       shape: [arch.numExperts, 2 * arch.moeIntermediate, arch.hidden],
+                       into: &experts, rng: &rng)
+            appendBF16(name: "\(prefix).mlp.experts.down_proj",
+                       shape: [arch.numExperts, arch.hidden, arch.moeIntermediate],
+                       into: &experts, rng: &rng)
+        }
+        appendBF16(name: text + "norm.weight",
+                   shape: [arch.hidden], into: &tower, rng: &rng)
+
+        // PLE module on its layer: the small projections stay with the tower,
+        // the n-gram table shards go to their own shard file.
+        let plePrefix = text + "layers.\(arch.pleLayer).ple"
+        appendBF16(name: plePrefix + ".key_proj.weight",
+                   shape: [arch.hidden, arch.hidden], into: &tower, rng: &rng)
+        appendBF16(name: plePrefix + ".value_proj.weight",
+                   shape: [arch.hidden, arch.hidden], into: &tower, rng: &rng)
+        appendBF16(name: plePrefix + ".conv1d.weight",
+                   shape: [arch.hidden, arch.pleConvKernelSize, 1], into: &tower, rng: &rng)
+        for norm in ["norm_conv", "norm_key", "norm_query"] {
+            appendBF16(name: "\(plePrefix).\(norm).weight",
+                       shape: [arch.hidden], into: &tower, rng: &rng)
+        }
+        // I64 in the real checkpoint (layer_multipliers [3],
+        // ngram_heads_offsets / ngram_heads_vocab_sizes [16]); they must reach
+        // the install byte-for-byte at dtype I64, not coerced.
+        appendUnquantizedI64(name: plePrefix + ".ple_embedding.layer_multipliers",
+                             shape: [3], into: &tower, rng: &rng)
+        appendUnquantizedI64(name: plePrefix + ".ple_embedding.ngram_heads_offsets",
+                             shape: [arch.pleNgramHeads], into: &tower, rng: &rng)
+        appendUnquantizedI64(name: plePrefix + ".ple_embedding.ngram_heads_vocab_sizes",
+                             shape: [arch.pleNgramHeads], into: &tower, rng: &rng)
+        for shard in 0..<arch.pleShardCount {
+            appendBF16(name: "\(plePrefix).ple_embedding.ngram_embedding.shard_\(shard).weight",
+                       shape: [arch.pleRowsPerShard, arch.pleNgramDim],
+                       into: &extras, rng: &rng)
+        }
+
+        // MTP draft group: one hybrid layer with its own routed experts.
+        appendBF16(name: "mtp.fc_embedding.weight",
+                   shape: [arch.hidden, arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.fc_hidden.weight",
+                   shape: [arch.hidden, arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.pre_fc_norm_embedding.weight",
+                   shape: [arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.pre_fc_norm_hidden.weight",
+                   shape: [arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.hyper_connection_mixer.hc_norm.weight",
+                   shape: [arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+                   shape: [arch.hcLowRank, arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+                   shape: [arch.hidden, arch.hcLowRank], into: &extras, rng: &rng)
+        appendFlashNextAttention(prefix: "mtp.layers.0", arch: arch,
+                                 into: &extras, rng: &rng)
+        appendBF16(name: "mtp.layers.0.mlp.gate.weight",
+                   shape: [arch.numExperts, arch.hidden], into: &extras, rng: &rng)
+        // The draft layer has the same MoE block as a text layer, shared expert
+        // and all (docs/families/qwen38flashnext.tensors.json, `sidecar_mtp`).
+        // Both of its gating tensors are here because the install policy gives
+        // them the same width as the text stack's, and a fixture missing the
+        // scalar gate would leave that half of the policy uncovered end to end.
+        appendBF16(name: "mtp.layers.0.mlp.shared_expert_gate.weight",
+                   shape: [1, arch.hidden], into: &extras, rng: &rng)
+        for proj in ["gate_proj", "up_proj"] {
+            appendBF16(name: "mtp.layers.0.mlp.shared_expert.\(proj).weight",
+                       shape: [arch.sharedIntermediate, arch.hidden],
+                       into: &extras, rng: &rng)
+        }
+        appendBF16(name: "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+                   shape: [arch.hidden, arch.sharedIntermediate],
+                   into: &extras, rng: &rng)
+        appendBF16(name: "mtp.layers.0.input_layernorm.weight",
+                   shape: [arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.layers.0.post_attention_layernorm.weight",
+                   shape: [arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "mtp.layers.0.mlp.experts.gate_up_proj",
+                   shape: [arch.numExperts, 2 * arch.moeIntermediate, arch.hidden],
+                   into: &extras, rng: &rng)
+        appendBF16(name: "mtp.layers.0.mlp.experts.down_proj",
+                   shape: [arch.numExperts, arch.hidden, arch.moeIntermediate],
+                   into: &extras, rng: &rng)
+
+        // Vision tower: always skipped, present so the skip is observable.
+        appendBF16(name: "model.visual.blocks.0.norm1.weight",
+                   shape: [arch.hidden], into: &extras, rng: &rng)
+        appendBF16(name: "model.visual.patch_embed.proj.weight",
+                   shape: [arch.hidden, arch.hidden], into: &extras, rng: &rng)
+
+        if mutation == .brokenFusedExpertShape {
+            let name = text + "layers.0.mlp.experts.gate_up_proj"
+            experts.removeAll { $0.0 == name }
+            appendBF16(name: name,
+                       shape: [arch.numExperts, 3 * arch.moeIntermediate, arch.hidden],
+                       into: &experts, rng: &rng)
+        }
+
+        let groups = [tower, experts, extras]
+        var shardPaths: [String] = []
+        var weightMap: [String: String] = [:]
+        for (index, group) in groups.enumerated() {
+            let shardName = String(format: "model-%05d-of-%05d.safetensors",
+                                   index + 1, groups.count)
+            let path = (dir as NSString).appendingPathComponent(shardName)
+            try writeShard(path: path, tensors: group)
+            shardPaths.append(path)
+            for (name, _, _, _) in group { weightMap[name] = shardName }
+        }
+
+        // No `quantization` block: this is the vendor's own BF16 upload.
+        let textConfig: [String: Any] = [
+            "hidden_size": arch.hidden,
+            "moe_intermediate_size": arch.moeIntermediate,
+            "shared_expert_intermediate_size": arch.sharedIntermediate,
+            "num_attention_heads": arch.numHeads,
+            "num_key_value_heads": arch.numKVHeads,
+            "head_dim": arch.headDim,
+            "vocab_size": arch.vocab,
+            "num_hidden_layers": arch.numLayers,
+            "num_experts": arch.numExperts,
+            "num_experts_per_tok": arch.topK,
+            "layer_types": arch.layerTypes,
+            "full_attention_interval": 2,
+            "rope_parameters": [
+                "rope_theta": 10_000_000.0,
+                "rope_type": "default",
+                "partial_rotary_factor": 0.25,
+            ],
+            "linear_num_key_heads": arch.linearNumKHeads,
+            "linear_num_value_heads": arch.linearNumVHeads,
+            "linear_key_head_dim": arch.linearKeyHeadDim,
+            "linear_value_head_dim": arch.linearValueHeadDim,
+            "linear_conv_kernel_dim": arch.linearConvKernelSize,
+            "attn_output_gate": true,
+            "output_gate_type": "sigmoid",
+            "tie_word_embeddings": false,
+            "rms_norm_eps": 1e-6,
+            "hidden_act": "silu",
+            "hc_count": arch.hcCount,
+            "hc_lowrank": arch.hcLowRank,
+            "indexer_n_heads": arch.indexerNumHeads,
+            "indexer_head_dim": arch.indexerHeadDim,
+            "indexer_kv_heads": arch.indexerNumKVHeads,
+            "indexer_budget": arch.indexerBudget,
+            "indexer_compress_ratio": arch.indexerCompressRatio,
+            "ple_layer_ids": [arch.pleLayer],
+            "split_ngram_parts": arch.pleShardCount,
+            "ngram_vocab_size_base": arch.pleNgramVocabSizeBase,
+            "ple_conv_kernel_size": arch.pleConvKernelSize,
+        ]
+        let config: [String: Any] = [
+            "architectures": ["Qwen4ExpForConditionalGeneration"],
+            "model_type": "qwen4_exp",
+            "text_config": textConfig,
+        ]
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: (dir as NSString)
+                .appendingPathComponent("config.json")))
+        try JSONSerialization.data(
+            withJSONObject: ["metadata": ["format": "pt"], "weight_map": weightMap],
+            options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: (dir as NSString)
+                .appendingPathComponent("model.safetensors.index.json")))
+        return Snapshot(shardPath: shardPaths[0], shardPaths: shardPaths)
+    }
+
+    private static func appendFlashNextAttention(
+        prefix: String,
+        arch: FlashNextArch,
+        into tensors: inout [(String, String, [Int], [UInt8])],
+        rng: inout SplitMix64) {
+        // q_proj emits per-head [query ; gate] halves (sigmoid output gate).
+        appendBF16(name: "\(prefix).self_attn.q_proj.weight",
+                   shape: [2 * arch.numHeads * arch.headDim, arch.hidden],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.k_proj.weight",
+                   shape: [arch.numKVHeads * arch.headDim, arch.hidden],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.v_proj.weight",
+                   shape: [arch.numKVHeads * arch.headDim, arch.hidden],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.o_proj.weight",
+                   shape: [arch.hidden, arch.numHeads * arch.headDim],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.q_norm.weight",
+                   shape: [arch.headDim], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.k_norm.weight",
+                   shape: [arch.headDim], into: &tensors, rng: &rng)
+        // The new attention indexer.
+        appendBF16(name: "\(prefix).self_attn.indexer.index_qk_proj.weight",
+                   shape: [arch.indexerNumHeads * arch.indexerHeadDim, arch.hidden],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.indexer.q_layernorm.weight",
+                   shape: [arch.indexerHeadDim], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).self_attn.indexer.k_layernorm.weight",
+                   shape: [arch.indexerHeadDim], into: &tensors, rng: &rng)
+    }
+
+    private static func appendFlashNextLinearAttention(
+        prefix: String,
+        arch: FlashNextArch,
+        into tensors: inout [(String, String, [Int], [UInt8])],
+        rng: inout SplitMix64) {
+        appendBF16(name: "\(prefix).linear_attn.in_proj_qkv.weight",
+                   shape: [arch.qkvDim, arch.hidden], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.in_proj_z.weight",
+                   shape: [arch.valueDim, arch.hidden], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.in_proj_a.weight",
+                   shape: [arch.linearNumVHeads, arch.hidden], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.in_proj_b.weight",
+                   shape: [arch.linearNumVHeads, arch.hidden], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.conv1d.weight",
+                   shape: [arch.qkvDim, arch.linearConvKernelSize, 1],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.A_log",
+                   shape: [arch.linearNumVHeads], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.dt_bias",
+                   shape: [arch.linearNumVHeads], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.norm.weight",
+                   shape: [arch.linearValueHeadDim], into: &tensors, rng: &rng)
+        appendBF16(name: "\(prefix).linear_attn.out_proj.weight",
+                   shape: [arch.hidden, arch.valueDim], into: &tensors, rng: &rng)
+    }
+
+    /// Finite BF16 payload. Random *bit patterns* would inject NaN and Inf,
+    /// which have no defined group min/max, so values are drawn in [-2, 2] and
+    /// rounded to BF16 — exactly what the reference quantizer will later see.
+    static func appendBF16(name: String, shape: [Int],
+                           into tensors: inout [(String, String, [Int], [UInt8])],
+                           rng: inout SplitMix64) {
+        let elements = shape.reduce(1, *)
+        var bytes = [UInt8](repeating: 0, count: elements * 2)
+        for index in 0..<elements {
+            let unit = Float(rng.next() >> 40) / Float(1 << 24)
+            let value = (unit - 0.5) * 4.0
+            let bits = value.bitPattern
+            let lsb = (bits >> 16) & 1
+            let rounded = UInt16(truncatingIfNeeded: (bits &+ (0x7FFF &+ lsb)) >> 16)
+            bytes[index * 2] = UInt8(truncatingIfNeeded: rounded)
+            bytes[index * 2 + 1] = UInt8(truncatingIfNeeded: rounded >> 8)
+        }
+        tensors.append((name, "BF16", shape, bytes))
+    }
+
+    // MARK: - MiniCPM5 variants
+
+    /// Tiny plain-llama shape: four full-attention layers, 2 query heads over
+    /// 2 KV heads of 64, one SwiGLU MLP per layer, untied `lm_head`, no q/k
+    /// norm, no experts. `attentionScale` is exactly 0.125 (= pow(64, -0.5)).
+    struct MiniCPM5Arch {
+        let hidden: Int = 128
+        let intermediate: Int = 64
+        let numHeads: Int = 2
+        let numKVHeads: Int = 2
+        let headDim: Int = 64
+        let vocab: Int = 256
+        let numLayers: Int = 4
+        let groupSize: Int = 64
+        let ropeTheta: Double = 5_000_000.0
+    }
+
+    /// The flat `LlamaForCausalLM` config both MiniCPM5 repos share, minus
+    /// the `quantization` block the MLX control adds.
+    private static func miniCPM5Config(_ arch: MiniCPM5Arch) -> [String: Any] {
+        [
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": arch.hidden,
+            "intermediate_size": arch.intermediate,
+            "num_attention_heads": arch.numHeads,
+            "num_key_value_heads": arch.numKVHeads,
+            "head_dim": arch.headDim,
+            "vocab_size": arch.vocab,
+            "num_hidden_layers": arch.numLayers,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": arch.ropeTheta,
+            "rope_scaling": NSNull(),
+            "tie_word_embeddings": false,
+            "hidden_act": "silu",
+            "attention_bias": false,
+            "mlp_bias": false,
+            "bos_token_id": 0,
+            "eos_token_id": [1, 3],
+        ]
+    }
+
+    /// The vendor's BF16 upload shape: bare `model.` trunk, top-level
+    /// `lm_head.weight`, one shard named as the real repo names it, no
+    /// `quantization` block. Every tensor is finite BF16 so the in-flight
+    /// quantizer sees the same value range the real checkpoint has.
+    static func buildMiniCPM5(at dir: String,
+                              seed: UInt64 = 0x5C9B_0001_2B00_CD19) throws -> Snapshot {
+        try? FileManager.default.removeItem(atPath: dir)
+        try FileManager.default.createDirectory(atPath: dir,
+                                                withIntermediateDirectories: true)
+        let arch = MiniCPM5Arch()
+        var rng = SplitMix64(seed: seed)
+        var tensors: [(String, String, [Int], [UInt8])] = []
+
+        appendBF16(name: "model.embed_tokens.weight",
+                   shape: [arch.vocab, arch.hidden], into: &tensors, rng: &rng)
+        for li in 0..<arch.numLayers {
+            let prefix = "model.layers.\(li)"
+            appendBF16(name: prefix + ".self_attn.q_proj.weight",
+                       shape: [arch.numHeads * arch.headDim, arch.hidden],
+                       into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".self_attn.k_proj.weight",
+                       shape: [arch.numKVHeads * arch.headDim, arch.hidden],
+                       into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".self_attn.v_proj.weight",
+                       shape: [arch.numKVHeads * arch.headDim, arch.hidden],
+                       into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".self_attn.o_proj.weight",
+                       shape: [arch.hidden, arch.numHeads * arch.headDim],
+                       into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".mlp.gate_proj.weight",
+                       shape: [arch.intermediate, arch.hidden], into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".mlp.up_proj.weight",
+                       shape: [arch.intermediate, arch.hidden], into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".mlp.down_proj.weight",
+                       shape: [arch.hidden, arch.intermediate], into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".input_layernorm.weight",
+                       shape: [arch.hidden], into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".post_attention_layernorm.weight",
+                       shape: [arch.hidden], into: &tensors, rng: &rng)
+        }
+        appendBF16(name: "model.norm.weight", shape: [arch.hidden],
+                   into: &tensors, rng: &rng)
+        appendBF16(name: "lm_head.weight", shape: [arch.vocab, arch.hidden],
+                   into: &tensors, rng: &rng)
+
+        let shardName = "model-00000-of-00001.safetensors"
+        let shardPath = (dir as NSString).appendingPathComponent(shardName)
+        try writeShard(path: shardPath, tensors: tensors)
+
+        try JSONSerialization.data(withJSONObject: miniCPM5Config(arch),
+                                   options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: (dir as NSString)
+                .appendingPathComponent("config.json")))
+        var weightMap: [String: String] = [:]
+        for (name, _, _, _) in tensors { weightMap[name] = shardName }
+        try JSONSerialization.data(
+            withJSONObject: ["metadata": ["total_size": tensors.reduce(0) { $0 + $1.3.count }],
+                             "weight_map": weightMap],
+            options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: (dir as NSString)
+                .appendingPathComponent("model.safetensors.index.json")))
+        return Snapshot(shardPath: shardPath)
+    }
+
+    /// The vendor's MLX control shape: the same names, every projection
+    /// (embedding and head included) packed U32 INT4 group-64 with BF16
+    /// `.scales` / `.biases` companions, BF16 norms, and the base
+    /// `quantization` block with no per-tensor overrides.
+    static func buildMiniCPM5MLX(at dir: String,
+                                 seed: UInt64 = 0x5C9B_0002_2B00_35AC) throws -> Snapshot {
+        try? FileManager.default.removeItem(atPath: dir)
+        try FileManager.default.createDirectory(atPath: dir,
+                                                withIntermediateDirectories: true)
+        let arch = MiniCPM5Arch()
+        var rng = SplitMix64(seed: seed)
+        var tensors: [(String, String, [Int], [UInt8])] = []
+
+        appendQuantizedWeight(name: "model.embed_tokens",
+                              outerShape: [arch.vocab], innerLogical: arch.hidden, bits: 4,
+                              groupSize: arch.groupSize, into: &tensors, rng: &rng)
+        for li in 0..<arch.numLayers {
+            let prefix = "model.layers.\(li)"
+            appendQuantizedWeight(name: prefix + ".self_attn.q_proj",
+                                  outerShape: [arch.numHeads * arch.headDim],
+                                  innerLogical: arch.hidden, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".self_attn.k_proj",
+                                  outerShape: [arch.numKVHeads * arch.headDim],
+                                  innerLogical: arch.hidden, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".self_attn.v_proj",
+                                  outerShape: [arch.numKVHeads * arch.headDim],
+                                  innerLogical: arch.hidden, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".self_attn.o_proj",
+                                  outerShape: [arch.hidden],
+                                  innerLogical: arch.numHeads * arch.headDim, bits: 4,
+                                  groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.gate_proj",
+                                  outerShape: [arch.intermediate], innerLogical: arch.hidden,
+                                  bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.up_proj",
+                                  outerShape: [arch.intermediate], innerLogical: arch.hidden,
+                                  bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendQuantizedWeight(name: prefix + ".mlp.down_proj",
+                                  outerShape: [arch.hidden], innerLogical: arch.intermediate,
+                                  bits: 4, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".input_layernorm.weight",
+                       shape: [arch.hidden], into: &tensors, rng: &rng)
+            appendBF16(name: prefix + ".post_attention_layernorm.weight",
+                       shape: [arch.hidden], into: &tensors, rng: &rng)
+        }
+        appendBF16(name: "model.norm.weight", shape: [arch.hidden],
+                   into: &tensors, rng: &rng)
+        appendQuantizedWeight(name: "lm_head",
+                              outerShape: [arch.vocab], innerLogical: arch.hidden, bits: 4,
+                              groupSize: arch.groupSize, into: &tensors, rng: &rng)
+
+        let shardName = "model.safetensors"
+        let shardPath = (dir as NSString).appendingPathComponent(shardName)
+        try writeShard(path: shardPath, tensors: tensors)
+
+        var config = miniCPM5Config(arch)
+        config["quantization"] = ["bits": 4, "group_size": arch.groupSize, "mode": "affine"]
+        try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: (dir as NSString)
+                .appendingPathComponent("config.json")))
+        var weightMap: [String: String] = [:]
+        for (name, _, _, _) in tensors { weightMap[name] = shardName }
+        try JSONSerialization.data(
+            withJSONObject: ["metadata": ["format": "mlx"], "weight_map": weightMap],
+            options: [.sortedKeys])
+            .write(to: URL(fileURLWithPath: (dir as NSString)
+                .appendingPathComponent("model.safetensors.index.json")))
+        return Snapshot(shardPath: shardPath)
+    }
+
+    /// GLM-5.3-Flash at toy scale, in PipeNetwork's mlx-vlm layout: the
+    /// `language_model.model.layers.N.…` text trunk with a `language_model.
+    /// lm_head`, a `vision_model.` tower the planner must drop, a nested
+    /// `text_config`, and a `quantization` block with INT4 base width plus
+    /// flat per-module INT8 overrides for everything but the routed experts.
+    /// The routed experts are stacked `mlp.switch_mlp.{gate,up,down}_proj`
+    /// INT4 triplets; the router gate is BF16 with an FP32 correction bias;
+    /// the mHC `fn` is BF16 with FP32 `base` / `scale`; the KDA decay
+    /// parameters are FP32 and the depthwise conv BF16.
+    ///
+    /// Four layers: three Kimi-Delta-Attention layers and one sparse layer
+    /// (index 3), the first layer dense. Same geometry as the runtime's
+    /// `ArchConfig.glm53Toy()`.
+    struct Glm53Arch {
+        let hidden: Int = 128
+        let moeIntermediate: Int = 64
+        let denseIntermediate: Int = 128
+        let numHeads: Int = 2
+        let qkNopeHeadDim: Int = 64
+        let vHeadDim: Int = 64
+        let kvLoraRank: Int = 64
+        let qLoraRank: Int = 64
+        let linearHeads: Int = 2
+        let linearHeadDim: Int = 64
+        let convKernel: Int = 4
+        let indexNHeads: Int = 2
+        let indexHeadDim: Int = 64
+        let indexTopK: Int = 4
+        let indexKPool: Int = 2
+        let vocab: Int = 256
+        let numLayers: Int = 4
+        let numExperts: Int = 8
+        let topK: Int = 2
+        let groupSize: Int = 64
+        let hcMult: Int = 4
+        let layerTypes: [String] = ["linear_attention", "linear_attention",
+                                    "linear_attention", "deepseek_sparse_attention"]
+        let firstKDense: Int = 1
+        var hcFnRows: Int { (2 + hcMult) * hcMult }
+        var linearDim: Int { linearHeads * linearHeadDim }
+    }
+
+    static func buildGlm53(at dir: String,
+                           seed: UInt64 = 0x61A5_3F1A_5B11_2026) throws -> Snapshot {
+        try? FileManager.default.removeItem(atPath: dir)
+        try FileManager.default.createDirectory(atPath: dir,
+                                                withIntermediateDirectories: true)
+        let arch = Glm53Arch()
+        var rng = SplitMix64(seed: seed)
+        var tensors: [(String, String, [Int], [UInt8])] = []
+        var quant: [String: Any] = ["group_size": arch.groupSize, "bits": 4]
+        func int8(_ module: String, rows: Int, cols: Int) {
+            appendQuantizedWeight(name: module, outerShape: [rows], innerLogical: cols,
+                                  bits: 8, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            quant[module] = ["group_size": arch.groupSize, "bits": 8]
+        }
+        func int8PerHead(_ module: String, heads: Int, rows: Int, cols: Int) {
+            appendQuantizedWeight(name: module, outerShape: [heads, rows], innerLogical: cols,
+                                  bits: 8, groupSize: arch.groupSize, into: &tensors, rng: &rng)
+            quant[module] = ["group_size": arch.groupSize, "bits": 8]
+        }
+        func bf16(_ name: String, _ shape: [Int]) {
+            appendUnquantizedBF16(name: name, shape: shape, into: &tensors, rng: &rng)
+        }
+        func f32(_ name: String, _ shape: [Int]) {
+            appendUnquantizedFP32(name: name, shape: shape, into: &tensors, rng: &rng)
+        }
+
+        let lm = "language_model."
+        int8(lm + "model.embed_tokens", rows: arch.vocab, cols: arch.hidden)
+        int8(lm + "lm_head", rows: arch.vocab, cols: arch.hidden)
+        bf16(lm + "model.norm.weight", [arch.hidden])
+
+        for li in 0..<arch.numLayers {
+            let p = lm + "model.layers.\(li)."
+            bf16(p + "input_layernorm.weight", [arch.hidden])
+            bf16(p + "post_attention_layernorm.weight", [arch.hidden])
+            for site in ["attn_hc", "ffn_hc"] {
+                bf16(p + "\(site).fn", [arch.hcFnRows, arch.hcMult * arch.hidden])
+                f32(p + "\(site).base", [arch.hcFnRows])
+                f32(p + "\(site).scale", [3])
+            }
+            if arch.layerTypes[li] == "linear_attention" {
+                let d = arch.linearDim
+                int8(p + "self_attn.q_proj", rows: d, cols: arch.hidden)
+                int8(p + "self_attn.k_proj", rows: d, cols: arch.hidden)
+                int8(p + "self_attn.v_proj", rows: d, cols: arch.hidden)
+                bf16(p + "self_attn.conv1d.weight", [3 * d, arch.convKernel, 1])
+                int8(p + "self_attn.forget_gate.f_a_proj", rows: arch.linearHeadDim, cols: arch.hidden)
+                int8(p + "self_attn.forget_gate.f_b_proj", rows: d, cols: arch.linearHeadDim)
+                f32(p + "self_attn.forget_gate.A_log", [arch.linearHeads])
+                f32(p + "self_attn.forget_gate.dt_bias", [d])
+                int8(p + "self_attn.g_a_proj", rows: arch.linearHeadDim, cols: arch.hidden)
+                int8(p + "self_attn.g_b_proj", rows: d, cols: arch.linearHeadDim)
+                int8(p + "self_attn.b_proj", rows: arch.linearHeads, cols: arch.hidden)
+                bf16(p + "self_attn.o_norm.weight", [arch.linearHeadDim])
+                int8(p + "self_attn.o_proj", rows: arch.hidden, cols: d)
+            } else {
+                int8(p + "self_attn.q_a_proj", rows: arch.qLoraRank, cols: arch.hidden)
+                bf16(p + "self_attn.q_a_layernorm.weight", [arch.qLoraRank])
+                int8(p + "self_attn.q_b_proj", rows: arch.numHeads * arch.qkNopeHeadDim, cols: arch.qLoraRank)
+                int8(p + "self_attn.kv_a_proj_with_mqa", rows: arch.kvLoraRank, cols: arch.hidden)
+                bf16(p + "self_attn.kv_a_layernorm.weight", [arch.kvLoraRank])
+                int8PerHead(p + "self_attn.embed_q", heads: arch.numHeads,
+                            rows: arch.kvLoraRank, cols: arch.qkNopeHeadDim)
+                int8PerHead(p + "self_attn.unembed_out", heads: arch.numHeads,
+                            rows: arch.vHeadDim, cols: arch.kvLoraRank)
+                int8(p + "self_attn.o_proj", rows: arch.hidden, cols: arch.numHeads * arch.vHeadDim)
+                int8(p + "self_attn.indexer.wq_b", rows: arch.indexNHeads * arch.indexHeadDim,
+                     cols: arch.qLoraRank)
+                int8(p + "self_attn.indexer.wk", rows: arch.indexHeadDim, cols: arch.hidden)
+                bf16(p + "self_attn.indexer.k_norm.weight", [arch.indexHeadDim])
+                bf16(p + "self_attn.indexer.k_norm.bias", [arch.indexHeadDim])
+                int8(p + "self_attn.indexer.weights_proj", rows: arch.indexNHeads, cols: arch.hidden)
+                bf16(p + "self_attn.indexer.index_kpool_compress_gate", [arch.indexHeadDim, arch.hidden])
+                bf16(p + "self_attn.indexer.index_kpool_compress_ape", [arch.indexKPool, arch.indexHeadDim])
+            }
+            if li < arch.firstKDense {
+                int8(p + "mlp.gate_proj", rows: arch.denseIntermediate, cols: arch.hidden)
+                int8(p + "mlp.up_proj", rows: arch.denseIntermediate, cols: arch.hidden)
+                int8(p + "mlp.down_proj", rows: arch.hidden, cols: arch.denseIntermediate)
+            } else {
+                bf16(p + "mlp.gate.weight", [arch.numExperts, arch.hidden])
+                f32(p + "mlp.gate.e_score_correction_bias", [arch.numExperts])
+                int8(p + "mlp.shared_experts.gate_proj", rows: arch.moeIntermediate, cols: arch.hidden)
+                int8(p + "mlp.shared_experts.up_proj", rows: arch.moeIntermediate, cols: arch.hidden)
+                int8(p + "mlp.shared_experts.down_proj", rows: arch.hidden, cols: arch.moeIntermediate)
+                for (role, rows, cols) in [("gate_proj", arch.moeIntermediate, arch.hidden),
+                                           ("up_proj", arch.moeIntermediate, arch.hidden),
+                                           ("down_proj", arch.hidden, arch.moeIntermediate)] {
+                    appendQuantizedWeight(name: p + "mlp.switch_mlp.\(role)",
+                                          outerShape: [arch.numExperts, rows],
+                                          innerLogical: cols, bits: 4,
+                                          groupSize: arch.groupSize, into: &tensors, rng: &rng)
+                }
+            }
+        }
+
+        // The vision tower the planner drops (BF16, as the real conversion).
+        bf16("vision_model.patch_embed.proj.weight", [32, 12])
+        bf16("vision_model.patch_embed.proj.bias", [32])
+        bf16("vision_model.blocks.0.attn.qkv.weight", [96, 32])
+        bf16("vision_model.merger.proj.weight", [arch.hidden, 32])
+        bf16("vision_model.post_layernorm.weight", [32])
+
+        let shardName = "model-00001.safetensors"
+        let shardPath = (dir as NSString).appendingPathComponent(shardName)
+        try writeShard(path: shardPath, tensors: tensors)
+        var weightMap: [String: String] = [:]
+        for (name, _, _, _) in tensors { weightMap[name] = shardName }
+
+        let textConfig: [String: Any] = [
+            "model_type": "glm5_next_text",
+            "vocab_size": arch.vocab,
+            "hidden_size": arch.hidden,
+            "intermediate_size": arch.denseIntermediate,
+            "moe_intermediate_size": arch.moeIntermediate,
+            "num_hidden_layers": arch.numLayers,
+            "num_attention_heads": arch.numHeads,
+            "num_key_value_heads": arch.numHeads,
+            "n_shared_experts": 1,
+            "n_routed_experts": arch.numExperts,
+            "num_experts_per_tok": arch.topK,
+            "routed_scaling_factor": 2.5,
+            "kv_lora_rank": arch.kvLoraRank,
+            "q_lora_rank": arch.qLoraRank,
+            "qk_rope_head_dim": 0,
+            "qk_nope_head_dim": arch.qkNopeHeadDim,
+            "qk_head_dim": arch.qkNopeHeadDim,
+            "v_head_dim": arch.vHeadDim,
+            "head_dim": 0,
+            "n_group": 1, "topk_group": 1,
+            "norm_topk_prob": true,
+            "scoring_func": "sigmoid",
+            "topk_method": "noaux_tc",
+            "hidden_act": "silu",
+            "first_k_dense_replace": arch.firstKDense,
+            "max_position_embeddings": 4096,
+            "rms_norm_eps": 1e-5,
+            "index_topk": arch.indexTopK,
+            "index_head_dim": arch.indexHeadDim,
+            "index_n_heads": arch.indexNHeads,
+            "index_kpool": arch.indexKPool,
+            "index_kpool_compress": true,
+            "index_kpool_always_select_tail": true,
+            "indexer_rope_interleave": true,
+            "indexer_types": Array(repeating: "full", count: arch.numLayers),
+            "layer_types": arch.layerTypes,
+            "mlp_layer_types": (0..<arch.numLayers).map { $0 < arch.firstKDense ? "dense" : "sparse" },
+            "linear_attn_config": [
+                "num_heads": arch.linearHeads, "head_dim": arch.linearHeadDim,
+                "short_conv_kernel_size": arch.convKernel, "gate_lower_bound": -5.0,
+                "kda_layers": [0, 1, 2], "full_attn_layers": [3],
+            ],
+            "swiglu_limit": 0.5,
+            "hc_mult": arch.hcMult, "hc_eps": 1e-06, "hc_sinkhorn_iters": 20, "mhc": true,
+            "mla_use_nope": true,
+            "moe_router_dtype": "float32",
+            "num_nextn_predict_layers": 0,
+            "tie_word_embeddings": false,
+            "eos_token_id": [1],
+        ]
+        let config: [String: Any] = [
+            "architectures": ["Glm5NextForConditionalGeneration"],
+            "model_type": "glm5_next",
+            "text_config": textConfig,
+            "vision_config": ["model_type": "glm5_next_vision", "depth": 1, "hidden_size": 32],
+            "tie_word_embeddings": false,
+            "quantization": quant,
+        ]
+        let configData = try JSONSerialization.data(withJSONObject: config, options: [.sortedKeys])
+        try configData.write(to: URL(fileURLWithPath: (dir as NSString).appendingPathComponent("config.json")))
+        let indexObj: [String: Any] = ["metadata": [:], "weight_map": weightMap]
+        let indexData = try JSONSerialization.data(withJSONObject: indexObj, options: [.sortedKeys])
+        try indexData.write(to: URL(fileURLWithPath:
+            (dir as NSString).appendingPathComponent("model.safetensors.index.json")))
         return Snapshot(shardPath: shardPath)
     }
 

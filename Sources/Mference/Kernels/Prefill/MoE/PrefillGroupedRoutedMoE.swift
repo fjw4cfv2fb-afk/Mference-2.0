@@ -14,6 +14,7 @@ enum PrefillGroupedRoutedMoEBufferIndex {
 
 struct PrefillGroupedRoutedMoEStreamedMetadataBuffers {
     let sortedPairs: MTLBuffer
+    let groups: MTLBuffer
 }
 
 struct PrefillStreamedTileArgumentBuffer {
@@ -170,6 +171,47 @@ struct PrefillGroupedRoutedMoEStreamedParams: Equatable, Sendable {
         self.localExpert13 = ids[13]
         self.localExpert14 = ids[14]
         self.localExpert15 = ids[15]
+        self.gateWOff = offsets.gateWOff
+        self.gateSOff = offsets.gateSOff
+        self.gateBOff = offsets.gateBOff
+        self.upWOff = offsets.upWOff
+        self.upSOff = offsets.upSOff
+        self.upBOff = offsets.upBOff
+        self.downWOff = offsets.downWOff
+        self.downSOff = offsets.downSOff
+        self.downBOff = offsets.downBOff
+    }
+
+    init(groupStart: UInt32,
+         groupCount: UInt32,
+         d: UInt32,
+         routedIntermediate: UInt32,
+         topK: UInt32,
+         hiddenStrideElements: UInt32,
+         offsets: MoEExpertOffsets) {
+        self.pairStart = groupStart
+        self.pairCount = groupCount
+        self.d = d
+        self.routedIntermediate = routedIntermediate
+        self.topK = topK
+        self.hiddenStrideElements = hiddenStrideElements
+        self.liveExpertCount = 0
+        self.localExpert0 = .max
+        self.localExpert1 = .max
+        self.localExpert2 = .max
+        self.localExpert3 = .max
+        self.localExpert4 = .max
+        self.localExpert5 = .max
+        self.localExpert6 = .max
+        self.localExpert7 = .max
+        self.localExpert8 = .max
+        self.localExpert9 = .max
+        self.localExpert10 = .max
+        self.localExpert11 = .max
+        self.localExpert12 = .max
+        self.localExpert13 = .max
+        self.localExpert14 = .max
+        self.localExpert15 = .max
         self.gateWOff = offsets.gateWOff
         self.gateSOff = offsets.gateSOff
         self.gateBOff = offsets.gateBOff
@@ -339,6 +381,8 @@ enum PrefillGroupedRoutedMoEError: Error, Equatable, CustomStringConvertible {
 final class PrefillGroupedRoutedMoE {
     private let batchedPhase1PSO: MTLComputePipelineState
     private let batchedDownPSO: MTLComputePipelineState
+    private let residentPhase1PSO: MTLComputePipelineState
+    private let residentDownPSO: MTLComputePipelineState
     private let streamedArgEncoder: MTLArgumentEncoder
 
     func makeStreamedArgumentBuffer(device: MTLDevice,
@@ -366,6 +410,9 @@ final class PrefillGroupedRoutedMoE {
             "prefill_grouped_routed_moe_batched_phase1",
             constants: activationConstants)
         self.batchedDownPSO = try context.pipeline("prefill_grouped_routed_moe_batched_down")
+        self.residentPhase1PSO = try context.pipeline(
+            "prefill_grouped_routed_moe_resident_phase1", constants: activationConstants)
+        self.residentDownPSO = try context.pipeline("prefill_grouped_routed_moe_resident_down")
         guard let streamedFn = context.library.makeFunction(name: "prefill_grouped_routed_moe_batched_phase1") else {
             throw MetalError.missingFunction("prefill_grouped_routed_moe_batched_phase1")
         }
@@ -382,10 +429,44 @@ final class PrefillGroupedRoutedMoE {
             device.makeBuffer(bytes: ptr.baseAddress!,
                               length: bytes,
                               options: .storageModeShared)
+        }),
+        let groups = routes.groups.withUnsafeBufferPointer({ ptr in
+            device.makeBuffer(bytes: ptr.baseAddress!,
+                              length: routes.groups.count
+                                * MemoryLayout<PrefillMoEGroup>.stride,
+                              options: .storageModeShared)
         }) else {
             throw PrefillGroupedRoutedMoEError.allocationFailed("prefill sorted route pairs")
         }
-        return PrefillGroupedRoutedMoEStreamedMetadataBuffers(sortedPairs: sortedPairs)
+        return PrefillGroupedRoutedMoEStreamedMetadataBuffers(
+            sortedPairs: sortedPairs, groups: groups)
+    }
+
+    func encodeResidentBatched(commandBuffer cb: MTLCommandBuffer,
+                               hidden: MTLBuffer, sortedPairs: MTLBuffer,
+                               activation: MTLBuffer, routePartials: MTLBuffer,
+                               slab: MTLBuffer, stride: UInt32,
+                               params: PrefillGroupedRoutedMoEStreamedParams) throws {
+        precondition(params.liveExpertCount == 0 && params.pairStart == 0 && stride > 0)
+        for (pipeline, width) in [(residentPhase1PSO, params.routedIntermediate),
+                                   (residentDownPSO, params.d)] {
+            guard let encoder = cb.makeComputeCommandEncoder() else {
+                throw PrefillGroupedRoutedMoEError.allocationFailed("resident grouped expert encoder")
+            }
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(hidden, offset: 0, index: 0)
+            encoder.setBuffer(sortedPairs, offset: 0, index: 1)
+            encoder.setBuffer(activation, offset: 0, index: 2)
+            encoder.setBuffer(routePartials, offset: 0, index: 3)
+            encoder.setBuffer(slab, offset: 0, index: 4)
+            var p = params
+            var stride = stride
+            encoder.setBytes(&p, length: MemoryLayout<PrefillGroupedRoutedMoEStreamedParams>.stride, index: 5)
+            encoder.setBytes(&stride, length: 4, index: 6)
+            encoder.dispatchThreads(MTLSize(width: Int(width), height: Int(params.pairCount), depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 8, height: 8, depth: 1))
+            encoder.endEncoding()
+        }
     }
 
     @discardableResult

@@ -29,6 +29,7 @@ struct ServerPromptCacheEntry: Sendable, Equatable {
     let kvBackedTokenIDs: [Int32]
     let uncommittedBoundaryTokenIDs: [Int32]
     let kvPosition: Int
+    var reasoningEffort: QwenReasoningEffort? = nil
 }
 
 enum ServerPromptCacheMatch: Sendable, Equatable {
@@ -49,6 +50,7 @@ struct ServerPromptCache: Sendable {
         content: String,
         calls: [ParsedToolCall],
         result: RawDecodeResult,
+        reasoningContent: String? = nil,
         stopStringFiltered: Bool = false
     ) {
         guard result.kvPosition == result.kvBackedTokenIDs.count,
@@ -70,7 +72,8 @@ struct ServerPromptCache: Sendable {
         let assistant = MFTokenizer.Message(
             role: .assistant,
             content: calls.isEmpty ? content : nil,
-            toolCalls: historicalCalls)
+            toolCalls: historicalCalls,
+            reasoningContent: reasoningContent)
         entry = ServerPromptCacheEntry(
             domain: domain,
             inputMessages: request.messages,
@@ -80,7 +83,8 @@ struct ServerPromptCache: Sendable {
                 rawStopReason: result.reason),
             kvBackedTokenIDs: result.kvBackedTokenIDs,
             uncommittedBoundaryTokenIDs: result.uncommittedBoundaryTokenIDs,
-            kvPosition: result.kvPosition)
+            kvPosition: result.kvPosition,
+            reasoningEffort: request.reasoningEffort)
     }
 
     func match(
@@ -106,6 +110,11 @@ struct ServerPromptCache: Sendable {
                 cachedPromptTokens: entry.kvPosition)
         }
 
+        // Source-template effort and preserved reasoning are defined by the
+        // source template. Reuse only an exact rendered prefix; the legacy
+        // hand-written bridge cannot prove equivalence for this checkpoint.
+        guard !tokenizer.isSwiftQwen, request.reasoningEffort == nil,
+              entry.reasoningEffort == nil else { return .miss }
         let inputCount = entry.inputMessages.count
         guard request.messages.count > inputCount + 1,
               request.messages.prefix(inputCount)
@@ -137,6 +146,7 @@ struct ServerPromptCache: Sendable {
         guard incoming.role == .assistant,
               cached.role == .assistant,
               incoming.toolCalls == cached.toolCalls,
+              incoming.reasoningContent == cached.reasoningContent,
               incoming.toolCallID == cached.toolCallID,
               incoming.name == cached.name else {
             return false

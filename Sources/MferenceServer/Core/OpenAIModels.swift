@@ -76,6 +76,7 @@ public struct OpenAIToolCall: Codable, Equatable, Sendable {
 }
 
 public struct OpenAIChatMessage: Codable, Equatable, Sendable {
+    public var reasoningContent: String? = nil
     public let role: String
     public let content: OpenAIMessageContent?
     public let toolCalls: [OpenAIToolCall]?
@@ -84,6 +85,7 @@ public struct OpenAIChatMessage: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case role, content, name
+        case reasoningContent = "reasoning_content"
         case toolCalls = "tool_calls"
         case toolCallID = "tool_call_id"
     }
@@ -138,6 +140,7 @@ public struct OpenAIStreamOptions: Codable, Equatable, Sendable {
 }
 
 public struct OpenAIChatRequest: Codable, Equatable, Sendable {
+    public var reasoningEffort: String? = nil
     public let model: String
     public let messages: [OpenAIChatMessage]
     public let stream: Bool?
@@ -160,6 +163,7 @@ public struct OpenAIChatRequest: Codable, Equatable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case model, messages, stream, temperature, stop, seed, tools, n, logprobs
+        case reasoningEffort = "reasoning_effort"
         case streamOptions = "stream_options"
         case topP = "top_p"
         case maxTokens = "max_tokens"
@@ -174,6 +178,20 @@ public struct OpenAIChatRequest: Codable, Equatable, Sendable {
 }
 
 public struct OpenAIUsage: Codable, Equatable, Sendable {
+    public struct CompletionTokensDetails: Codable, Equatable, Sendable {
+        public let reasoningTokens: Int
+        public let visibleTokens: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case reasoningTokens = "reasoning_tokens"
+            case visibleTokens = "visible_tokens"
+        }
+
+        public init(reasoningTokens: Int, visibleTokens: Int?) {
+            self.reasoningTokens = reasoningTokens
+            self.visibleTokens = visibleTokens
+        }
+    }
     public struct PromptTokensDetails: Codable, Equatable, Sendable {
         public let cachedTokens: Int
 
@@ -190,22 +208,26 @@ public struct OpenAIUsage: Codable, Equatable, Sendable {
     public let completionTokens: Int
     public let totalTokens: Int
     public let promptTokensDetails: PromptTokensDetails
+    public let completionTokensDetails: CompletionTokensDetails?
 
     enum CodingKeys: String, CodingKey {
         case promptTokens = "prompt_tokens"
         case completionTokens = "completion_tokens"
         case totalTokens = "total_tokens"
         case promptTokensDetails = "prompt_tokens_details"
+        case completionTokensDetails = "completion_tokens_details"
     }
 
     public init(promptTokens: Int,
                 completionTokens: Int,
                 totalTokens: Int,
-                cachedTokens: Int = 0) {
+                cachedTokens: Int = 0,
+                completionTokensDetails: CompletionTokensDetails? = nil) {
         self.promptTokens = promptTokens
         self.completionTokens = completionTokens
         self.totalTokens = totalTokens
         self.promptTokensDetails = PromptTokensDetails(cachedTokens: cachedTokens)
+        self.completionTokensDetails = completionTokensDetails
     }
 }
 
@@ -246,6 +268,7 @@ public enum ServerRequestError: Error, Equatable, Sendable {
 }
 
 public struct ValidatedChatRequest: Sendable {
+    public var reasoningEffort: QwenReasoningEffort? = nil
     public let messages: [MFTokenizer.Message]
     public let tools: [MFTokenizer.FunctionDefinition]
     public let stream: Bool
@@ -257,8 +280,35 @@ public struct ValidatedChatRequest: Sendable {
 public enum OpenAIRequestValidator {
     public static func validate(_ request: OpenAIChatRequest,
                                 modelID: String,
-                                dialect: ChatDialect = .gemma) throws -> ValidatedChatRequest {
+                                dialect: ChatDialect = .gemma,
+                                swiftQwen: Bool? = nil) throws -> ValidatedChatRequest {
+        try validate(request, modelID: modelID, dialect: dialect,
+                     swiftQwen: swiftQwen, qwenReasoning: nil)
+    }
+
+    public static func validate(_ request: OpenAIChatRequest,
+                                modelID: String,
+                                dialect: ChatDialect,
+                                swiftQwen: Bool?,
+                                qwenReasoning: Bool?) throws -> ValidatedChatRequest {
         guard request.model == modelID else { throw ServerRequestError.unknownModel }
+        let isSwiftQwen = swiftQwen ?? (modelID.split(separator: "@").first == Substring(CheckpointIdentity.swiftQwen38))
+        let supportsEffort = qwenReasoning ?? (isSwiftQwen ||
+            modelID.split(separator: "@").first == Substring(CheckpointIdentity.baseQwen38))
+        if (isSwiftQwen || (supportsEffort && request.reasoningEffort != nil)),
+           request.messages.contains(where: { $0.role == "developer" }) {
+            throw invalid("Qwen 3.8 source-template requests require leading system guidance; developer messages are not supported",
+                          "messages", "unsupported_role")
+        }
+        if !supportsEffort, request.reasoningEffort != nil {
+            throw invalid("reasoning_effort requires base or Swift Qwen 3.8",
+                          "reasoning_effort", "unsupported_value")
+        }
+        let effort = request.reasoningEffort.flatMap(QwenReasoningEffort.init(rawValue:))
+        guard request.reasoningEffort == nil || effort != nil else {
+            throw invalid("reasoning_effort must be xhigh, medium, low, or none",
+                          "reasoning_effort", "unsupported_value")
+        }
         guard request.n == nil || request.n == 1 else {
             throw invalid("only n=1 is supported", "n", "unsupported_value")
         }
@@ -327,7 +377,7 @@ public enum OpenAIRequestValidator {
                                       repetitionPenalty: repetitionPenalty,
                                       seed: request.seed,
                                       stopStrings: request.stop?.values ?? [])
-        return ValidatedChatRequest(messages: messages,
+        return ValidatedChatRequest(reasoningEffort: effort, messages: messages,
                                     tools: tools,
                                     stream: request.stream ?? false,
                                     includeUsage: request.streamOptions?.includeUsage ?? false,
@@ -492,7 +542,8 @@ public enum OpenAIRequestValidator {
                                                   content: content,
                                                   toolCalls: calls,
                                                   toolCallID: message.toolCallID,
-                                                  name: message.name))
+                                                  name: message.name,
+                                                  reasoningContent: message.reasoningContent))
             }
         }
         return result

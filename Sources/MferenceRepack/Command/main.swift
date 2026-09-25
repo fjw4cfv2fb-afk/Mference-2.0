@@ -3,7 +3,7 @@ import MferenceRepackCore
 
 private let usage = """
 Usage:
-  MferenceRepack [--dry-run] [--model <gemma4|qwen36|qwen38|deepseekv4flash|inklingsmall|maple>] --output <model.gturbo> [--overwrite] [--resume] [--base-url <url>]
+  MferenceRepack [--dry-run] [--model <gemma4|qwen36|qwen36original|qwen38|swiftqwen38|deepseekv4flash|inklingsmall|maple|qwen38flashnext|minicpm5|minicpm5mlx|glm53flash>] --output <model.gturbo> [--overwrite] [--resume] [--skip-mtp] [--base-url <url>]
   MferenceRepack --attach-mtp <mtp-shard.safetensors> --output <model.gturbo>
   MferenceRepack --discard-partial --output <model.gturbo>
   MferenceRepack --verify-install --input-gturbo <model.gturbo>
@@ -13,12 +13,57 @@ Usage:
 safetensors shard to an existing install (projections quantized to INT4
 affine group-64), enabling speculative decoding.
 
+--skip-mtp drops the source checkpoint's own mtp.* draft-layer group instead
+of carrying it. Vision towers are always skipped. Either way the decision is
+recorded in manifest.json -> sidecars rather than left implicit.
+
+qwen38flashnext and qwen36original read the model vendor's original BF16 repo
+and quantize to INT4 affine group-64 during the install. qwen38flashnext keeps
+its two gating tensors per layer at INT8; its capability gate was lifted on
+2026-09-10, so an install loads through the ordinary funnel. qwen36original is
+the same checkpoint qwen36 installs from mlx-community's pre-quantized
+conversion, put through our own quantizer instead; installing both and
+comparing them is the W2.1b quantizer-quality gate
+(docs/QUANTIZER_QUALITY.md).
+
+swiftqwen38 reads the pinned ukisai/Swift-Qwen3.8-27b BF16 source and quantizes
+its text and MTP weights in flight. It is a qualification candidate, distinct
+from base qwen38; see docs/families/SWIFT_QWEN38.md.
+
+minicpm5 reads openbmb/MiniCPM5-2B's BF16 upload and quantizes to INT4 affine
+group-64 during the install (~5 GB read, ~1.4 GB written); minicpm5mlx is the
+vendor's own MLX INT4 conversion of the same checkpoint, the W2.1b control.
+
+glm53flash reads PipeNetwork's pre-quantized mixed 4/8-bit MLX conversion of
+GLM-5.3-Flash (~181 GB; check disk first). Resident and bounded streamed
+prefill are implemented; see docs/families/GLM53_FLASH.md and the prefill
+qualification matrix for the validated profiles and remaining limits.
+
 The installer streams the selected checkpoint (default: the supported Gemma 4
 checkpoint) from Hugging Face and repackages it without materializing the
 source checkpoint on disk. Set HF_TOKEN only if Hugging Face requests
 authentication. A cancelled or interrupted download can be continued with
 --resume or removed with --discard-partial.
 """
+
+/// Range callbacks may arrive from transfer workers. Throttle payload-only
+/// updates while always reporting phase transitions and completed payloads.
+private final class InstallProgressPrinter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var lastPayloadTime = -Double.infinity
+
+    func report(_ progress: ModelInstallProgress) {
+        lock.lock()
+        defer { lock.unlock() }
+        if case let .copyingPayload(reused, downloaded, total) = progress {
+            let now = ProcessInfo.processInfo.systemUptime
+            let complete = Double(reused) + Double(downloaded) >= Double(total)
+            if !complete && now - lastPayloadTime < 2 { return }
+            lastPayloadTime = now
+        }
+        FileHandle.standardError.write(Data(("[install] " + progress.statusLine + "\n").utf8))
+    }
+}
 
 private struct Arguments {
     var model = SupportedModelSource.default
@@ -31,6 +76,7 @@ private struct Arguments {
     var inputGTurbo: String?
     var baseURL: URL?
     var dryRun = false
+    var skipMTP = false
 
     static func parse(_ values: [String]) throws -> Arguments {
         var parsed = Arguments()
@@ -48,6 +94,9 @@ private struct Arguments {
                 index += 1
             case "--dry-run":
                 parsed.dryRun = true
+                index += 1
+            case "--skip-mtp":
+                parsed.skipMTP = true
                 index += 1
             case "--discard-partial":
                 parsed.discardPartial = true
@@ -105,7 +154,8 @@ private struct Arguments {
             guard parsed.output != nil else {
                 throw ParseError.missingRequired("--output")
             }
-            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall else {
+            guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.verifyInstall,
+                  !parsed.skipMTP else {
                 throw ParseError.invalidMode("--discard-partial only accepts --output")
             }
             return parsed
@@ -115,7 +165,7 @@ private struct Arguments {
                 throw ParseError.missingRequired("--output")
             }
             guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.resume,
-                  !parsed.verifyInstall, !parsed.dryRun else {
+                  !parsed.verifyInstall, !parsed.dryRun, !parsed.skipMTP else {
                 throw ParseError.invalidMode("--attach-mtp only accepts --output")
             }
             return parsed
@@ -124,7 +174,8 @@ private struct Arguments {
             guard parsed.inputGTurbo != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
             }
-            guard parsed.output == nil, !parsed.overwrite, !parsed.resume else {
+            guard parsed.output == nil, !parsed.overwrite, !parsed.resume,
+                  !parsed.skipMTP else {
                 throw ParseError.invalidMode("verification accepts only --input-gturbo")
             }
         } else {
@@ -220,9 +271,13 @@ private func run(_ values: [String]) async -> Int32 {
         token: ProcessInfo.processInfo.environment["HF_TOKEN"],
         resume: arguments.resume,
         baseURL: arguments.baseURL,
-        dryRunSpaceCheck: arguments.dryRun)
+        dryRunSpaceCheck: arguments.dryRun,
+        sidecarPolicy: SidecarPolicy(carryMTP: !arguments.skipMTP))
     do {
-        let result = try await RemoteStreamingRepacker(options: options).run()
+        let printer = InstallProgressPrinter()
+        let result = try await RemoteStreamingRepacker(options: options).run { progress in
+            printer.report(progress)
+        }
         if result.dryRun {
             print("Dry run for \(source.displayName)")
             print("Source revision: \(result.resolvedCommit)")
@@ -233,6 +288,18 @@ private func run(_ values: [String]) async -> Int32 {
             print("Expert layers: \(result.expertLayerCount)")
             print("Excluded multimodal tensors: "
                 + "\(result.excludedMultimodalTensorCount)")
+            // The per-tensor width mixture. Printed as a census of what the
+            // plan will actually write rather than as the policy's rule list,
+            // so a dry run can be diffed against a control conversion's own
+            // mixture before committing to a multi-hour install.
+            let byBits = result.residentWeightWidthCensus
+            let census = byBits.keys.sorted()
+                .map { "INT\($0) \(byBits[$0]!)" }
+                .joined(separator: ", ")
+            print("Resident weight widths: "
+                + (census.isEmpty ? "none quantized" : census)
+                + " (unquantized \(result.residentUnquantizedCount))")
+            print("Bit-width overrides: \(result.bitWidthOverrideCount)")
             return 0
         }
         print("Installed \(source.displayName)")

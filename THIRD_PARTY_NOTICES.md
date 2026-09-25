@@ -10,10 +10,12 @@ Mference's runtime, installer, and application code are derived from
 Mikhaylov and contributors, licensed under the
 [Apache License 2.0](LICENSE-APACHE). The derived portions remain governed by
 that license. Significant changes from the original include: the Mference
-rebrand throughout; support for Qwen 3.6, DeepSeek-V4-Flash, Inkling-Small, and
-Maple across architecture configuration, streaming installation, Metal
-kernels, forward runners, tokenization, and products; model-derived kernel
-specialization; and expanded validation and performance documentation.
+rebrand throughout; support for Qwen 3.6, DeepSeek-V4-Flash, Inkling-Small,
+Maple, Qwen3.8-Flash-Next, MiniCPM5-2B, and GLM-5.3-Flash (in port) across
+architecture configuration,
+streaming installation, Metal kernels, forward runners, tokenization, and
+products; model-derived kernel specialization; and expanded validation and
+performance documentation.
 
 This file records the dependency review performed on 2026-08-09. It is an
 attribution aid, not legal advice. Anyone distributing a compiled product must
@@ -32,7 +34,9 @@ are preserved in [`LICENSE-MLX`](LICENSE-MLX).
 ## Model weights
 
 Model weights are not included in this repository. The installer downloads a
-pinned revision of one of five checkpoints and repacks it locally.
+pinned revision of one of seven checkpoints and repacks it locally. Five are
+pre-quantized community conversions; Qwen3.8-Flash-Next and MiniCPM5-2B are
+read from their vendors' own BF16 repositories and quantized in flight.
 
 Gemma 4: revision `0d77464eeb233a2da68ebf9d7dc4edaac7db956d` of
 [`mlx-community/gemma-4-26b-a4b-it-4bit`](https://huggingface.co/mlx-community/gemma-4-26b-a4b-it-4bit).
@@ -64,8 +68,73 @@ or redistributing those weights therefore requires separately establishing
 that the necessary rights have been obtained; Mference makes no grant of
 rights to them.
 
+Qwen3.8-Flash-Next: revision `de4b8e4d43b917e7706784d8bb445c9af86a3540` of
+[`Qwen/Qwen3.8-Flash-Next`](https://huggingface.co/Qwen/Qwen3.8-Flash-Next),
+Alibaba's own BF16 checkpoint rather than a community conversion — the
+installer reads its 131 shards and quantizes to INT4 group-64 in flight. The
+installer verifies its source-index SHA-256
+`99e815241ef03325536b0aaa4441deea45174c17fae31e10f0bb456410c590de`.
+That revision carries a Hub `license: other` tag and a
+[LICENSE](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/blob/main/LICENSE)
+file naming the **Qwen Community License 1.0** (Copyright (c) 2026 Qwen). It is
+a permissive grant to use, modify, distribute, sublicense, sell, host,
+fine-tune, and create derivative works from the weights, subject to two
+conditions that a redistributor must check for itself: attribution of the model
+name on the user interface of any commercial product or service exceeding 100
+million monthly active users or US$20 million monthly revenue, and a separate
+license from Qwen before commercial use in a "Model as a Service" or "AI Work
+Assistant" business as that license defines them. The license text governs;
+this summary is an attribution aid, not legal advice. No reference code from
+that repository is imported into Mference — the runner, kernels and repack path
+are written against the published architecture, not copied from it.
+
+MiniCPM5-2B: revision `cd199ce3ee67549c42ef7372f809f2c63599a3e9` of
+[`openbmb/MiniCPM5-2B`](https://huggingface.co/openbmb/MiniCPM5-2B), the
+vendor's own BF16 upload, quantized to INT4 affine group-64 at install; the
+installer verifies its source-index SHA-256
+`6d839cd76e8395de548a0e6cc310386f66d1ecbb2c75d198a8dfd3d70892b756`. OpenBMB
+publishes the model and its weights under the
+[Apache License 2.0](https://github.com/OpenBMB/MiniCPM/blob/main/LICENSE)
+(`license: apache-2.0` in the model card). The W2.1b quantizer-quality control,
+revision `35ac38ee7bdb0bf7fa748d0700eeb6d6675760a3` of
+[`openbmb/MiniCPM5-2B-MLX`](https://huggingface.co/openbmb/MiniCPM5-2B-MLX)
+(index SHA-256 `ccf202e0a06fe3c7eb8f354cfb29412a5e64956ad895413d4d9267ae4b3a6045`),
+is the vendor's own conversion under the same license. No reference code was
+imported for this family: its architecture was read from
+`transformers` v5.6.2 (Apache-2.0) and nothing was copied from it.
+
+GLM-5.3-Flash (in port): revision `d43ea8b407ce4e9c25e6ac9baec3feab70d9f5f3`
+of
+[`pipenetwork/GLM-5.3-Flash-MLX-mixed-4_8bit`](https://huggingface.co/pipenetwork/GLM-5.3-Flash-MLX-mixed-4_8bit),
+PipeNetwork's mixed 4/8-bit MLX conversion of Z.ai's
+[GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash). The installer
+verifies its source-index SHA-256
+`5e0a3768db6fb795c4846bed713785a17d336f4cc4494b4f6b28f75082314383`. Both the
+vendor checkpoint and the conversion are published under the MIT license.
+PipeNetwork's runtime for it
+([`PipeNetwork/glm53-flash-mlx`](https://github.com/PipeNetwork/glm53-flash-mlx),
+MIT, revision `a61a7c7d`) is the executable reference the family's parity
+goldens are cut from; no code from it is imported. The family's Metal
+kernels (`Sources/Mference/Metal/Glm53/glm53.metal`: the Kimi Delta Attention
+decode recurrence, the pooled indexer, the latent attention, the per-head
+INT8 GEMV and the router select) are original transcriptions of the
+reference's arithmetic; nothing was imported from
+[`IngeniousIdiocy/ds4`](https://github.com/IngeniousIdiocy/ds4) (branch
+`glm53-m3ultra`, revision `90d71e0d`, MIT), which was read as a design
+reference only. Should a kernel be ported from it later, its notice (MIT with
+the ggml authors' copyright) will be added here at that time.
+
 Downloaded weights remain a separate work governed by their source terms. Do
 not redistribute weights as part of Mference releases.
+
+## Swift-Qwen template test fixture
+
+`Tests/Mference/Core/Tokenization/Fixtures/SwiftQwenTemplate/chat_template.jinja`
+is from `ukisai/Swift-Qwen3.8-27b`, revision
+`1b30aaaf753fe5c1cb51ada2ea0367a53445359c`. The source model card identifies
+Swift Open License 1.0. See the
+[pinned upstream repository](https://huggingface.co/ukisai/Swift-Qwen3.8-27b/tree/1b30aaaf753fe5c1cb51ada2ea0367a53445359c)
+for attribution and terms. Model weights are not bundled with Mference.
 
 ## Swift package graph
 

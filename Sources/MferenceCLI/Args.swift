@@ -10,9 +10,9 @@ public enum PrefillChunkChoice: Equatable, Sendable {
 }
 
 /// Routed-expert cache selection. Auto keeps the 16-slot memory-first default
-/// for every family except Qwen 3.6, whose 256 experts per layer measurably
-/// benefit from larger rungs: 96 slots on hosts with at least 24 GiB,
-/// 32 with at least 16 GiB.
+/// except where a larger rung has been measured: Qwen 3.6 uses 96 slots on
+/// hosts with at least 24 GiB and 32 with at least 16 GiB. Flash-Next maps its
+/// routed pool on hosts with at least 192 GiB when 32 GiB of headroom remains.
 public enum ExpertCacheSlotChoice: Equatable, Sendable {
     case fixed(Int)
     case resident
@@ -20,6 +20,7 @@ public enum ExpertCacheSlotChoice: Equatable, Sendable {
 }
 
 public struct Args: Equatable, Sendable {
+    public var reasoningEffort: QwenReasoningEffort?
     public var model: String
     public var prompt: String?
     public var messagesFile: String?
@@ -43,8 +44,7 @@ public struct Args: Equatable, Sendable {
     /// Model-integrity policy. `.fullSha256` re-hashes every routed-expert
     /// file on first touch — 145 GB for Inkling-Small, ~59 s inside the first
     /// prefill. `.sizeCheckTrustedReceipt` checks sizes against the receipt
-    /// written at install time instead. Mirrors the Mac app's existing
-    /// verification control.
+    /// written at install time instead.
     public var verification: ModelIntegrityPolicy
     /// Paged KV cache with SSD spill + sparse decode (Qwen 3.8):
     /// "on" / "off" / "auto" (auto enables it above 32k context).
@@ -75,7 +75,9 @@ public struct Args: Equatable, Sendable {
                 verification: ModelIntegrityPolicy = .fullSha256,
                 kvPaged: String = "auto",
                 kvTopKPages: Int = 60,
-                kvPoolPages: Int? = nil) {
+                kvPoolPages: Int? = nil,
+                reasoningEffort: QwenReasoningEffort? = nil) {
+        self.reasoningEffort = reasoningEffort
         self.model = model
         self.prompt = prompt
         self.messagesFile = messagesFile
@@ -125,7 +127,7 @@ public enum ArgsError: Error, Equatable, CustomStringConvertible {
 
 extension Args {
     public static let usage = """
-    MferenceCLI — Gemma 4 / Qwen 3.6 / DeepSeek V4 Flash / Inkling-Small / Maple text generation
+    MferenceCLI — Gemma 4 / Qwen 3.6 / DeepSeek V4 Flash / Inkling-Small / Maple / GLM-5.3 Flash text generation
 
     usage: MferenceCLI --model <dir> (--prompt <string> | --messages-file <path> | --chat) [options]
 
@@ -160,10 +162,11 @@ extension Args {
                                 Routed-expert cache slots per layer: 8, 16,
                                 24, 32, 64, 96, 128, resident, or auto.
                                 resident maps every layer file once and skips
-                                the slot cache entirely. auto always uses the
-                                slot cache: Qwen gets 96 slots on hosts with
-                                at least 24 GiB, 32 with at least 16 GiB,
-                                else 16; other families get 16.
+                                the slot cache entirely. auto maps Flash-Next's
+                                routed pool on 192 GiB+ hosts when 32 GiB of
+                                headroom remains; Qwen 3.6 gets 96 slots on
+                                hosts with at least 24 GiB, 32 with at least
+                                16 GiB, else 16; other cases get 16.
                                 More slots raise the hit rate but use more RAM.
       --prefill-chunk <n|auto>  Prefill chunk tokens (default auto). Larger
                                 chunks cut routed-expert re-reads during
@@ -179,6 +182,8 @@ extension Args {
                                 ~59 s inside the first prefill;
                                 trusted-receipt checks file sizes against the
                                 receipt written at install time instead.
+      --reasoning-effort <mode>  Base/Swift Qwen 3.8 chat: xhigh, medium,
+                                low, or none. Not applied to raw prompts.
       --quiet                   Suppress the timing footer.
       --help                    Show this message.
     """
@@ -206,6 +211,7 @@ extension Args {
         var kvPaged = "auto"
         var kvTopKPages = 60
         var kvPoolPages: Int? = nil
+        var reasoningEffort: QwenReasoningEffort?
 
         var index = 0
         while index < argv.count {
@@ -271,6 +277,12 @@ extension Args {
                     throw ArgsError.invalidValue(flag: flag, value: value)
                 }
                 temperature = parsed
+            case "--reasoning-effort":
+                let value = try takeValue(argv, &index, flag: flag)
+                guard let parsed = QwenReasoningEffort(rawValue: value) else {
+                    throw ArgsError.invalidValue(flag: flag, value: value)
+                }
+                reasoningEffort = parsed
             case "--top-k":
                 let value = try takeValue(argv, &index, flag: flag)
                 guard let parsed = Int(value), (0...256).contains(parsed) else {
@@ -339,6 +351,9 @@ extension Args {
         }
 
         guard let model else { throw ArgsError.requiredMissing("--model") }
+        if reasoningEffort != nil && prompt != nil {
+            throw ArgsError.invalidValue(flag: "--reasoning-effort", value: "requires chat or messages, not raw --prompt")
+        }
         if prompt != nil && messagesFile != nil {
             throw ArgsError.mutuallyExclusive("--prompt", "--messages-file")
         }
@@ -378,7 +393,8 @@ extension Args {
                     verification: verification,
                     kvPaged: kvPaged,
                     kvTopKPages: kvTopKPages,
-                    kvPoolPages: kvPoolPages)
+                    kvPoolPages: kvPoolPages,
+                    reasoningEffort: reasoningEffort)
     }
 
     private static func takeValue(_ argv: [String],

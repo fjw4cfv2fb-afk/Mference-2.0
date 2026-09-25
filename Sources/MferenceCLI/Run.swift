@@ -5,6 +5,7 @@ import Mference
 private struct MessageJSON: Decodable {
     let role: String
     let content: String
+    let reasoning_content: String?
 }
 
 public struct RunResult: Equatable, Sendable {
@@ -34,10 +35,10 @@ public func run(args: Args,
                 guard let role = MFTokenizer.Role(rawValue: row.role) else {
                     throw MFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
                 }
-                return MFTokenizer.Message(role: role, content: row.content)
+                return MFTokenizer.Message(role: role, content: row.content,
+                                           reasoningContent: row.reasoning_content)
             }
-            let rendered = try tokenizer.applyChatTemplate(messages)
-            promptIds = tokenizer.encode(rendered, addBOS: false)
+            promptIds = try tokenizer.encodeChat(messages: messages, reasoningEffort: args.reasoningEffort)
         } else {
             return errored(stderr, "one of --prompt or --messages-file is required", 2)
         }
@@ -99,16 +100,24 @@ public func run(args: Args,
         let scratch = try RawCompletionScratch(context: context,
                                                vocab: model.config.vocabSize,
                                                logitSoftcap: Float(model.config.finalLogitSoftcap))
-        let decoder = args.messagesFile != nil && tokenizer.generationPromptStartsInThinking
+        let startsInThinking = tokenizer.startsInThinking(
+            reasoningEffort: args.reasoningEffort, promptIDs: promptIds)
+        let decoder = args.messagesFile != nil && (tokenizer.usesSourceQwenTemplate(reasoningEffort: args.reasoningEffort) || startsInThinking)
             ? StructuredAssistantDecoder(tokenizer: tokenizer,
                                          allowedTools: [],
-                                         startsInThought: true)
+                                         startsInThought: startsInThinking)
             : nil
         var completionConfig = config
         var stopMatcher = StreamingStopMatcher(stops: decoder == nil ? [] : config.stopStrings)
         if decoder != nil { completionConfig.stopStrings = [] }
         var decodingError: Error?
         var shouldStop = false
+        var hasVisibleText = false
+        func writeVisible(_ text: String) {
+            guard !text.isEmpty else { return }
+            if text.contains(where: { !$0.isWhitespace }) { hasVisibleText = true }
+            stdout.write(Data(text.utf8))
+        }
         let stats = try await runRawCompletion(
             producer: runner,
             tokenizer: tokenizer,
@@ -127,13 +136,13 @@ public func run(args: Args,
                     let events = try structuredEvents(decoder, tokenID: tokenID, text: delta)
                     let visible = try visibleAssistantText(events)
                     let emitted = decoder == nil ? visible : stopMatcher.push(visible)
-                    if !emitted.isEmpty { stdout.write(Data(emitted.utf8)) }
+                    writeVisible(emitted)
                     if decoder != nil, stopMatcher.isStopped { shouldStop = true }
                 case .tail(let tail):
                     let events = try structuredTailEvents(decoder, text: tail)
                     let visible = try visibleAssistantText(events)
                     let emitted = decoder == nil ? visible : stopMatcher.push(visible)
-                    if !emitted.isEmpty { stdout.write(Data(emitted.utf8)) }
+                    writeVisible(emitted)
                 }
                 } catch {
                     decodingError = error
@@ -144,7 +153,11 @@ public func run(args: Args,
         if let decoder {
             let visible = try visibleAssistantText(decoder.finish())
             let emitted = stopMatcher.push(visible) + stopMatcher.finish()
-            if !emitted.isEmpty { stdout.write(Data(emitted.utf8)) }
+            writeVisible(emitted)
+        }
+        if let notice = emptyResponseLimitNotice(reason: stats.reason,
+            hasVisibleText: hasVisibleText, isSwiftQwen: tokenizer.isSwiftQwen) {
+            stderr.write(Data(("\n" + notice + "\n").utf8))
         }
 
         if ProcessInfo.processInfo.environment["MFERENCE_PREFILL_BREAKDOWN"] == "1",
@@ -192,6 +205,72 @@ public func run(args: Args,
             lines += String(format: "%.1f", total - accounted) + " ms\n"
             stderr.write(Data(lines.utf8))
         }
+        // Qwen3.8-Flash-Next accounts a different set of phases: it has no
+        // cb1/cb2 split (no early router signal, no expert-I/O overlap — the
+        // whole read is exposed), and it adds two costs no other family pays,
+        // the indexer's CPU top-k round trip and the PLE row-pool gather.
+        if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1",
+           let runner = runner as? FlashNextForwardRunner {
+            let ms = { (n: UInt64) in String(format: "%.1f", Double(n) / 1e6) }
+            let total = stats.decodeSeconds * 1000
+            let accounted = Double(runner.totalIoNanos
+                                   + runner.totalIndexerTopKNanos
+                                   + runner.totalPleRowNanos) / 1e6
+            var lines = "\n[phases over \(stats.newTokens) tokens, decode "
+            lines += String(format: "%.0f", total) + " ms]\n"
+            lines += "  expert io (all exposed): " + ms(runner.totalIoNanos) + " ms\n"
+            lines += "  indexer cpu top-k:       "
+            lines += ms(runner.totalIndexerTopKNanos) + " ms\n"
+            lines += "  ple row fetch:           "
+            lines += ms(runner.totalPleRowNanos) + " ms\n"
+            let gpuBusy = runner.totalGpuBusyNanos
+            let gpuSpan = runner.totalGpuSpanNanos
+            lines += "  gpu busy: " + ms(gpuBusy) + " ms, span: "
+            lines += ms(gpuSpan) + " ms, gap: "
+            lines += ms(gpuSpan > gpuBusy ? gpuSpan - gpuBusy : 0) + " ms\n"
+            lines += "  unaccounted (CPU encode + GPU waits): "
+            lines += String(format: "%.1f", total - accounted) + " ms\n"
+            stderr.write(Data(lines.utf8))
+        }
+        // GLM-5.3-Flash: per-token path with the routed-expert read fully
+        // exposed, the pooled indexer's CPU top-k (sparse layers past
+        // index_topk) and the CPU router round trip per MoE layer.
+        if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1",
+           let g53 = runner as? Glm53ForwardRunner {
+            let ms = { (n: UInt64) in String(format: "%.1f", Double(n) / 1e6) }
+            let total = stats.decodeSeconds * 1000
+            let accounted = Double(g53.totalIoNanos + g53.totalIndexerTopKNanos
+                                   + g53.totalRouterNanos) / 1e6
+            var lines = "\n[phases over \(stats.newTokens) tokens, decode "
+            lines += String(format: "%.0f", total) + " ms]\n"
+            lines += "  expert io (all exposed): " + ms(g53.totalIoNanos) + " ms\n"
+            lines += "  indexer cpu top-k:       " + ms(g53.totalIndexerTopKNanos) + " ms\n"
+            lines += "  router readback wait:    " + ms(g53.totalRouterNanos) + " ms"
+            lines += g53.expertsResident ? " (resident: none)\n" : "\n"
+            let gpuBusy = g53.totalGpuBusyNanos
+            let gpuSpan = g53.totalGpuSpanNanos
+            lines += "  gpu busy: " + ms(gpuBusy) + " ms, span: " + ms(gpuSpan) + " ms, gap: "
+            lines += ms(gpuSpan > gpuBusy ? gpuSpan - gpuBusy : 0) + " ms\n"
+            lines += "  command buffers: \(g53.totalCommandBuffers)\n"
+            lines += "  unaccounted (CPU encode + GPU waits): "
+            lines += String(format: "%.1f", total - accounted) + " ms\n"
+            stderr.write(Data(lines.utf8))
+        }
+        if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1",
+           let m5 = runner as? MiniCPM5ForwardRunner, m5.phaseStats.decodeSteps > 0 {
+            // Dense, one command buffer per token: no expert I/O phases exist.
+            let p = m5.phaseStats
+            let ms = { (n: UInt64) in String(format: "%.1f", Double(n) / 1e6) }
+            let per = { (n: UInt64) in
+                String(format: "%.2f", Double(n) / 1e6 / Double(p.decodeSteps)) }
+            var lines = "\n[phases over \(p.decodeSteps) decode steps, decode "
+            lines += String(format: "%.0f", stats.decodeSeconds * 1000) + " ms]\n"
+            lines += "  cpu encode+commit: " + ms(p.encodeNanos) + " ms (" + per(p.encodeNanos) + " ms/token)\n"
+            lines += "  gpu execution:     " + ms(p.gpuNanos) + " ms (" + per(p.gpuNanos) + " ms/token)\n"
+            lines += "  wait/readback:     " + ms(p.waitNanos) + " ms (" + per(p.waitNanos) + " ms/token)\n"
+            lines += "  expert io: none (dense family)\n"
+            stderr.write(Data(lines.utf8))
+        }
         if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1",
            let q38 = runner as? Qwen38ForwardRunner,
            let spec = q38.mtpSpecStats, spec.rounds > 0 {
@@ -205,8 +284,20 @@ public func run(args: Args,
             lines += "  draft: " + ms(spec.draftNanos) + " ms, verify: "
             lines += ms(spec.verifyNanos) + " ms, accept: "
             lines += ms(spec.acceptNanos) + " ms\n"
+            var profile: [String] = []
+            for (accepts, trials) in zip(spec.positionAccepts, spec.positionTrials)
+                where trials > 0 {
+                let rate: Double = 100.0 * Double(accepts) / Double(trials)
+                profile.append(String(format: "%.0f%%", rate))
+            }
+            if !profile.isEmpty {
+                lines += "  accept by draft position: "
+                lines += profile.joined(separator: " ") + "\n"
+            }
             stderr.write(Data(lines.utf8))
         }
+        writeRuntimeDiagnostics(stats: stats, model: model, runner: runner,
+                                scratch: scratch, stderr: stderr)
         if !args.quiet {
             let tokensPerSecond = stats.decodeSeconds > 0
                 ? Double(stats.newTokens) / stats.decodeSeconds
@@ -226,6 +317,27 @@ public func run(args: Args,
 private func errored(_ stderr: FileHandle, _ message: String, _ code: Int32) -> RunResult {
     stderr.write(Data("error: \(message)\n".utf8))
     return RunResult(exitCode: code)
+}
+
+func emptyResponseLimitNotice(reason: StopReason, hasVisibleText: Bool,
+                              isSwiftQwen: Bool) -> String? {
+    guard reason == .maxTokens, !hasVisibleText else { return nil }
+    let effort = isSwiftQwen
+        ? " Swift-Qwen also supports --reasoning-effort medium or low; changing effort can change answer quality."
+        : ""
+    return "note: token limit reached before a visible answer. Increase --max-new (and --max-context if needed)." + effort
+}
+
+private func writeRuntimeDiagnostics(stats: RawDecodeResult, model: Model,
+                                     runner: any LogitProducer,
+                                     scratch: RawCompletionScratch, stderr: FileHandle) {
+    guard RuntimeDiagnostics.enabled else { return }
+    let diagnostics = RuntimeDiagnostics(result: stats,
+        memory: .capture(model: model, producer: runner, scratch: scratch))
+    // Diagnostic serialization must not turn a successful generation into a failure.
+    if let json = try? diagnostics.jsonLine() {
+        stderr.write(Data("\n[runtime-diagnostics] \(json)\n".utf8))
+    }
 }
 
 /// "auto" enables the paged KV cache above 32k context — the point where the
@@ -327,7 +439,7 @@ private func runChat(args: Args,
         } ?? []
         var history = opening
         let promptTokens = { (messages: [MFTokenizer.Message]) throws -> Int in
-            tokenizer.encode(try tokenizer.applyChatTemplate(messages), addBOS: false).count
+            try tokenizer.encodeChat(messages: messages, reasoningEffort: args.reasoningEffort).count
         }
 
         stderr.write(Data("Interactive chat. Commands: /clear, /history, /quit.\n".utf8))
@@ -369,13 +481,14 @@ private func runChat(args: Args,
             }
             history = fitted.messages
 
-            let promptIds = tokenizer.encode(try tokenizer.applyChatTemplate(history),
-                                             addBOS: false)
+            let promptIds = try tokenizer.encodeChat(messages: history, reasoningEffort: args.reasoningEffort)
             var config = baseConfig
             config.maxNewTokens = min(args.maxNew, args.maxContext - promptIds.count)
             let reply = try await streamChatTurn(promptIds: promptIds,
+                                                 model: model,
                                                  config: config,
                                                  tokenizer: tokenizer,
+                                                 reasoningEffort: args.reasoningEffort,
                                                  runner: runner,
                                                  context: context,
                                                  scratch: scratch,
@@ -383,8 +496,8 @@ private func runChat(args: Args,
                                                  quiet: args.quiet,
                                                  stdout: stdout,
                                                  stderr: stderr)
-            if !reply.isEmpty {
-                history.append(MFTokenizer.Message(role: .assistant, content: reply))
+            if reply.content?.isEmpty == false || reply.reasoningContent != nil {
+                history.append(reply)
             }
         }
     } catch is CancellationError {
@@ -436,21 +549,29 @@ private func resolveExpertStreaming(_ choice: ExpertCacheSlotChoice,
 /// Generate one assistant turn, streaming deltas to `stdout`, and return the
 /// text that was streamed so the caller can append it to the history.
 private func streamChatTurn(promptIds: [Int32],
+                            model: Model,
                             config: GenerationConfig,
                             tokenizer: MFTokenizer,
+                            reasoningEffort: QwenReasoningEffort?,
                             runner: any ContinuableLogitProducer,
                             context: MetalContext,
                             scratch: RawCompletionScratch,
                             prefillConfig: PrefillRuntimeConfig,
                             quiet: Bool,
                             stdout: FileHandle,
-                            stderr: FileHandle) async throws -> String {
+                            stderr: FileHandle) async throws -> MFTokenizer.Message {
     var reply = ""
-    let decoder = tokenizer.generationPromptStartsInThinking
+    var reasoning = ""
+    let startsInThinking = tokenizer.startsInThinking(
+        reasoningEffort: reasoningEffort, promptIDs: promptIds)
+    let decoder = tokenizer.usesSourceQwenTemplate(reasoningEffort: reasoningEffort) || startsInThinking
         ? StructuredAssistantDecoder(tokenizer: tokenizer,
                                      allowedTools: [],
-                                     startsInThought: true)
+                                     startsInThought: startsInThinking)
         : nil
+    if tokenizer.usesSourceQwenTemplate(reasoningEffort: reasoningEffort) {
+        decoder?.onReasoning = { reasoning += $0 }
+    }
     var completionConfig = config
     var stopMatcher = StreamingStopMatcher(stops: decoder == nil ? [] : config.stopStrings)
     if decoder != nil { completionConfig.stopStrings = [] }
@@ -493,6 +614,13 @@ private func streamChatTurn(promptIds: [Int32],
         if !emitted.isEmpty { stdout.write(Data(emitted.utf8)); reply += emitted }
     }
     stdout.write(Data("\n".utf8))
+    if let notice = emptyResponseLimitNotice(reason: stats.reason,
+        hasVisibleText: reply.contains(where: { !$0.isWhitespace }),
+        isSwiftQwen: tokenizer.isSwiftQwen) {
+        stderr.write(Data((notice + "\n").utf8))
+    }
+    writeRuntimeDiagnostics(stats: stats, model: model, runner: runner,
+                            scratch: scratch, stderr: stderr)
     if !quiet {
         let tokensPerSecond = stats.decodeSeconds > 0
             ? Double(stats.newTokens) / stats.decodeSeconds
@@ -500,5 +628,6 @@ private func streamChatTurn(promptIds: [Int32],
         let footer = "[stop=\(String(describing: stats.reason)) prefill=\(stats.prefillTokens)tok/\(String(format: "%.2f", stats.prefillSeconds))s new=\(stats.newTokens)tok decode=\(String(format: "%.2f", stats.decodeSeconds))s tok/s=\(String(format: "%.3f", tokensPerSecond))]\n"
         stderr.write(Data(footer.utf8))
     }
-    return reply
+    return MFTokenizer.Message(role: .assistant, content: reply,
+                               reasoningContent: reasoning.isEmpty ? nil : reasoning)
 }

@@ -6,10 +6,22 @@ import Foundation
 /// installs trust-on-first-use: the installer resolves HEAD's commit and
 /// reports the computed index hash for pinning instead of failing on it.
 public struct SupportedModelSource: Sendable, Equatable {
+    /// How the installer consumes the source repo.
+    public enum Kind: String, Sendable, Equatable {
+        /// A pre-quantized MLX community conversion: the installer only
+        /// re-lays-out already-packed INT4/INT2 tensors.
+        case preQuantized
+        /// The model vendor's own BF16 upload: the installer quantizes to INT4
+        /// affine group-64 in flight (Workstream 2). Pinning and SHA discipline
+        /// are identical — only the byte transform differs.
+        case originalRepoQuantize
+    }
+
     /// CLI selector value (`--model <name>`).
     public let name: String
     public let displayName: String
     public let repoID: String
+    public let kind: Kind
     /// Pinned commit; nil resolves HEAD's `X-Repo-Commit` at install time.
     public let revision: String?
     /// Pinned `model.safetensors.index.json` SHA-256; nil accepts any index
@@ -21,6 +33,28 @@ public struct SupportedModelSource: Sendable, Equatable {
     public let installedBytes: UInt64
     public let reserveBytes: UInt64
 
+    public init(name: String,
+                displayName: String,
+                repoID: String,
+                revision: String?,
+                sourceIndexSHA256: String?,
+                modelID: String,
+                approximateDownloadBytes: UInt64,
+                installedBytes: UInt64,
+                reserveBytes: UInt64,
+                kind: Kind = .preQuantized) {
+        self.name = name
+        self.displayName = displayName
+        self.repoID = repoID
+        self.kind = kind
+        self.revision = revision
+        self.sourceIndexSHA256 = sourceIndexSHA256
+        self.modelID = modelID
+        self.approximateDownloadBytes = approximateDownloadBytes
+        self.installedBytes = installedBytes
+        self.reserveBytes = reserveBytes
+    }
+
     /// Both pins recorded; unpinned sources install trust-on-first-use.
     public var isPinned: Bool { revision != nil && sourceIndexSHA256 != nil }
 
@@ -29,7 +63,8 @@ public struct SupportedModelSource: Sendable, Equatable {
                                token: String?,
                                resume: Bool = false,
                                baseURL: URL? = nil,
-                               dryRunSpaceCheck: Bool = false)
+                               dryRunSpaceCheck: Bool = false,
+                               sidecarPolicy: SidecarPolicy = .default)
         -> RemoteStreamingRepackOptions {
         if let baseURL {
             return RemoteStreamingRepackOptions(
@@ -42,7 +77,8 @@ public struct SupportedModelSource: Sendable, Equatable {
                 overwrite: overwrite,
                 resume: resume,
                 dryRunSpaceCheck: dryRunSpaceCheck,
-                baseURL: baseURL)
+                baseURL: baseURL,
+                sidecarPolicy: sidecarPolicy)
         }
         return RemoteStreamingRepackOptions(
             repoID: repoID,
@@ -53,7 +89,8 @@ public struct SupportedModelSource: Sendable, Equatable {
             minFreeReserveBytes: reserveBytes,
             overwrite: overwrite,
             resume: resume,
-            dryRunSpaceCheck: dryRunSpaceCheck)
+            dryRunSpaceCheck: dryRunSpaceCheck,
+            sidecarPolicy: sidecarPolicy)
     }
 
     public static let gemma4 = SupportedModelSource(
@@ -85,6 +122,41 @@ public struct SupportedModelSource: Sendable, Equatable {
         installedBytes: 19_546_491_213,
         reserveBytes: 1_073_741_824)
 
+    /// The **same checkpoint as `qwen36`**, installed from the vendor's own
+    /// BF16 upload through our quantizer instead of copying mlx-community's
+    /// pre-quantized conversion. It exists so the two installs can be compared:
+    /// this is the control pair the W2.1b quantizer-quality gate is measured on
+    /// (docs/QUANTIZER_QUALITY.md), and the reason Qwen 3.6 was chosen is that
+    /// the runtime already has a runner for it, so the comparison can be made
+    /// at the model level and not just on bytes.
+    ///
+    /// Both pins recorded. Download bytes are the index's declared total
+    /// (71.9 GB across 26 shards); the planner actually reads 71.0 GB of that,
+    /// the difference being the dropped vision tower. Installed bytes are the
+    /// dry-run's own figure for the larger of the two sidecar policies:
+    /// 19,973,468,544 with the `mtp.*` draft group carried (19,498,342,656 with
+    /// `--skip-mtp`), rounded up for the receipt and lock files. Every
+    /// two-dimensional projection becomes INT4 affine group-64 — 0.5625 bytes
+    /// per weight against BF16's 2.0 — while norms, 1-D vectors and the conv
+    /// kernels ride through as BF16.
+    ///
+    /// `modelID` deliberately differs from `qwen36`'s: both entries carry a
+    /// pinned index hash, and `SourceFingerprint.knownFingerprints` is keyed by
+    /// model ID, so a shared ID would collide. The distinct ID also keeps the
+    /// two installs of one checkpoint tellable apart in a manifest.
+    public static let qwen36Original = SupportedModelSource(
+        name: "qwen36original",
+        displayName: "Qwen3.6 35B-A3B (quantized at install)",
+        repoID: "Qwen/Qwen3.6-35B-A3B",
+        revision: "995ad96eacd98c81ed38be0c5b274b04031597b0",
+        sourceIndexSHA256:
+            "41b9356101ebf8e7519e150dc811f80c4226e727301fbb032b890f006ed0be83",
+        modelID: "qwen3.6-35b-a3b-int4g64",
+        approximateDownloadBytes: 71_903_645_408,
+        installedBytes: 20_000_000_000,
+        reserveBytes: 2_147_483_648,
+        kind: .originalRepoQuantize)
+
     /// Text stack of the multimodal Qwen3.8 checkpoint; the vision tower is
     /// excluded by the planner, so the download estimate is the repo total
     /// (16.05 GB) minus the ~0.9 GB tower. Installed bytes add the resident
@@ -101,6 +173,22 @@ public struct SupportedModelSource: Sendable, Equatable {
         approximateDownloadBytes: 15_200_000_000,
         installedBytes: 15_400_000_000,
         reserveBytes: 1_073_741_824)
+
+    /// Reasoning-efficient fine-tune, kept distinct from the base Qwen control.
+    /// Text and MTP are quantized in flight; vision is not installed.
+    /// Qualification status and license provenance: docs/families/SWIFT_QWEN38.md.
+    public static let swiftQwen38 = SupportedModelSource(
+        name: "swiftqwen38",
+        displayName: "Swift-Qwen3.8 27B (qualification candidate)",
+        repoID: "ukisai/Swift-Qwen3.8-27b",
+        revision: "1b30aaaf753fe5c1cb51ada2ea0367a53445359c",
+        sourceIndexSHA256:
+            "77042094076611b69791a610065f28b7013b8c621795fa86ddccc8bac7d1b9df",
+        modelID: "swift-qwen3.8-27b-int4g64",
+        approximateDownloadBytes: 55_562_855_904,
+        installedBytes: 16_000_000_000,
+        reserveBytes: 2_147_483_648,
+        kind: .originalRepoQuantize)
 
     /// Revision and index hash are not yet pinned (the upload has not been
     /// fingerprinted); the installer resolves HEAD and prints the computed
@@ -148,11 +236,120 @@ public struct SupportedModelSource: Sendable, Equatable {
         installedBytes: 6_650_000_000,
         reserveBytes: 1_073_741_824)
 
+    /// The first `originalRepoQuantize` entry: no faithful pre-quantized MLX
+    /// conversion of Qwen3.8-Flash-Next exists (checked 2026-08-31, see
+    /// docs/families/QWEN38_FLASH_NEXT.md), so the installer reads the vendor's
+    /// 131 BF16 shards and quantizes to INT4 group-64 in flight — except the
+    /// two MoE gating tensors per layer, which `QuantBitPolicy.moeRouterInt8`
+    /// keeps at INT8 group-64 (98 tensors: 48 text layers plus the MTP draft
+    /// layer, `.mlp.gate.weight` and `.mlp.shared_expert_gate.weight` each).
+    ///
+    /// That mixture postdates the install currently on disk, which is uniform
+    /// INT4 and records `bitWidthOverridesHonored: 0`. `modelID` is unchanged
+    /// because it names the *base* width, exactly as `qwen36original`'s
+    /// `qwen3.6-35b-a3b-int4g64` does while installing 80 INT8 tensors; the two
+    /// Flash-Next installs are told apart by `bitWidthOverridesHonored` (0 vs
+    /// 98) and `quant.router.weightBits` (4 vs 8). A second entry for the same
+    /// repo and revision is not an option: `SourceFingerprint.knownFingerprints`
+    /// is searched by index hash, so two entries sharing one would resolve
+    /// nondeterministically.
+    ///
+    /// Both pins recorded. Download bytes are the index's declared total
+    /// (360.0 GB). Installed bytes are ~175 GB: routed experts ~68 GB (INT4
+    /// g64), the PLE n-gram table ~102.8 GB (**BF16** — its rows are 160 wide,
+    /// which the group size does not divide, so they cannot be quantized), the
+    /// resident core ~2.5 GB, the MTP draft pool ~1.4 GB, plus page rounding
+    /// and the PLE pool's 0.4% per-block slack. The Day-0 dossier's ~101 GB
+    /// figure assumed an INT4 n-gram table and is superseded. The INT8 routers
+    /// add 32,175,360 bytes on top, which the headroom already covers.
+    ///
+    /// `FlashNextForwardRunner` executes this family and its capability gate
+    /// was lifted on 2026-09-10, so an install made here loads through the
+    /// ordinary `ManifestReader.peekFamily` funnel. It is a quantize-in-flight
+    /// repack driven from `MferenceRepack --model qwen38flashnext` (or
+    /// `./mference-ui.sh install qwen38flashnext`).
+    public static let qwen38FlashNext = SupportedModelSource(
+        name: "qwen38flashnext",
+        displayName: "Qwen3.8-Flash-Next 180B-A3.5B (quantized at install)",
+        repoID: "Qwen/Qwen3.8-Flash-Next",
+        revision: "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+        sourceIndexSHA256:
+            "99e815241ef03325536b0aaa4441deea45174c17fae31e10f0bb456410c590de",
+        modelID: "qwen3.8-flash-next-int4g64",
+        approximateDownloadBytes: 359_999_963_128,
+        installedBytes: 180_000_000_000,
+        reserveBytes: 8_589_934_592,
+        kind: .originalRepoQuantize)
+
+    /// MiniCPM5-2B from the vendor's own BF16 upload, quantized to INT4
+    /// affine group-64 in flight — the project's first plain-llama family and
+    /// the second original-repo family with a runner, so it re-runs the W2.1b
+    /// quantizer gate against its own control (`minicpm5mlx`).
+    ///
+    /// Both pins recorded (2026-09-10). Download bytes are the single shard
+    /// (5,033,557,096 B; the index's `total_size` is 5,033,512,960 of tensor
+    /// data plus the 44,128-byte header). Installed bytes are the INT4 g64
+    /// resident set — 1,415,925,760 B, to the byte the control's own
+    /// `total_size` — plus the page-rounded index, ~10 MB of tokenizer
+    /// sidecars, manifest and receipt. See docs/families/MINICPM5.md.
+    public static let minicpm5 = SupportedModelSource(
+        name: "minicpm5",
+        displayName: "MiniCPM5-2B (quantized at install)",
+        repoID: "openbmb/MiniCPM5-2B",
+        revision: "cd199ce3ee67549c42ef7372f809f2c63599a3e9",
+        sourceIndexSHA256:
+            "6d839cd76e8395de548a0e6cc310386f66d1ecbb2c75d198a8dfd3d70892b756",
+        modelID: "minicpm5-2b-int4g64",
+        approximateDownloadBytes: 5_033_557_096,
+        installedBytes: 1_430_000_000,
+        reserveBytes: 1_073_741_824,
+        kind: .originalRepoQuantize)
+
+    /// The **same checkpoint as `minicpm5`**, from the vendor's own MLX INT4
+    /// group-64 affine conversion through the pre-quantized path. It exists
+    /// as the trusted control the W2.1b quantizer-quality gate measures
+    /// `minicpm5` against (docs/QUANTIZER_QUALITY.md); its `modelID` differs
+    /// because the fingerprint table is keyed by it. Download bytes are the
+    /// single `model.safetensors` (1,416,035,216 B).
+    public static let minicpm5MLX = SupportedModelSource(
+        name: "minicpm5mlx",
+        displayName: "MiniCPM5-2B MLX 4-bit (W2.1b control)",
+        repoID: "openbmb/MiniCPM5-2B-MLX",
+        revision: "35ac38ee7bdb0bf7fa748d0700eeb6d6675760a3",
+        sourceIndexSHA256:
+            "ccf202e0a06fe3c7eb8f354cfb29412a5e64956ad895413d4d9267ae4b3a6045",
+        modelID: "minicpm5-2b-mlx-4bit",
+        approximateDownloadBytes: 1_416_035_216,
+        installedBytes: 1_430_000_000,
+        reserveBytes: 1_073_741_824)
+
     /// Default source when no `--model` selector is given.
     public static let `default` = gemma4
 
+    /// GLM-5.3-Flash 320B-A18B from PipeNetwork's mixed 4/8-bit MLX
+    /// conversion: 42 layers x 288 routed experts at INT4 group-64 (~164 GB
+    /// of page-aligned expert blobs), everything else INT8 group-64 with the
+    /// router gates BF16 and the mHC / KDA decay parameters FP32 (~10.6 GB
+    /// resident), the vision tower dropped. The download is the 18 shards
+    /// (181.9 GB) plus sidecars. See docs/families/GLM53_FLASH.md.
+    ///
+    /// `ManifestReader.familiesWithoutRunner` gates the family until its
+    /// runner lands, so an install made here is refused by axis name at load.
+    public static let glm53Flash = SupportedModelSource(
+        name: "glm53flash",
+        displayName: "GLM-5.3-Flash 320B-A18B MLX mixed 4/8-bit",
+        repoID: "pipenetwork/GLM-5.3-Flash-MLX-mixed-4_8bit",
+        revision: "d43ea8b407ce4e9c25e6ac9baec3feab70d9f5f3",
+        sourceIndexSHA256:
+            "5e0a3768db6fb795c4846bed713785a17d336f4cc4494b4f6b28f75082314383",
+        modelID: "glm-5.3-flash-mlx-mixed-4-8bit",
+        approximateDownloadBytes: 181_944_533_258,
+        installedBytes: 182_000_000_000,
+        reserveBytes: 2_147_483_648)
+
     public static let all: [SupportedModelSource] = [
-        gemma4, qwen36, qwen38, deepseekV4Flash, inklingSmall, maple,
+        gemma4, qwen36, qwen36Original, qwen38, swiftQwen38, deepseekV4Flash, inklingSmall,
+        maple, qwen38FlashNext, minicpm5, minicpm5MLX, glm53Flash,
     ]
 
     public static func named(_ name: String) -> SupportedModelSource? {

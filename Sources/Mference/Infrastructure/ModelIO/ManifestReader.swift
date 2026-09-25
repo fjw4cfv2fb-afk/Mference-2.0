@@ -87,6 +87,113 @@ public struct ManifestArch: Decodable, Equatable, Sendable {
     public let routerNormAfterTopK: Bool?
     public let routerGlobalScale: Bool?
     public let unpaddedVocabSize: Int?
+
+    // Qwen3.8-Flash-Next extensions. Optional for the same reason: absent
+    // values validate against the zeroed `FlashNextConfig.none`. Field names
+    // match what `MferenceRepack`'s `FlashNextAxes` publishes verbatim.
+    public let hcCount: Int?
+    public let hcLowRank: Int?
+    public let indexerNumHeads: Int?
+    public let indexerHeadDim: Int?
+    public let indexerNumKVHeads: Int?
+    public let indexerBudget: Int?
+    public let indexerCompressRatio: Int?
+    public let pleLayerIDs: [Int]?
+    public let pleNgramShardCount: Int?
+    public let pleNgramVocabSizeBase: Int?
+    public let pleConvKernelSize: Int?
+    /// Not emitted by installs predating this axis, so `validateArch` checks
+    /// it only when present. See `FlashNextConfig.pleEosTokenID`.
+    public let pleEosTokenID: Int?
+    /// Axis names the install claims a runner must implement. Advisory only —
+    /// `ManifestReader.familiesWithoutRunner` is the authority, and it is empty
+    /// today, so an install publishing this field does not make the family
+    /// unloadable.
+    public let requiredAxes: [String]?
+    /// Per-head q/k RMSNorm gains on full-attention layers. Optional so every
+    /// manifest predating the axis decodes unchanged; absent validates against
+    /// the Gemma default (`true`).
+    public let qkNorm: Bool?
+
+    // GLM-5.3-Flash extensions. Optional for the same reason: absent values
+    // validate against the zeroed `Glm53Config.none`. Field names match what
+    // `MferenceRepack`'s `Glm53Axes` publishes.
+    public let kvLoraRank: Int?
+    public let qkNopeHeadDim: Int?
+    public let vHeadDim: Int?
+    public let indexKPool: Int?
+    public let indexKPoolAlwaysSelectTail: Bool?
+    public let indexerKNormEps: Double?
+    public let kdaGateLowerBound: Double?
+    public let rmsNormEps: Double?
+}
+
+/// One page-aligned region of a row-lookup pool, mirroring one source shard.
+public struct ManifestPleShard: Decodable, Equatable, Sendable {
+    public let shard: Int
+    public let rows: Int
+    /// Byte offset of the region's first block within the pool file.
+    public let offset: UInt64
+    public let size: UInt64
+}
+
+/// One PLE n-gram row pool: the repacked, page-aligned form of a layer's
+/// hashed n-gram embedding table.
+///
+/// Row `i` of shard `s` lives at
+/// `shards[s].offset + (i / rowsPerBlock) * blockStride
+///  + (i % rowsPerBlock) * rowStride`, and a record never straddles a block,
+/// so one row costs one page fault and a cached page serves `rowsPerBlock`
+/// neighbours. `rows` is the pool-wide total; shard rows are consecutive in
+/// shard order.
+public struct ManifestPlePoolLayer: Decodable, Equatable, Sendable {
+    public let layer: Int
+    /// Path relative to the install directory, e.g. `ple/layer_01_ngram_rows.bin`.
+    public let file: String
+    public let rows: Int
+    public let rowDim: Int
+    /// `"bf16"` or `"int4AffineG64"`. Chosen from the row width at install:
+    /// group-64 needs `rowDim % 64 == 0`, which 160 does not satisfy.
+    public let storage: String
+    public let weightBits: Int
+    public let groupSize: Int
+    public let rowWeightBytes: Int
+    public let rowScaleBytes: Int
+    public let rowBiasBytes: Int
+    public let rowStride: Int
+    public let rowsPerBlock: Int
+    public let blockStride: Int
+    public let fileSize: UInt64
+    public let shards: [ManifestPleShard]
+}
+
+public struct ManifestPlePool: Decodable, Equatable, Sendable {
+    /// Pool format tag. Readers must refuse an unknown kind.
+    public let kind: String
+    public let layers: [ManifestPlePoolLayer]
+}
+
+/// An additive routed-expert pool outside `packed_experts/`, for a sidecar
+/// (today: the MTP draft layer's own 512 experts at `packed_experts_mtp/`).
+/// Kept out of `packed_experts/layout.json` so the shipped layout validator
+/// and the routed-expert reader are untouched.
+public struct ManifestAuxiliaryExpertPool: Decodable, Equatable, Sendable {
+    public struct Layer: Decodable, Equatable, Sendable {
+        public let layer: Int
+        public let file: String
+    }
+    public let name: String
+    public let directory: String
+    public let expertsPerLayer: Int
+    public let expertStride: UInt64
+    public let layers: [Layer]
+}
+
+/// Whether an optional tensor group from the source checkpoint was carried
+/// into the install (`mtp`) or skipped (`vision`).
+public struct ManifestSidecar: Decodable, Equatable, Sendable {
+    public let carried: Bool
+    public let tensorCount: Int
 }
 
 public struct ManifestQuantSlot: Decodable, Equatable, Sendable {
@@ -133,6 +240,24 @@ public struct Manifest: Decodable, Equatable, Sendable {
     public let expertsPerLayer: Int
     public let numLayers: Int
     public let expertStride: UInt64
+
+    // Additive install blocks. Every family that predates them emits none of
+    // these keys, so existing manifests decode byte-identically.
+
+    /// Streamed n-gram row pools, one per PLE layer.
+    public let plePool: ManifestPlePool?
+    /// Routed-expert pools outside `packed_experts/` (sidecar draft layers).
+    public let auxiliaryExpertPools: [ManifestAuxiliaryExpertPool]?
+    /// Optional source tensor groups and whether the install carried them.
+    public let sidecars: [String: ManifestSidecar]?
+    /// True when the installer has already folded the `+1` of the
+    /// zero-centered `(1 + w)` RMSNorm convention into the stored norm
+    /// weights. Absent means it has not: the loader applies the bake itself
+    /// for families whose norms are zero-centered
+    /// (`ZeroCenteredNormPolicy`). Deliberately outside `arch` — it describes
+    /// how the bytes were written, not what architecture they describe, so it
+    /// must not participate in the `archMismatch` field-by-field comparison.
+    public let zeroCenteredNormsBakedAtInstall: Bool?
 }
 
 public enum ManifestReader {
@@ -212,6 +337,12 @@ public enum ManifestReader {
         if let flashHead = m.flashHead {
             try validateMapleFlashHead(flashHead, expected: expected)
         }
+        if let plePool = m.plePool {
+            try validatePlePool(plePool, expected: expected)
+        } else if !expected.flashNext.pleLayerIDs.isEmpty {
+            throw ModelError.plePoolMissing(
+                layer: expected.flashNext.pleLayerIndices[0])
+        }
         let pageSize = UInt64(getpagesize())
         guard m.expertStride % pageSize == 0 else {
             throw ModelError.expertStrideNotPageAligned(stride: m.expertStride,
@@ -247,6 +378,46 @@ public enum ManifestReader {
 
     private static func validateQuant(_ quant: ManifestQuant,
                                       expected: ArchConfig) throws {
+        if expected.family == .glm53Flash {
+            // PipeNetwork's mixed 4/8-bit conversion: INT8 affine group-64
+            // attention (KDA and sparse projections alike), shared experts,
+            // dense FFNs, embedding and head; INT4 group-64 routed experts;
+            // the router gate unquantized BF16, recorded as an unquantized
+            // slot (the Maple convention) rather than the default 8 the
+            // writer would otherwise assume.
+            let affine: [(String, ManifestQuantSlot, Int)] = [
+                ("embedding", quant.embedding, 8),
+                ("attention", quant.attention, 8),
+                ("sharedExpert", quant.sharedExpert, 8),
+                ("routedExpert", quant.routedExpert, 4),
+            ]
+            for (name, slot, bits) in affine {
+                guard slot.weightBits == bits,
+                      slot.scheme.lowercased() == "affine",
+                      slot.scaleType.lowercased() == "bf16",
+                      slot.biasType.lowercased() == "bf16",
+                      slot.groupSize == Quantization.groupSize else {
+                    throw ModelError.indexCorrupt(
+                        detail: "unsupported GLM-5.3-Flash quantization for \(name)")
+                }
+            }
+            guard quant.router.weightBits == 16,
+                  quant.router.scheme.lowercased() == "unquantized",
+                  quant.router.scaleType.lowercased() == "none",
+                  quant.router.biasType.lowercased() == "none",
+                  quant.router.groupSize == 0 else {
+                throw ModelError.indexCorrupt(
+                    detail: "unsupported GLM-5.3-Flash quantization for router")
+            }
+            return
+        }
+        if expected.family == .minicpm5 {
+            // Dense, like Qwen 3.8: INT4 affine group-64 embedding and
+            // attention slots (the MLP shares the attention slot), and the
+            // router / shared-expert / routed-expert slots marked absent.
+            try validateDenseInt4Quant(quant, familyName: "MiniCPM5")
+            return
+        }
         if expected.family == .qwen38 {
             let affine: [(String, ManifestQuantSlot)] = [
                 ("embedding", quant.embedding),
@@ -315,6 +486,46 @@ public enum ManifestReader {
             }
             return
         }
+        if expected.family == .qwen38flashnext {
+            // Workstream-2 quantize-in-flight: every eligible resident and
+            // routed tensor is INT4 affine group-64 — except the MoE gating
+            // tensors, which the install policy may keep at INT8.
+            //
+            // Both widths are admitted on the router slot on purpose, and the
+            // set is not a courtesy: two installs of this family exist. The
+            // uniform-INT4 one (`bitWidthOverridesHonored` 0) predates the
+            // 2026-09-10 router measurement and records 4; the INT8-router one
+            // records 8 and 98 overrides. Refusing either would strand an
+            // install that is on disk and correct for what it claims to be, so
+            // the manifest slot is read as a declaration rather than as a
+            // constant, and `FlashNextWeightMatrix` dispatches per tensor on
+            // the width its own index entry implies.
+            //
+            // `sharedExpert` stays INT4-only because that slot describes the
+            // shared expert's `gate_proj`, a projection the policy never
+            // overrides. The `mlp.shared_expert_gate` scalar gate, which the
+            // policy *does* override, has no slot of its own in the manifest
+            // schema; its width lives only in the resident index, which is the
+            // authority for every per-tensor width anyway.
+            let slots: [(String, ManifestQuantSlot, Set<Int>)] = [
+                ("embedding", quant.embedding, [4]),
+                ("attention", quant.attention, [4]),
+                ("router", quant.router, [4, 8]),
+                ("sharedExpert", quant.sharedExpert, [4]),
+                ("routedExpert", quant.routedExpert, [4]),
+            ]
+            for (name, slot, allowedBits) in slots {
+                guard allowedBits.contains(slot.weightBits),
+                      slot.scheme.lowercased() == "affine",
+                      slot.scaleType.lowercased() == "bf16",
+                      slot.biasType.lowercased() == "bf16",
+                      slot.groupSize == Quantization.groupSize else {
+                    throw ModelError.indexCorrupt(
+                        detail: "unsupported Qwen3.8-Flash-Next quantization for \(name)")
+                }
+            }
+            return
+        }
         // Routed experts additionally allow 2-bit: the DeepSeek-V4-Flash
         // dynamic-quant checkpoint ships Q2 experts under a Q4 core, and the
         // MoE runtime dispatches on `quant.routedExpert.weightBits`.
@@ -336,6 +547,27 @@ public enum ManifestReader {
         }
     }
 
+    /// Structural gate on `manifest.plePool`. The runtime refuses a pool whose
+    /// geometry cannot address its own file: every arithmetic assumption the
+    /// row reader makes (`PleRowPool`) is checked once here rather than being
+    /// rediscovered per row read.
+    static func validatePlePool(_ pool: ManifestPlePool,
+                                expected: ArchConfig) throws {
+        guard pool.kind == PleRowPool.supportedKind else {
+            throw ModelError.plePoolInvalid(
+                detail: "unknown kind \"\(pool.kind)\"; this runtime reads "
+                    + "\"\(PleRowPool.supportedKind)\"")
+        }
+        for layerIndex in expected.flashNext.pleLayerIndices {
+            guard pool.layers.contains(where: { $0.layer == layerIndex }) else {
+                throw ModelError.plePoolMissing(layer: layerIndex)
+            }
+        }
+        for layer in pool.layers {
+            _ = try PleRowPoolGeometry(layer: layer, hiddenSize: expected.hiddenSize)
+        }
+    }
+
     private static func validateMapleFlashHead(_ flashHead: ManifestMapleFlashHead,
                                                expected: ArchConfig) throws {
         guard expected.family == .maple,
@@ -349,6 +581,41 @@ public enum ManifestReader {
               Set(flashHead.forceTokens).count == flashHead.forceTokens.count,
               flashHead.forceTokens.allSatisfy({ $0 >= 0 && $0 < expected.vocabSize }) else {
             throw ModelError.indexCorrupt(detail: "invalid Maple FlashHead metadata")
+        }
+    }
+
+    /// The dense-family quant contract: INT4 affine group-64 `embedding` and
+    /// `attention` slots, and every MoE slot marked absent.
+    private static func validateDenseInt4Quant(_ quant: ManifestQuant,
+                                               familyName: String) throws {
+        let affine: [(String, ManifestQuantSlot)] = [
+            ("embedding", quant.embedding),
+            ("attention", quant.attention),
+        ]
+        for (name, slot) in affine {
+            guard slot.weightBits == 4,
+                  slot.scheme.lowercased() == "affine",
+                  slot.scaleType.lowercased() == "bf16",
+                  slot.biasType.lowercased() == "bf16",
+                  slot.groupSize == Quantization.groupSize else {
+                throw ModelError.indexCorrupt(
+                    detail: "unsupported \(familyName) quantization for \(name)")
+            }
+        }
+        let absent: [(String, ManifestQuantSlot)] = [
+            ("router", quant.router),
+            ("sharedExpert", quant.sharedExpert),
+            ("routedExpert", quant.routedExpert),
+        ]
+        for (name, slot) in absent {
+            guard slot.weightBits == 0,
+                  slot.scheme.lowercased() == "none",
+                  slot.scaleType.lowercased() == "none",
+                  slot.biasType.lowercased() == "none",
+                  slot.groupSize == 0 else {
+                throw ModelError.indexCorrupt(
+                    detail: "\(familyName) manifest must mark \(name) absent")
+            }
         }
     }
 
@@ -441,6 +708,9 @@ public enum ManifestReader {
         try check("ropeNeoxSubdim",
                   a.ropeNeoxSubdim ?? gemmaDefaults.ropeNeoxSubdim,
                   e.ropeNeoxSubdim)
+        try check("qkNorm",
+                  a.qkNorm ?? gemmaDefaults.qkNorm,
+                  e.qkNorm)
         try check("linearNumKHeads",
                   a.linearNumKHeads ?? 0, e.linearAttention.numKHeads)
         try check("linearNumVHeads",
@@ -524,8 +794,57 @@ public enum ManifestReader {
                   a.routerNormAfterTopK ?? false, e.routerNormAfterTopK)
         try check("routerGlobalScale",
                   a.routerGlobalScale ?? false, e.routerGlobalScale)
-        try check("unpaddedVocabSize",
-                  a.unpaddedVocabSize ?? 0, e.unpaddedVocabSize)
+        // The unpadded vocabulary is a head-masking fact, not a layout one:
+        // a manifest written before a family recorded it (GLM-5.3-Flash
+        // installs from before 2026-09-11) leaves the baseline's value in
+        // force; one that records it must agree.
+        if let recorded = a.unpaddedVocabSize {
+            try check("unpaddedVocabSize", recorded, e.unpaddedVocabSize)
+        }
+
+        let fn = e.flashNext
+        try check("hcCount",              a.hcCount ?? 0,              fn.hcCount)
+        try check("hcLowRank",            a.hcLowRank ?? 0,            fn.hcLowRank)
+        try check("indexerNumHeads",      a.indexerNumHeads ?? 0,      fn.indexerNumHeads)
+        try check("indexerHeadDim",       a.indexerHeadDim ?? 0,       fn.indexerHeadDim)
+        try check("indexerNumKVHeads",    a.indexerNumKVHeads ?? 0,    fn.indexerNumKVHeads)
+        try check("indexerBudget",        a.indexerBudget ?? 0,        fn.indexerBudget)
+        try check("indexerCompressRatio", a.indexerCompressRatio ?? 0, fn.indexerCompressRatio)
+        try check("pleLayerIDs",
+                  (a.pleLayerIDs ?? []).description, fn.pleLayerIDs.description)
+        try check("pleNgramShardCount",   a.pleNgramShardCount ?? 0,   fn.pleNgramShardCount)
+        try check("pleNgramVocabSizeBase",
+                  a.pleNgramVocabSizeBase ?? 0, fn.pleNgramVocabSizeBase)
+        try check("pleConvKernelSize",    a.pleConvKernelSize ?? 0,    fn.pleConvKernelSize)
+        // Checked only when the install publishes it: the shipped repack path
+        // predates this axis, and defaulting to the baseline would turn a real
+        // mismatch into silent agreement. See `FlashNextConfig.pleEosTokenID`.
+        if let published = a.pleEosTokenID {
+            try check("pleEosTokenID", published, fn.pleEosTokenID)
+        }
+
+        let g = e.glm53
+        try check("kvLoraRank",        a.kvLoraRank ?? 0,        g.kvLoraRank)
+        try check("qkNopeHeadDim",     a.qkNopeHeadDim ?? 0,     g.qkNopeHeadDim)
+        try check("vHeadDim",          a.vHeadDim ?? 0,          g.vHeadDim)
+        try check("indexKPool",        a.indexKPool ?? 0,        g.indexKPool)
+        try check("indexKPoolAlwaysSelectTail",
+                  a.indexKPoolAlwaysSelectTail ?? false, g.indexKPoolAlwaysSelectTail)
+        try check("indexerKNormEps",   a.indexerKNormEps ?? 0,   g.indexerKNormEps)
+        try check("kdaGateLowerBound", a.kdaGateLowerBound ?? 0, g.kdaGateLowerBound)
+        try check("rmsNormEps",        a.rmsNormEps ?? 0,        g.rmsNormEps)
+    }
+
+    /// Metadata-only checkpoint identity, bounded like the family probe.
+    public static func peekModelID(directoryURL: URL,
+                                   maxBytes: UInt64 = defaultMaxBytes) throws -> String {
+        let url = directoryURL.appendingPathComponent("manifest.json")
+        let size = try metadataFileSize(url, fileName: "manifest.json")
+        guard size <= maxBytes else {
+            throw ModelError.indexCorrupt(detail: "manifest.json exceeds metadata cap")
+        }
+        struct Identity: Decodable { let modelID: String }
+        return try JSONDecoder().decode(Identity.self, from: Data(contentsOf: url)).modelID
     }
 
     /// Decode just enough of `manifest.json` to identify the model family,
@@ -542,6 +861,16 @@ public enum ManifestReader {
                 detail: "manifest.json size \(size) exceeds metadata cap \(maxBytes)")
         }
         let data = try Data(contentsOf: manifestURL)
+        // The capability gate runs off a minimal decode, before the full
+        // `Manifest` shape is required. A family the runner cannot execute must
+        // say so by name even if its manifest carries fields (or omits ones)
+        // the strict decoder does not expect — otherwise the first thing the
+        // user sees is a decode error that reads like a corrupt install.
+        if let declared = try? JSONDecoder().decode(FamilyPeek.self, from: data),
+           let raw = declared.arch.family,
+           let refusal = capabilityRefusal(family: raw) {
+            throw refusal
+        }
         let manifest: Manifest
         do {
             manifest = try JSONDecoder().decode(Manifest.self, from: data)
@@ -553,5 +882,80 @@ public enum ManifestReader {
             throw ModelError.indexCorrupt(detail: "unknown arch.family \"\(raw)\"")
         }
         return family
+    }
+
+    /// Just enough of `manifest.json` to read `arch.family`.
+    private struct FamilyPeek: Decodable {
+        struct Arch: Decodable { let family: String? }
+        let arch: Arch
+    }
+
+    /// The axes a raw `arch.family` string is missing a runner for, or nil when
+    /// the runtime can execute it.
+    ///
+    /// `peekFamily` refuses a gated family by throwing, which is right for a
+    /// load but not for a caller enumerating a library: it has to tell "this
+    /// install has no runner yet" from "this install is broken" without
+    /// matching on error text. `familiesWithoutRunner` stays the authority;
+    /// this only reads it.
+    public static func missingRunnerAxes(forRawFamily raw: String) -> [String]? {
+        familiesWithoutRunner[raw]
+    }
+
+    /// Families `MferenceRepack` can install but no forward runner can execute,
+    /// mapped to the axes whose kernels are missing.
+    ///
+    /// One entry today: `glm53Flash`, added 2026-09-11 with its Day-0 contract.
+    /// `qwen38flashnext` was the previous occupant, removed 2026-09-10 when
+    /// `FlashNextForwardRunner` landed and the owner lifted its gate. The three
+    /// axis names are the runtime's own (`Glm53Config` and its doc comment name
+    /// the mechanism behind each); remove the entry only when
+    /// `ForwardRunnerFactory` actually dispatches to the family's runner.
+    ///
+    /// Add an entry the moment a new family gains an `ArchInfo` install path,
+    /// keyed by its `manifest.arch.family` string and valued with the axis
+    /// names whose kernels are still missing. Remove it only when that family's
+    /// runner actually lands and `ForwardRunnerFactory` dispatches to it.
+    ///
+    /// The gate lives here because `peekFamily` is the single funnel every
+    /// entry point uses — `Model.load`, the CLI, the loopback server, the Mac
+    /// app's installation probe and the tokenizer loader all call it — so one
+    /// check makes the failure named and actionable everywhere instead of
+    /// surfacing as "unknown arch.family" or, worse, matching some other
+    /// family's runner.
+    ///
+    /// The axis names are the runtime's own; the install also publishes them as
+    /// `manifest.arch.requiredAxes`, but this table is deliberately the
+    /// authority — a manifest does not get to tell the runtime what it can run.
+    ///
+    /// A gated family may still carry an `ArchConfig` baseline, a `ModelFamily`
+    /// case, tensor accessors and manifest validation — that is what the
+    /// runner is built *against*. Presence in this table is the single fact
+    /// that decides whether it can be loaded, and it is checked in
+    /// `peekFamily` before any of that machinery is reached.
+    static let familiesWithoutRunner: [String: [String]] = [:]
+
+    /// The axes `glm53Flash` needed a runner for, in the order the port built
+    /// them; `Glm53ForwardRunner` implements all three, so the family is no
+    /// longer in the table. Still what the installer publishes as
+    /// `arch.requiredAxes`.
+    public static let glm53RequiredAxes: [String] = [
+        "kimiDeltaAttention",
+        "nopeLatentSparseAttention",
+        "pooledLightningIndexer",
+    ]
+
+    /// The gate lookup, factored out of `peekFamily` so it can be exercised
+    /// against an injected table: with `familiesWithoutRunner` empty there is
+    /// no shipped family left to prove the mechanism with, and the mechanism is
+    /// what the next family port depends on.
+    ///
+    /// Returns the named refusal for a gated family, or nil for one the runtime
+    /// can execute.
+    static func capabilityRefusal(family raw: String,
+                                  in table: [String: [String]] = familiesWithoutRunner)
+        -> ModelError? {
+        guard let missingAxes = table[raw] else { return nil }
+        return .familyRunnerNotImplemented(family: raw, missingAxes: missingAxes)
     }
 }

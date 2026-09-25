@@ -16,6 +16,9 @@ public struct RemoteStreamingRepackOptions: Sendable {
     public let baseURL: URL
     public let rangeRetryAttempts: Int
     public let retryBaseDelayNs: UInt64
+    /// Optional tensor groups the install carries (spec W2.4). Only families
+    /// that actually ship such a group consult it.
+    public let sidecarPolicy: SidecarPolicy
 
     public init(repoID: String,
                 revision: String,
@@ -32,7 +35,9 @@ public struct RemoteStreamingRepackOptions: Sendable {
                 downloadSession: RemoteDownloadSession = RemoteDownloadSession(),
                 baseURL: URL = URL(string: "https://huggingface.co")!,
                 rangeRetryAttempts: Int = 4,
-                retryBaseDelayNs: UInt64 = 1_000_000_000) {
+                retryBaseDelayNs: UInt64 = 1_000_000_000,
+                sidecarPolicy: SidecarPolicy = .default) {
+        self.sidecarPolicy = sidecarPolicy
         self.repoID = repoID
         self.revision = revision
         self.outputDir = outputDir
@@ -67,13 +72,36 @@ public struct RemoteStreamingRepackResult: Sendable {
     /// Bytes the install writes: the resident file plus every packed-expert
     /// layer blob. Sidecars (manifest, layout, tokenizer) are negligible.
     public var outputBytes: UInt64 {
-        plan.resident.totalSize + plan.layers.reduce(UInt64(0)) { $0 + $1.fileSize }
+        plan.resident.totalSize
+            + plan.allExpertLayers.reduce(UInt64(0)) { $0 + $1.fileSize }
+            + plan.plePools.reduce(UInt64(0)) { $0 + $1.fileSize }
     }
     public var residentEntryCount: Int { plan.resident.entries.count }
     public var expertLayerCount: Int { plan.layers.count }
     public var excludedMultimodalTensorCount: Int {
         plan.excludedMultimodalTensorNames.count
     }
+
+    /// How many resident tensors the plan quantizes at each width, keyed by
+    /// bits. A census of what will actually be written rather than of the
+    /// policy's rules, so a `--dry-run` can be diffed against a control
+    /// conversion's own mixture before committing to a multi-hour install.
+    public var residentWeightWidthCensus: [Int: Int] {
+        var census: [Int: Int] = [:]
+        for entry in plan.resident.entries {
+            guard let spec = entry.quantSpec else { continue }
+            census[spec.bits, default: 0] += 1
+        }
+        return census
+    }
+    /// Resident tensors that ride through at their source dtype (norms, 1-D
+    /// vectors, conv kernels, integer lookup tables).
+    public var residentUnquantizedCount: Int {
+        plan.resident.entries.filter { $0.quantSpec == nil }.count
+    }
+    /// Tensors quantized at something other than the base width — directly
+    /// comparable to a community conversion's `bitWidthOverridesHonored`.
+    public var bitWidthOverrideCount: Int { plan.bitsOverrideCount }
 }
 
 public final class RemoteStreamingRepacker {
@@ -198,7 +226,8 @@ public final class RemoteStreamingRepacker {
         let plan = try RepackPlanner.plan(meta: snapshot.metadata,
                                           arch: snapshot.arch,
                                           shardHeaders: snapshot.shardHeaders,
-                                          outputDir: paths.partialDirectory)
+                                          outputDir: paths.partialDirectory,
+                                          sidecarPolicy: options.sidecarPolicy)
         let rangePlan = try RangeCopyPlanner.plan(repackPlan: plan,
                                                   rangeChunkBytes: options.rangeChunkBytes,
                                                   layoutMode: "identity",
@@ -237,7 +266,8 @@ public final class RemoteStreamingRepacker {
                 parentDirectory: paths.parentDirectory)
         }
         let outputBytes = plan.resident.totalSize
-            + plan.layers.reduce(UInt64(0)) { $0 + $1.fileSize }
+            + plan.allExpertLayers.reduce(UInt64(0)) { $0 + $1.fileSize }
+            + plan.plePools.reduce(UInt64(0)) { $0 + $1.fileSize }
         progress(.planning(downloadBytes: rangePlan.remoteBytesToDownload,
                            outputBytes: outputBytes))
         let reusedDestinationBytes = checkpoint.completedRanges.reduce(UInt64(0)) {
@@ -329,6 +359,20 @@ public final class RemoteStreamingRepacker {
             let rel = "packed_experts/" + (layer.path as NSString).lastPathComponent
             try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
         }
+        for pool in plan.auxiliaryExpertPools {
+            for layer in pool.layers where layer.expertsPerLayer > 0 {
+                try Task.checkCancellation()
+                let rel = pool.directoryName + "/"
+                    + (layer.path as NSString).lastPathComponent
+                try recordOutputFile(relativePath: rel, path: layer.path, progress: progress)
+            }
+        }
+        for pool in plan.plePools {
+            try Task.checkCancellation()
+            try recordOutputFile(relativePath: pool.relativePath,
+                                 path: pool.path,
+                                 progress: progress)
+        }
 
         let layoutPath = ((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts") as NSString)
@@ -407,16 +451,31 @@ public final class RemoteStreamingRepacker {
                                    paths: RemoteInstallPaths) throws {
         try Posix.mkdirP((paths.partialDirectory as NSString)
             .appendingPathComponent("packed_experts"))
+        for pool in plan.auxiliaryExpertPools {
+            try Posix.mkdirP((paths.partialDirectory as NSString)
+                .appendingPathComponent(pool.directoryName))
+        }
+        if !plan.plePools.isEmpty {
+            try Posix.mkdirP((paths.partialDirectory as NSString)
+                .appendingPathComponent("ple"))
+        }
         let resident = try ResidentWriter.createAndWriteIndex(
             plan: plan.resident,
             audit: audit)
         try Posix.fsync(resident, path: plan.resident.path)
         close(resident)
-        for layer in plan.layers where layer.expertsPerLayer > 0 {
+        for layer in plan.allExpertLayers {
             try Task.checkCancellation()
             let descriptor = try Posix.openCreateRW(layer.path)
             try Posix.ftruncate(descriptor, path: layer.path, size: layer.fileSize)
             try Posix.fsync(descriptor, path: layer.path)
+            close(descriptor)
+        }
+        for pool in plan.plePools {
+            try Task.checkCancellation()
+            let descriptor = try Posix.openCreateRW(pool.path)
+            try Posix.ftruncate(descriptor, path: pool.path, size: pool.fileSize)
+            try Posix.fsync(descriptor, path: pool.path)
             close(descriptor)
         }
         try Posix.fsyncDirectory(paths.partialDirectory)
@@ -587,7 +646,8 @@ public final class RemoteStreamingRepacker {
         for e in plan.resident.entries {
             if e.name == "language_model.model.embed_tokens.weight"
                 || e.name == "model.embed_tokens.weight"
-                || e.name == "model.llm.embed.weight",
+                || e.name == "model.llm.embed.weight"
+                || e.name == "model.language_model.embed_tokens.weight",
                let s = e.quantSpec {
                 bits.embedding = s.bits
             }
@@ -626,7 +686,7 @@ public final class RemoteStreamingRepacker {
         }
         // The dense Qwen 3.8 family has no router, shared expert or routed
         // experts; report the slots absent rather than the 8-bit defaults.
-        if plan.arch.family == .qwen38 {
+        if plan.arch.family == .qwen38 || plan.arch.family == .minicpm5 {
             bits.router = 0
             bits.sharedExpert = 0
             bits.routedExpert = 0

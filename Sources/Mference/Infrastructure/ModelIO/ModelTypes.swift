@@ -12,6 +12,26 @@ public enum ModelFamily: String, Sendable, Hashable {
     case deepseekV4Flash = "deepseekV4Flash"
     case inklingSmall = "inklingSmall"
     case maple = "maple"
+    /// Qwen3.8-Flash-Next. The repacker installs it and `FlashNextForwardRunner`
+    /// executes it; its capability gate was lifted on 2026-09-10. It reaches the
+    /// CLI, the loopback server and the UI behind it; the install is a ~175 GB
+    /// quantize-in-flight repack rather than a pre-converted download.
+    case qwen38flashnext = "qwen38flashnext"
+    /// MiniCPM5-2B: a plain-llama dense family (`LlamaForCausalLM`), the
+    /// project's first, installed from the vendor's BF16 upload through the
+    /// quantize-in-flight path. Bare `model.` trunk prefix and a top-level
+    /// `lm_head.weight`; no q/k norms, no output gate, no experts.
+    case minicpm5 = "minicpm5"
+    /// GLM-5.3-Flash 320B-A18B (`glm5_next`): 34 Kimi-Delta-Attention linear
+    /// layers and 11 DeepSeek-sparse-attention layers (NoPE MLA over a shared
+    /// 512-wide latent, selected by a pooled lightning indexer), a 4-stream
+    /// mHC residual, 3 leading dense layers then 288-expert top-8 MoE with one
+    /// shared expert. Installed from PipeNetwork's mixed 4/8-bit MLX
+    /// conversion under its `language_model.` tensor names. Its three new
+    /// axes are listed in `ManifestReader.familiesWithoutRunner` until
+    /// `Glm53ForwardRunner` lands; every load path refuses the family by name
+    /// until then.
+    case glm53Flash = "glm53Flash"
 }
 
 /// Gated-DeltaNet (linear attention) dimensions. Zeroed for architectures
@@ -165,14 +185,235 @@ public struct RelativePositionConfig: Sendable, Equatable {
         dRel: 0, extent: 0, projDim: 0, logScalingFloor: 0, logScalingAlpha: 0)
 }
 
+/// Qwen3.8-Flash-Next's three new axes: low-rank hyper-connections, the QSA
+/// attention indexer, and the per-layer n-gram embedding (PLE). Zeroed
+/// (`.none`) for every family that carries none of them.
+///
+/// **Low-rank hyper-connections.** The residual stream is `hcCount` parallel
+/// copies of `hiddenSize`, i.e. `hcCount * hiddenSize` wide from the embedding
+/// through the last layer. Each sub-block site owns a `GatedResidual`:
+/// `input_mix_weight_down` `[hcLowRank, hcCount * hidden]` and
+/// `input_mix_weight_up` `[hcCount * hidden, hcLowRank]` factorize the mix,
+/// `block_inject_weight` `[hcCount, hcCount * hidden]` places the block output
+/// back into all streams, and `hc_norm` is a group RMSNorm with group size
+/// `hiddenSize`. This is a *different* mechanism from
+/// `HyperConnectionConfig` (DeepSeek V4's manifold-constrained mHC, which
+/// carries a Sinkhorn-projected combine matrix and no low-rank factorization),
+/// so the two configs are separate axes rather than one shared struct.
+///
+/// **QSA indexer.** Per full-attention layer, `index_qk_proj`
+/// `[indexerNumHeads * indexerHeadDim + indexerNumKVHeads * indexerHeadDim,
+/// hidden]` scores the visible prefix in blocks of `indexerCompressRatio`
+/// tokens; the top `indexerBudget / indexerCompressRatio` blocks (plus the
+/// incomplete tail, always selected) form the attention mask for that query.
+/// Selection sparsity is applied through the mask only — KV entries are never
+/// dropped.
+///
+/// **PLE.** At each layer id in `pleLayerIDs` (**one-indexed**, so id 2 is
+/// `layers[1]`) a hashed n-gram embedding is added to the residual stream
+/// before attention. Rows come from the streamed row pool described by
+/// `manifest.plePool`, not from the resident buffer. `pleEosTokenID` delimits
+/// the segments the n-gram shift must not cross.
+///
+/// Facts established against the reference implementation (2026-09-01 parity
+/// harness) that constrain any kernel built on these axes:
+///   * **RMSNorm upcasts.** Every `Qwen4ExpTextRMSNorm` computes
+///     `_norm(x.float()) * (1 + w.float())` and casts back, so the reduction
+///     and the scale are fp32 even when the operands are BF16.
+///   * **The n-gram mix has zero integer headroom.** The hash values are
+///     exactly 63 bits by construction, so the mix must be done in true
+///     64-bit integer arithmetic — never `Double` (53-bit significand) and
+///     never a 32-bit intermediate.
+///   * **The indexer does not guarantee a query selects its own block.**
+///     Nothing in this plumbing may assume a "keep self" entry; the visible
+///     set is whatever the top-k over block scores plus the incomplete tail
+///     produces.
+///   * **Gated `q_proj` packs per head.** The `2 * numHeads * fullHeadDim`
+///     rows are `[heads, 2 * headDim]` split on the last dimension, not a
+///     global query-half / gate-half row split — which is already the
+///     convention the shipped Qwen path implements (`split_q_gate_fp16`), so
+///     `attnOutputGate` is reusable here unchanged.
+public struct FlashNextConfig: Sendable, Equatable {
+    /// Parallel residual streams. The residual is `hcCount * hiddenSize` wide.
+    public let hcCount: Int
+    /// Rank of the hyper-connection mix factorization (`input_mix_weight_*`).
+    public let hcLowRank: Int
+    /// Indexer query heads.
+    public let indexerNumHeads: Int
+    /// Indexer head width, shared by the query heads and the single key head.
+    public let indexerHeadDim: Int
+    /// Indexer key heads; 1 in production (one pooled key per block).
+    public let indexerNumKVHeads: Int
+    /// Tokens the indexer keeps visible per query, before the always-selected
+    /// tail. `indexerBudget / indexerCompressRatio` blocks are selected.
+    public let indexerBudget: Int
+    /// Consecutive tokens pooled into one indexer block key.
+    public let indexerCompressRatio: Int
+    /// **One-indexed** layer ids carrying a PLE block: id `n` is `layers[n-1]`.
+    public let pleLayerIDs: [Int]
+    /// `split_ngram_parts`: how many shards the source n-gram table arrives
+    /// in, and how many page-aligned regions the installed row pool holds.
+    public let pleNgramShardCount: Int
+    /// `ngram_vocab_size_base` verbatim — the PER-HEAD base vocab, *not* the
+    /// table's row count. The true row count comes from the shard headers and
+    /// is published in `manifest.plePool.layers[].rows`; nothing validates one
+    /// against the other.
+    public let pleNgramVocabSizeBase: Int
+    /// Depthwise causal conv width in the PLE mixer (dilation is the n-gram
+    /// size, which is read from the installed `layer_multipliers` length).
+    public let pleConvKernelSize: Int
+    /// Token id that delimits PLE n-gram segments: a shifted token stream must
+    /// not read across it (`_shift_right_ignore_eos`, EOS inclusive).
+    ///
+    /// The installed manifests predating this axis do not publish it, so
+    /// `validateArch` checks it only when present and otherwise trusts this
+    /// compiled constant. Emitting `arch.pleEosTokenID` from the repacker is
+    /// an open follow-up; until it lands, a checkpoint with a different EOS
+    /// would violate the constant silently.
+    public let pleEosTokenID: Int
+
+    public init(hcCount: Int, hcLowRank: Int,
+                indexerNumHeads: Int, indexerHeadDim: Int,
+                indexerNumKVHeads: Int, indexerBudget: Int,
+                indexerCompressRatio: Int,
+                pleLayerIDs: [Int],
+                pleNgramShardCount: Int,
+                pleNgramVocabSizeBase: Int,
+                pleConvKernelSize: Int,
+                pleEosTokenID: Int) {
+        self.hcCount = hcCount
+        self.hcLowRank = hcLowRank
+        self.indexerNumHeads = indexerNumHeads
+        self.indexerHeadDim = indexerHeadDim
+        self.indexerNumKVHeads = indexerNumKVHeads
+        self.indexerBudget = indexerBudget
+        self.indexerCompressRatio = indexerCompressRatio
+        self.pleLayerIDs = pleLayerIDs
+        self.pleNgramShardCount = pleNgramShardCount
+        self.pleNgramVocabSizeBase = pleNgramVocabSizeBase
+        self.pleConvKernelSize = pleConvKernelSize
+        self.pleEosTokenID = pleEosTokenID
+    }
+
+    public static let none = FlashNextConfig(
+        hcCount: 0, hcLowRank: 0,
+        indexerNumHeads: 0, indexerHeadDim: 0, indexerNumKVHeads: 0,
+        indexerBudget: 0, indexerCompressRatio: 0,
+        pleLayerIDs: [], pleNgramShardCount: 0, pleNgramVocabSizeBase: 0,
+        pleConvKernelSize: 0, pleEosTokenID: 0)
+
+    /// Zero-indexed layer indices carrying a PLE block, derived from the
+    /// one-indexed `pleLayerIDs` the checkpoint publishes.
+    public var pleLayerIndices: [Int] { pleLayerIDs.map { $0 - 1 } }
+
+    /// Indexer blocks selected per query: `indexerBudget / compressRatio`.
+    public var indexerBlockBudget: Int {
+        indexerCompressRatio > 0 ? indexerBudget / indexerCompressRatio : 0
+    }
+}
+
+/// GLM-5.3-Flash's new axes. `.none` (all fields zero) for every family that
+/// carries none of them.
+///
+/// The family is a hybrid of two attention kinds over a four-stream mHC
+/// residual (`hyperConnections`, the DeepSeek-V4 formulation, applied with
+/// the same site's `pre` and collapsed by a plain **mean** over the streams
+/// after the last layer — there is no `hc_head`):
+///
+/// **Kimi Delta Attention** (layer mask 7). A gated delta-rule recurrence like
+/// Qwen's GDN (`linearAttention` holds the head geometry), with three
+/// differences that make it its own axis: the decay is a **per-channel
+/// vector**, not a per-head scalar — `g = kdaGateLowerBound * sigmoid(exp(A_log[h])
+/// * (f_b(f_a(x)) + dt_bias))` per (head, key channel), so the state row
+/// `S[h, dk, :]` decays by `exp(g[h, dk])`; the output gate is a low-rank
+/// `g_b(g_a(x))` through a **sigmoid**-gated per-head RMSNorm (`o_norm`); and
+/// the write strength `beta = sigmoid(b_proj(x))` is a per-head projection
+/// of the block input. q and k are l2-normalized (q also scaled by
+/// `keyHeadDim^-0.5`) after a depthwise causal conv (`convKernelSize` taps)
+/// over the concatenated `[q ; k ; v]` projections, followed by SiLU.
+///
+/// **NoPE latent sparse attention** (layer mask 8). MLA in its absorbed form
+/// with no rotary channels at all: `q = q_b(rmsnorm(q_a(x)))` per head
+/// (`qkNopeHeadDim` wide), folded into the latent space by `embed_q`
+/// (`[heads, kvLoraRank, qkNopeHeadDim]`), attends over one shared cache of
+/// `rmsnorm(kv_a(x))` latents (`kvLoraRank` wide, K = V), and the per-head
+/// latent output is unfolded by `unembed_out` (`[heads, vHeadDim,
+/// kvLoraRank]`) before `o_proj`. The KV cache is `kvLoraRank` FP16 per token
+/// per sparse layer.
+///
+/// **Pooled lightning indexer.** Each sparse layer scores the visible
+/// prefix with `compressedAttention.indexNHeads` query heads
+/// (`wq_b(rmsnorm(q_a(x)))`, `indexHeadDim` wide) against **pooled** keys:
+/// `layernorm(wk(x))` keys are grouped `indexKPool` consecutive tokens at a
+/// time and combined with a per-channel softmax over `x @ gate^T + ape[j]`;
+/// only complete groups are candidates. Scores are `relu(q · k) *
+/// indexHeadDim^-0.5`, weighted per head by `weights_proj(x) *
+/// indexNHeads^-0.5` and summed; the top `indexTopK / indexKPool` visible
+/// groups expand to token indices, and the up-to-`indexKPool - 1` tokens of
+/// the incomplete tail are always selected (`indexKPoolAlwaysSelectTail`).
+/// While the cache holds at most `indexTopK` tokens the selection is
+/// exhaustive and attention is dense.
+///
+/// `rmsNormEps` (1e-5) is carried because the runtime's kernels default to
+/// 1e-6; `indexerKNormEps` (1e-6) is the indexer key LayerNorm's own epsilon.
+public struct Glm53Config: Sendable, Equatable {
+    /// Width of the shared attention latent that is both K and V.
+    public let kvLoraRank: Int
+    /// Query head width on sparse-attention layers (no rotary part).
+    public let qkNopeHeadDim: Int
+    /// Per-head output width unfolded from the latent.
+    public let vHeadDim: Int
+    /// Consecutive tokens pooled into one indexer key.
+    public let indexKPool: Int
+    /// Whether the incomplete tail group's tokens are always attended.
+    public let indexKPoolAlwaysSelectTail: Bool
+    /// LayerNorm epsilon of the indexer key path.
+    public let indexerKNormEps: Double
+    /// `gate_lower_bound`: the KDA decay is `lowerBound * sigmoid(...)`, in
+    /// log space, so every channel decays by at least `exp(lowerBound)`.
+    public let kdaGateLowerBound: Double
+    /// RMSNorm epsilon of every norm in the stack (`rms_norm_eps`).
+    public let rmsNormEps: Double
+
+    public init(kvLoraRank: Int, qkNopeHeadDim: Int, vHeadDim: Int,
+                indexKPool: Int, indexKPoolAlwaysSelectTail: Bool,
+                indexerKNormEps: Double, kdaGateLowerBound: Double,
+                rmsNormEps: Double) {
+        self.kvLoraRank = kvLoraRank
+        self.qkNopeHeadDim = qkNopeHeadDim
+        self.vHeadDim = vHeadDim
+        self.indexKPool = indexKPool
+        self.indexKPoolAlwaysSelectTail = indexKPoolAlwaysSelectTail
+        self.indexerKNormEps = indexerKNormEps
+        self.kdaGateLowerBound = kdaGateLowerBound
+        self.rmsNormEps = rmsNormEps
+    }
+
+    public static let none = Glm53Config(
+        kvLoraRank: 0, qkNopeHeadDim: 0, vHeadDim: 0,
+        indexKPool: 0, indexKPoolAlwaysSelectTail: false,
+        indexerKNormEps: 0, kdaGateLowerBound: 0, rmsNormEps: 0)
+
+    /// Indexer keys selected per query: the token budget in pooled groups.
+    public func indexerSelectedGroups(indexTopK: Int) -> Int {
+        indexKPool > 0 ? indexTopK / indexKPool : 0
+    }
+    /// Attended rows per query at the widest: the budget plus the tail.
+    public func indexerMaxSelected(indexTopK: Int) -> Int {
+        indexTopK + (indexKPoolAlwaysSelectTail && indexKPool > 1 ? indexKPool - 1 : 0)
+    }
+}
+
 /// Compile-time architecture baseline. `manifest.json -> arch` must match this
 /// field-by-field at load time; mismatches throw `ModelError.archMismatch`.
 ///
 /// `fullAttentionLayerMask` values: 0 = sliding-window attention,
 /// 1 = full attention, 2 = gated-DeltaNet linear attention,
 /// 3 = compressed sparse attention (CSA), 4 = heavily compressed attention
-/// (HCA). Values 3/4 additionally include the sliding-window branch (DeepSeek
-/// V4 concatenates compressed entries onto the window KV).
+/// (HCA), 7 = Kimi Delta Attention (GLM-5.3-Flash linear attention), 8 = NoPE
+/// latent sparse attention (GLM-5.3-Flash). Values 3/4 additionally include
+/// the sliding-window branch (DeepSeek V4 concatenates compressed entries
+/// onto the window KV).
 public struct ArchConfig: Sendable, Equatable {
     public let hiddenSize: Int
     public let intermediateSize: Int          // shared expert FFN (== ffnIntermediate in manifest)
@@ -269,6 +510,18 @@ public struct ArchConfig: Sendable, Equatable {
     public let routerNormAfterTopK: Bool
     /// Per-layer learned scalar multiplying the router weights.
     public let routerGlobalScale: Bool
+    /// Qwen3.8-Flash-Next's low-rank hyper-connections, QSA indexer and
+    /// per-layer n-gram embedding. `.none` for every other family.
+    public let flashNext: FlashNextConfig
+    /// Full-attention layers carry per-head RMSNorm gains on the query and
+    /// key projections (`self_attn.q_norm.weight` / `k_norm.weight`), applied
+    /// before RoPE. `false` is plain-llama attention: the projections go
+    /// straight to RoPE and the fused QKV epilogues, which require the
+    /// weights, are bypassed for the standalone RoPE kernels.
+    public let qkNorm: Bool
+    /// GLM-5.3-Flash's Kimi Delta Attention, NoPE latent sparse attention and
+    /// pooled indexer geometry. `.none` for every other family.
+    public let glm53: Glm53Config
 
     public init(
         hiddenSize: Int,
@@ -318,7 +571,10 @@ public struct ArchConfig: Sendable, Equatable {
         routerGateBias: Bool = false,
         routerNormAfterTopK: Bool = false,
         routerGlobalScale: Bool = false,
-        unpaddedVocabSize: Int = 0
+        unpaddedVocabSize: Int = 0,
+        flashNext: FlashNextConfig = .none,
+        qkNorm: Bool = true,
+        glm53: Glm53Config = .none
     ) {
         self.hiddenSize = hiddenSize
         self.intermediateSize = intermediateSize
@@ -368,6 +624,9 @@ public struct ArchConfig: Sendable, Equatable {
         self.routerNormAfterTopK = routerNormAfterTopK
         self.routerGlobalScale = routerGlobalScale
         self.unpaddedVocabSize = unpaddedVocabSize
+        self.flashNext = flashNext
+        self.qkNorm = qkNorm
+        self.glm53 = glm53
     }
 
     /// Canonical Gemma 4 26B-A4B baseline, checked against the installed
@@ -701,7 +960,235 @@ public struct ArchConfig: Sendable, Equatable {
         (0..<42).map { $0 % 6 == 5 ? 1 : 0 }
     }
 
+    /// Canonical Qwen3.8-Flash-Next 180B-A3.5B baseline (text stack of the
+    /// multimodal `qwen4_exp` checkpoint; the vision tower is excluded at
+    /// repack). 48 layers in the same 3 : 1 hybrid as Qwen 3.6/3.8 — 36
+    /// gated-DeltaNet layers and 12 full-attention layers — with 512 routed
+    /// experts (top-10) of width 640 plus one sigmoid-gated shared expert,
+    /// gated attention output, per-head q/k norms, partial NeoX RoPE over 64
+    /// of 256 dims at θ 1e7, and an untied 248 320-row head.
+    ///
+    /// Three axes are new and carried in `flashNext`: the residual is 4
+    /// low-rank hyper-connected streams (so the stream is 10 240 wide and
+    /// there is **no** final norm — the global mixer collapses it before
+    /// `lm_head`), each full-attention layer carries a QSA indexer, and
+    /// layer id 2 (`layers[1]`) carries a PLE n-gram embedding whose 320M-row
+    /// table streams from `manifest.plePool` rather than sitting resident.
+    ///
+    /// Values are read from the installed manifest at
+    /// `scratch/qwen38flashnext.gturbo` (revision `de4b8e4d`); see
+    /// `docs/families/QWEN38_FLASH_NEXT.md`. This is the baseline
+    /// `FlashNextForwardRunner` runs against, and since the 2026-09-10 gate lift
+    /// it is also what `Model.load` auto-detection resolves for the family.
+    public static let qwen38FlashNext_180B_A3_5B = ArchConfig(
+        hiddenSize: 2560,
+        intermediateSize: 640,
+        moeIntermediateSize: 640,
+        numHeads: 24,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 248_320,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 10_000_000.0,
+        fullRopeTheta: 10_000_000.0,
+        partialRotaryFactor: 0.25,
+        numLayers: 48,
+        numExperts: 512,
+        topKExperts: 10,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: Self.qwen38FlashNextLayerMask(),
+        hiddenActivation: "silu",
+        family: .qwen38flashnext,
+        attnOutputGate: true,          // output_gate_type: sigmoid
+        attentionScale: 0.0625,        // 256^-0.5
+        embeddingScaledBySqrtHidden: false,
+        routerScaled: false,
+        ffnSandwichNorms: false,
+        sharedExpertGated: true,
+        ropeNeoxSubdim: true,
+        linearAttention: LinearAttentionConfig(
+            numKHeads: 16, numVHeads: 48,
+            keyHeadDim: 128, valueHeadDim: 128,
+            convKernelSize: 4),
+        // The router path is Qwen 3.6's: softmax over the logits, top-k of the
+        // probabilities, then renormalize the selected k (`norm_topk_prob`).
+        // `routerNormAfterTopK` stays false because that flag selects
+        // Inkling's and Maple's *different* ordering, not this one.
+        numSharedExperts: 1,
+        flashNext: FlashNextConfig(
+            hcCount: 4,
+            hcLowRank: 320,
+            indexerNumHeads: 4,
+            indexerHeadDim: 128,
+            indexerNumKVHeads: 1,
+            indexerBudget: 2048,
+            indexerCompressRatio: 4,
+            pleLayerIDs: [2],
+            pleNgramShardCount: 128,
+            pleNgramVocabSizeBase: 20_000_000,
+            pleConvKernelSize: 4,
+            // config.json text_config.eos_token_id @ de4b8e4d.
+            pleEosTokenID: 248_044)
+    )
+
+    private static func qwen38FlashNextLayerMask() -> [UInt8] {
+        // Same 3:1 hybrid shape as Qwen 3.6/3.8 (full_attention_interval = 4).
+        var mask = [UInt8](repeating: 2, count: 48)
+        for i in stride(from: 3, to: 48, by: 4) { mask[i] = 1 }
+        return mask
+    }
+
+    /// Canonical MiniCPM5-2B baseline: 42 plain pre-norm dense layers of
+    /// `LlamaForCausalLM` attention (16 query heads over 2 KV heads of 128,
+    /// full NeoX RoPE at theta 5e6, no q/k norm, no output gate) and one
+    /// SwiGLU MLP per layer; untied 130,560-row `lm_head`; no experts, no
+    /// router, no shared expert, no logit softcap. Values are read from
+    /// `config.json` of `openbmb/MiniCPM5-2B` at revision `cd199ce3` and
+    /// checked against `transformers` v5.6.2 `modeling_llama.py`; see
+    /// `docs/families/MINICPM5.md`.
+    ///
+    /// The sliding-window slots mirror the full-attention values: every layer
+    /// is full attention, so they never size storage. `rms_norm_eps` (1e-6)
+    /// is not an axis; the repacker refuses a config that sets it to anything
+    /// else, because the runners hard-code that epsilon.
+    public static let miniCPM5_2B = ArchConfig(
+        hiddenSize: 2048,
+        intermediateSize: 6144,
+        moeIntermediateSize: 0,
+        numHeads: 16,
+        numKVHeads: 2,
+        numFullKVHeads: 2,
+        headDim: 128,
+        fullHeadDim: 128,
+        vocabSize: 130_560,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 5_000_000.0,
+        fullRopeTheta: 5_000_000.0,
+        partialRotaryFactor: 1.0,
+        numLayers: 42,
+        numExperts: 0,
+        topKExperts: 0,
+        tieWordEmbeddings: false,
+        attentionKEqV: false,
+        fullAttentionLayerMask: [UInt8](repeating: 1, count: 42),
+        hiddenActivation: "silu",
+        family: .minicpm5,
+        attnOutputGate: false,
+        attentionScale: 0.08838834764831845,   // pow(128, -0.5) == head_dim ** -0.5 in transformers; 1/sqrt(128) is one ulp off
+        embeddingScaledBySqrtHidden: false,
+        routerScaled: false,
+        ffnSandwichNorms: false,
+        sharedExpertGated: false,
+        ropeNeoxSubdim: true,
+        numSharedExperts: 0,
+        numDenseLayers: 42,
+        denseIntermediateSize: 6144,
+        qkNorm: false
+    )
+
+    /// Canonical GLM-5.3-Flash 320B-A18B baseline: 45 layers, of which 34 are
+    /// Kimi Delta Attention (mask 7) and 11 — every fourth from layer 3 — are
+    /// NoPE latent sparse attention (mask 8); 3 leading dense layers of width
+    /// 12 288, then 288 routed experts of width 2048, top-8, sigmoid scores
+    /// with a selection-only correction bias, weights renormalized after
+    /// selection and scaled by 2.5, plus one shared expert of the same width;
+    /// swiglu clamp 10 on every FFN; a 4-stream mHC residual; untied INT8
+    /// head; no RoPE anywhere in the text stack.
+    ///
+    /// Values are read from `config.json -> text_config` of
+    /// `zai-org/GLM-5.3-Flash` (the pinned PipeNetwork conversion `d43ea8b4`
+    /// carries the block verbatim) and from PipeNetwork's parity-fixed MLX
+    /// runtime; see `docs/families/GLM53_FLASH.md`. Tensor names are the MLX
+    /// conversion's `language_model.model.layers.N.…` / `language_model.lm_head`.
+    public static let glm53Flash_320B_A18B = ArchConfig(
+        hiddenSize: 4096,
+        intermediateSize: 2048,
+        moeIntermediateSize: 2048,
+        numHeads: 64,
+        numKVHeads: 1,
+        numFullKVHeads: 1,
+        headDim: 256,
+        fullHeadDim: 256,
+        vocabSize: 154_880,
+        slidingWindow: 0,
+        finalLogitSoftcap: 0.0,
+        ropeTheta: 0.0,
+        fullRopeTheta: 0.0,
+        partialRotaryFactor: 0.0,
+        numLayers: 45,
+        numExperts: 288,
+        topKExperts: 8,
+        tieWordEmbeddings: false,
+        attentionKEqV: true,
+        fullAttentionLayerMask: Self.glm53FlashLayerMask(),
+        hiddenActivation: "silu",
+        family: .glm53Flash,
+        attnOutputGate: false,
+        attentionScale: 0.0625,                 // 256^-0.5
+        embeddingScaledBySqrtHidden: false,
+        routerScaled: false,
+        ffnSandwichNorms: false,
+        sharedExpertGated: false,
+        ropeNeoxSubdim: false,
+        linearAttention: LinearAttentionConfig(
+            numKHeads: 64, numVHeads: 64, keyHeadDim: 128, valueHeadDim: 128,
+            convKernelSize: 4),
+        // The low-rank query rank and the indexer head shape ride the V4
+        // struct; the output LoRA, rope and compress fields are zero because
+        // this family has none of them.
+        compressedAttention: CompressedAttentionConfig(
+            qLoraRank: 1536, oLoraRank: 0, oGroups: 0,
+            ropeHeadDim: 0,
+            indexNHeads: 32, indexHeadDim: 128, indexTopK: 2048,
+            csaCompressRate: 0, hcaCompressRate: 0,
+            compressRopeTheta: 0.0),
+        hyperConnections: HyperConnectionConfig(
+            mult: 4, sinkhornIters: 20, eps: 1.0e-6),
+        numHashRoutedLayers: 0,
+        routerScoringFunc: "sigmoid",
+        routedScalingFactor: 2.5,
+        swigluLimit: 10.0,
+        numSharedExperts: 1,
+        numDenseLayers: 3,
+        denseIntermediateSize: 12_288,
+        routerGateBias: true,
+        routerNormAfterTopK: true,
+        // The embedding / lm_head carry 154,880 rows; the tokenizer defines
+        // 154,856 ids (154,820 BPE + 36 added). The head masks the 24 padding
+        // rows to -inf so sampling can never emit an undecodable id.
+        unpaddedVocabSize: 154_856,
+        qkNorm: false,
+        glm53: Glm53Config(
+            kvLoraRank: 512,
+            qkNopeHeadDim: 256,
+            vHeadDim: 256,
+            indexKPool: 4,
+            indexKPoolAlwaysSelectTail: true,
+            indexerKNormEps: 1.0e-6,
+            kdaGateLowerBound: -5.0,
+            rmsNormEps: 1.0e-5)
+    )
+
+    private static func glm53FlashLayerMask() -> [UInt8] {
+        // `layer_types`: linear_attention everywhere except every fourth layer
+        // from 3 (3, 7, …, 43), which is deepseek_sparse_attention.
+        var mask = [UInt8](repeating: 7, count: 45)
+        for i in stride(from: 3, to: 45, by: 4) { mask[i] = 8 }
+        return mask
+    }
+
     /// Registry keyed by `manifest.arch.family` for auto-detection at load.
+    ///
+    /// A family here has a validated baseline, not necessarily a runner:
+    /// `ManifestReader.familiesWithoutRunner` is the separate, authoritative
+    /// gate over whether the runtime can execute one. That table is empty
+    /// today — every family in this registry has a runner — but the two facts
+    /// stay separate, because a new port earns its baseline first.
     public static let knownArchitectures: [ModelFamily: ArchConfig] = [
         .gemma4: .gemma4_26B_A4B,
         .qwen36: .qwen36_35B_A3B,
@@ -709,6 +1196,9 @@ public struct ArchConfig: Sendable, Equatable {
         .deepseekV4Flash: .deepseekV4Flash_284B_A13B,
         .inklingSmall: .inklingSmall_276B_A12B,
         .maple: .maplePreview,
+        .qwen38flashnext: .qwen38FlashNext_180B_A3_5B,
+        .minicpm5: .miniCPM5_2B,
+        .glm53Flash: .glm53Flash_320B_A18B,
     ]
 
     /// Resident INT4 GEMV shapes this architecture issues during decode, for
@@ -716,6 +1206,12 @@ public struct ArchConfig: Sendable, Equatable {
     /// raises achieved bandwidth on the narrower projections.
     public var decodeInt4GEMVShapes: [(m: Int, n: Int)] {
         var shapes: [(m: Int, n: Int)] = []
+        if family == .glm53Flash {
+            // Every resident projection of this family is INT8 or BF16; the
+            // only INT4 tensors are the streamed experts, which never go
+            // through the resident INT4 GEMV.
+            return shapes
+        }
         if hasCompressedAttentionLayers {
             // DeepSeek V4 low-rank attention path: q_a, q_b, kv, o_a (as
             // oGroups separate group GEMVs), o_b, plus the compressor /
@@ -760,6 +1256,33 @@ public struct ArchConfig: Sendable, Equatable {
     /// Resident INT8 GEMV shapes issued during decode (router and, when the
     /// architecture has one, the shared-expert scalar gate).
     public var decodeInt8GEMVShapes: [(m: Int, n: Int)] {
+        if family == .glm53Flash {
+            // The router is unquantized BF16 here; the INT8 rows are the KDA
+            // projections, the sparse-attention path, the indexer query and
+            // key paths, the shared and dense FFNs, and the head.
+            let la = linearAttention
+            let ca = compressedAttention
+            let g = glm53
+            return [
+                (m: la.numKHeads * la.keyHeadDim, n: hiddenSize),      // q/k/v_proj
+                (m: la.keyHeadDim, n: hiddenSize),                     // f_a, g_a
+                (m: la.numVHeads * la.valueHeadDim, n: la.keyHeadDim), // f_b, g_b
+                (m: la.numVHeads, n: hiddenSize),                      // b_proj
+                (m: hiddenSize, n: la.numVHeads * la.valueHeadDim),    // KDA o_proj
+                (m: ca.qLoraRank, n: hiddenSize),                      // q_a
+                (m: numHeads * g.qkNopeHeadDim, n: ca.qLoraRank),      // q_b
+                (m: g.kvLoraRank, n: hiddenSize),                      // kv_a
+                (m: hiddenSize, n: numHeads * g.vHeadDim),             // DSA o_proj
+                (m: ca.indexNHeads * ca.indexHeadDim, n: ca.qLoraRank),// indexer wq_b
+                (m: ca.indexHeadDim, n: hiddenSize),                   // indexer wk
+                (m: ca.indexNHeads, n: hiddenSize),                    // weights_proj
+                (m: intermediateSize, n: hiddenSize),                  // shared gate/up
+                (m: hiddenSize, n: intermediateSize),                  // shared down
+                (m: denseIntermediateSize, n: hiddenSize),             // dense gate/up
+                (m: hiddenSize, n: denseIntermediateSize),             // dense down
+                (m: vocabSize, n: hiddenSize),                         // head
+            ]
+        }
         var shapes: [(m: Int, n: Int)] = family == .maple
             ? [] : [(m: numExperts, n: hiddenSize)]
         if sharedExpertGated { shapes.append((m: 1, n: hiddenSize)) }
@@ -777,11 +1300,37 @@ public struct ArchConfig: Sendable, Equatable {
         return v == 3 || v == 4
     }
     public var hasLinearAttentionLayers: Bool { fullAttentionLayerMask.contains(2) }
+    /// GLM-5.3-Flash layer kinds: Kimi Delta Attention (7) and NoPE latent
+    /// sparse attention (8).
+    public func layerIsKDA(_ layer: Int) -> Bool { fullAttentionLayerMask[layer] == 7 }
+    public func layerIsLatentSparse(_ layer: Int) -> Bool { fullAttentionLayerMask[layer] == 8 }
+    public var hasGlm53Axes: Bool { glm53 != .none }
+    /// True when the layer runs the dense FFN rather than the MoE block.
+    public func layerIsDenseFFN(_ layer: Int) -> Bool { layer < numDenseLayers }
     public var hasCompressedAttentionLayers: Bool {
         fullAttentionLayerMask.contains(where: { $0 == 3 || $0 == 4 })
     }
     /// Hash-routed MoE layer: expert selection is `tid2eid[token]`.
     public func layerIsHashRouted(_ layer: Int) -> Bool { layer < numHashRoutedLayers }
+
+    /// True when the residual is Flash-Next's low-rank hyper-connected bundle
+    /// of `flashNext.hcCount` streams rather than a single stream.
+    public var hasLowRankHyperConnections: Bool { flashNext.hcCount > 0 }
+    /// Width of the residual the layer graph carries between blocks. Blocks
+    /// themselves always run at `hiddenSize`; only the residual widens.
+    public var residualStreamWidth: Int {
+        hasLowRankHyperConnections ? flashNext.hcCount * hiddenSize : hiddenSize
+    }
+    /// True when this layer carries a PLE n-gram embedding block. `pleLayerIDs`
+    /// is one-indexed in the checkpoint, so id 2 answers true for layer 1.
+    public func layerIsPLE(_ layer: Int) -> Bool {
+        flashNext.pleLayerIDs.contains(layer + 1)
+    }
+    /// True when this layer carries a QSA indexer: full-attention layers of a
+    /// family that configures one.
+    public func layerHasAttentionIndexer(_ layer: Int) -> Bool {
+        flashNext.indexerNumHeads > 0 && layerIsFull(layer)
+    }
 }
 
 /// Failure modes for the validation gates in `Model.load`.
@@ -802,6 +1351,19 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
     case trustedReceiptInvalid(detail: String)
     case routedExpertPlanUnavailable(layer: Int)
     case eagerExpertFillFailed(layer: Int)
+    /// The repacker can install this family but no runner executes it yet.
+    /// Named rather than "unknown family" so the failure points at the missing
+    /// kernels instead of reading as a corrupt install.
+    case familyRunnerNotImplemented(family: String, missingAxes: [String])
+    /// The install declares no `manifest.plePool` block, or none for the layer
+    /// the arch says carries a PLE n-gram embedding.
+    case plePoolMissing(layer: Int)
+    /// The `manifest.plePool` block is present but self-inconsistent (unknown
+    /// kind, geometry that does not tile the file, shard rows that do not sum
+    /// to the declared total).
+    case plePoolInvalid(detail: String)
+    /// A row index outside the pool's declared row count.
+    case plePoolRowOutOfRange(row: Int, rows: Int)
 
     public var description: String {
         switch self {
@@ -837,6 +1399,15 @@ enum ModelError: Error, CustomStringConvertible, Equatable {
             return "routed expert fetch plan unavailable for layer \(layer)"
         case .eagerExpertFillFailed(let layer):
             return "eager routed expert read failed for layer \(layer); decode step aborted"
+        case .familyRunnerNotImplemented(let family, let missingAxes):
+            return "family \(family) is installed but its runner is not implemented; "
+                + "missing axes: \(missingAxes.joined(separator: ", "))"
+        case .plePoolMissing(let layer):
+            return "manifest.plePool has no row-lookup pool for PLE layer \(layer)"
+        case .plePoolInvalid(let detail):
+            return "manifest.plePool is invalid: \(detail)"
+        case .plePoolRowOutOfRange(let row, let rows):
+            return "PLE row \(row) is outside the pool's \(rows) rows"
         }
     }
 }

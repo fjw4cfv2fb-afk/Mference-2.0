@@ -29,6 +29,16 @@ public enum ChatDialect: String, Sendable {
     case chatml
     case deepseek
     case inkling
+    /// MiniCPM5: ChatML framing with `<s>` first, XML `<function …>` tool
+    /// calls, `<tool_response>` results inside user turns, two EOS ids.
+    case minicpm
+    /// GLM-5.3-Flash: `[gMASK]<sop>` prefix, `<|system|>` / `<|user|>` /
+    /// `<|assistant|>` / `<|observation|>` turn markers, a `Reasoning Effort`
+    /// system line, `<think>` opening every assistant turn, `<tool_call>`
+    /// bodies keyed by `<arg_key>` / `<arg_value>`; `<|user|>`,
+    /// `<|observation|>` and `<|endoftext|>` all end the assistant turn.
+    /// Detected by the `[gMASK]` special token (`Glm5ChatTemplate.swift`).
+    case glm5
 }
 
 /// Tokenizer wrapper for the supported model families (Gemma 4, ChatML/Qwen,
@@ -49,6 +59,10 @@ public struct MFTokenizer: @unchecked Sendable {
     public static let toolChatTemplateIdentity = "gemma4-it-tools-jinja-v1"
 
     public let dialect: ChatDialect
+    public internal(set) var isSwiftQwen = false
+    public internal(set) var isBaseQwen38 = false
+    /// Tool grammar is a family contract, independent of thinking policy.
+    let usesJSONChatMLToolCalls: Bool
     /// Nominal BOS. For ChatML this is `<|endoftext|>` (the config's unused
     /// `bos_token_id`); it is never prepended — see `encode(_:addBOS:)`.
     public let bosID: Int32
@@ -74,7 +88,9 @@ public struct MFTokenizer: @unchecked Sendable {
     /// supplies one of those manifest families; direct loads and other
     /// families retain their old behavior.
     public var generationPromptStartsInThinking: Bool {
-        dialect == .chatml && eosID == endOfTurnID
+        (dialect == .chatml && eosID == endOfTurnID)
+            || (dialect == .minicpm && Self.miniCPMDefaultThinking == .enabled)
+            || dialect == .glm5
     }
 
     /// BOS actually prepended by `encode(_:addBOS:)`; nil for dialects that
@@ -101,10 +117,14 @@ public struct MFTokenizer: @unchecked Sendable {
     public static func load(forModelDirectory modelDirectory: URL,
                             environment: [String: String] = ProcessInfo.processInfo.environment) async throws -> MFTokenizer {
         let family = try ManifestReader.peekFamily(directoryURL: modelDirectory)
+        let checkpointID = try ManifestReader.peekModelID(directoryURL: modelDirectory)
         if let folder = tokenizerFolder(forModelDirectory: modelDirectory, environment: environment) {
-            return try await load(from: folder, family: family)
+            let loaded = try await load(from: folder, family: family)
+            return try loaded.forCheckpoint(checkpointID)
         }
-        if family == .maple { throw MFTokenizerError.missingToolTemplate }
+        if family == .maple || checkpointID == CheckpointIdentity.swiftQwen38 {
+            throw MFTokenizerError.missingToolTemplate
+        }
         return try await load()
     }
 
@@ -150,12 +170,21 @@ public struct MFTokenizer: @unchecked Sendable {
 
     public init(tokenizer: any Tokenizer, family: ModelFamily?) throws {
         self.tokenizer = tokenizer
+        self.usesJSONChatMLToolCalls = family == .maple
 
         let dialect: ChatDialect =
             if Self.specialTokenID(tokenizer, Self.inklingUserMark) != nil {
                 .inkling
             } else if Self.specialTokenID(tokenizer, Self.deepseekUserMark) != nil {
                 .deepseek
+            } else if Self.specialTokenID(tokenizer, Self.glm5GMaskMark) != nil {
+                .glm5
+            } else if family == .minicpm5
+                        || (Self.specialTokenID(tokenizer, Self.miniCPMFunctionOpen) != nil
+                            && Self.specialTokenID(tokenizer, Self.imEndMark) != nil) {
+                // Shares `<|im_end|>` with ChatML; the `<function` special
+                // token is what no Qwen tokenizer carries.
+                .minicpm
             } else if Self.specialTokenID(tokenizer, Self.imEndMark) != nil {
                 .chatml
             } else {
@@ -169,6 +198,8 @@ public struct MFTokenizer: @unchecked Sendable {
         case .chatml: try Self.resolveChatMLTokens(tokenizer, family: family)
         case .deepseek: try Self.resolveDeepseekTokens(tokenizer)
         case .inkling: try Self.resolveInklingTokens(tokenizer)
+        case .minicpm: try Self.resolveMiniCPMTokens(tokenizer)
+        case .glm5: try Self.resolveGlm5Tokens(tokenizer)
         }
 
         self.dialect = dialect
@@ -307,6 +338,54 @@ public struct MFTokenizer: @unchecked Sendable {
     /// generated tokens can never match.
     private static let noSuchTokenID: Int32 = -1
 
+    static let miniCPMFunctionOpen = "<function"
+    static let miniCPMFunctionClose = "</function>"
+
+    /// MiniCPM5 (`openbmb/MiniCPM5-2B`, tokenizer.json `3e065a55…`): `<s>` 0,
+    /// `</s>` 1, `<|im_start|>` 130072, `<|im_end|>` 130073, `<think>` 8 and
+    /// `</think>` 9 (added tokens with `special: false`, still single ids),
+    /// `<function` 18 / `</function>` 19 / `<param` 20, `<tool_response>` 10 /
+    /// `</tool_response>` 11. `config.json` lists two EOS ids, `</s>` and
+    /// `<|im_end|>`; both stop generation. The template prepends `<s>` itself
+    /// (`add_bos_token` is false), so `bosPrefixID` serves raw prompts only.
+    private static func resolveMiniCPMTokens(
+        _ tokenizer: any Tokenizer
+    ) throws -> ResolvedSpecialTokens {
+        func id(_ token: String) throws -> Int32 {
+            guard let value = specialTokenID(tokenizer, token) else {
+                throw MFTokenizerError.missingSpecialToken(token)
+            }
+            return Int32(value)
+        }
+        let bos = try id("<s>")
+        let eos = try id("</s>")
+        _ = try id(Self.imStartMark)
+        let imEnd = try id(Self.imEndMark)
+        let functionOpen = try id(Self.miniCPMFunctionOpen)
+        let functionClose = try id(Self.miniCPMFunctionClose)
+        _ = try id("<param")
+        let toolResponse = try id("<tool_response>")
+        let toolResponseEnd = try id("</tool_response>")
+        let thinkStart = try id("<think>")
+        let thinkEnd = try id("</think>")
+        return ResolvedSpecialTokens(
+            bosID: bos,
+            bosPrefixID: bos,
+            eosID: imEnd,
+            padID: eos,
+            endOfTurnID: imEnd,
+            toolCallStartID: functionOpen,
+            toolCallEndID: functionClose,
+            toolResponseID: toolResponse,
+            toolResponseEndID: toolResponseEnd,
+            channelStartID: thinkStart,
+            channelEndID: thinkEnd,
+            thinkStartID: thinkStart,
+            thinkEndID: thinkEnd,
+            stopTokenIDs: [eos, imEnd],
+            vocabSize: 130_560)
+    }
+
     private static func resolveDeepseekTokens(
         _ tokenizer: any Tokenizer
     ) throws -> ResolvedSpecialTokens {
@@ -345,6 +424,54 @@ public struct MFTokenizer: @unchecked Sendable {
             // The model's padded embedding/lm_head row count — logits buffers
             // use this, mirroring the other dialects.
             vocabSize: 129_280)
+    }
+
+    private static let glm5GMaskMark = "[gMASK]"
+
+    /// GLM-5.3-Flash: `[gMASK]` is the nominal BOS but is never prepended on
+    /// its own — the chat render carries the `[gMASK]<sop>` pair itself and a
+    /// raw prompt gets neither (`bosPrefixID` nil, as ChatML). The assistant
+    /// turn has no closing token of its own: `<|user|>` (the end-of-turn id),
+    /// `<|observation|>` and `<|endoftext|>` all stop generation, matching the
+    /// checkpoint's `generation_config.json`. `<think>` / `</think>` and the
+    /// `<tool_call>` / `<tool_response>` family are added tokens flagged
+    /// non-special; they still arrive as single ids, which the decoder keys on.
+    private static func resolveGlm5Tokens(
+        _ tokenizer: any Tokenizer
+    ) throws -> ResolvedSpecialTokens {
+        func id(_ token: String) throws -> Int32 {
+            guard let value = specialTokenID(tokenizer, token) else {
+                throw MFTokenizerError.missingSpecialToken(token)
+            }
+            return Int32(value)
+        }
+        let gmask = try id(Self.glm5GMaskMark)
+        _ = try id("<sop>")
+        _ = try id(Self.glm5SystemMark)
+        _ = try id(Self.glm5AssistantMark)
+        let eos = try id("<|endoftext|>")
+        let user = try id(Self.glm5UserMark)
+        let observation = try id(Self.glm5ObservationMark)
+        let thinkStart = try id(Self.glm5ThinkOpen)
+        let thinkEnd = try id(Self.glm5ThinkClose)
+        return ResolvedSpecialTokens(
+            bosID: gmask,
+            bosPrefixID: nil,
+            eosID: eos,
+            padID: eos,
+            endOfTurnID: user,
+            toolCallStartID: try id("<tool_call>"),
+            toolCallEndID: try id("</tool_call>"),
+            toolResponseID: try id("<tool_response>"),
+            toolResponseEndID: try id("</tool_response>"),
+            channelStartID: thinkStart,
+            channelEndID: thinkEnd,
+            thinkStartID: thinkStart,
+            thinkEndID: thinkEnd,
+            stopTokenIDs: [eos, user, observation],
+            // The model's padded embedding / lm_head row count (154,880 for
+            // 154,856 tokenizer ids), so logits buffers match the weights.
+            vocabSize: 154_880)
     }
 
     /// Encode UTF-8 text to token IDs. `addBOS = true` prepends `<bos>`.
@@ -398,6 +525,7 @@ public struct MFTokenizer: @unchecked Sendable {
         public let toolCalls: [HistoricalToolCall]
         public let toolCallID: String?
         public let name: String?
+        public let reasoningContent: String?
 
         public init(role: Role, content: String) {
             self.role = role
@@ -405,18 +533,21 @@ public struct MFTokenizer: @unchecked Sendable {
             self.toolCalls = []
             self.toolCallID = nil
             self.name = nil
+            self.reasoningContent = nil
         }
 
         public init(role: Role,
                     content: String?,
                     toolCalls: [HistoricalToolCall] = [],
                     toolCallID: String? = nil,
-                    name: String? = nil) {
+                    name: String? = nil,
+                    reasoningContent: String? = nil) {
             self.role = role
             self.content = content
             self.toolCalls = toolCalls
             self.toolCallID = toolCallID
             self.name = name
+            self.reasoningContent = reasoningContent
         }
     }
 
@@ -426,8 +557,8 @@ public struct MFTokenizer: @unchecked Sendable {
     private static let turnOpen    = "<|turn>"
     private static let turnClose   = "<turn|>"
     private static let bosMark     = "<bos>"
-    private static let imStartMark = "<|im_start|>"
-    private static let imEndMark   = "<|im_end|>"
+    static let imStartMark = "<|im_start|>"
+    static let imEndMark   = "<|im_end|>"
     /// Generation prompt with thinking disabled, matching the Jinja template's
     /// `add_generation_prompt` + `enable_thinking=false` branch.
     private static let chatMLGenerationSuffix =
@@ -502,11 +633,19 @@ public struct MFTokenizer: @unchecked Sendable {
     }
 
     public func applyChatTemplate(_ messages: [Message]) throws -> String {
+        if isSwiftQwen {
+            return decode(try encodeChat(messages: messages), skipSpecialTokens: false)
+        }
         switch dialect {
         case .gemma: return try gemmaChatTemplate(messages)
         case .chatml: return try chatMLChatTemplate(messages)
         case .deepseek: return try deepseekChatTemplate(messages)
         case .inkling: return try inklingChatTemplate(messages)
+        case .minicpm:
+            return try miniCPMRender(messages: messages, tools: [],
+                                     thinking: Self.miniCPMDefaultThinking)
+        case .glm5:
+            return try glm5Render(messages: messages, tools: [])
         }
     }
 
@@ -625,10 +764,28 @@ public struct MFTokenizer: @unchecked Sendable {
     }
 
     public func encodeToolChat(messages: [Message],
-                               tools: [FunctionDefinition]) throws -> [Int32] {
+                               tools: [FunctionDefinition],
+                               reasoningEffort: QwenReasoningEffort? = nil) throws -> [Int32] {
+        guard supportsQwenReasoningEffort || reasoningEffort == nil else {
+            throw MFTokenizerError.unsupportedForDialect("reasoning_effort requires base or Swift Qwen 3.8")
+        }
         // DeepSeek ships no chat_template.jinja; its tool framing is native.
         if dialect == .deepseek {
             return try encodeDeepseekToolChat(messages: messages, tools: tools)
+        }
+        // MiniCPM's template is hand-ported too (its Python-side semantics —
+        // loop-scoped `set`, an undefined `has_tool_sep`, Python `repr` of
+        // parameter values — are exactly what a second Jinja engine would get
+        // subtly wrong); the render is byte-checked against HF fixtures.
+        if dialect == .minicpm {
+            return encode(try miniCPMRender(messages: messages, tools: tools,
+                                            thinking: Self.miniCPMDefaultThinking),
+                          addBOS: false)
+        }
+        // GLM-5.3's template is hand-ported as well (`Glm5ChatTemplate.swift`),
+        // byte-checked against HF renders on the committed fixtures.
+        if dialect == .glm5 {
+            return encode(try glm5Render(messages: messages, tools: tools), addBOS: false)
         }
         guard tokenizer.hasChatTemplate else {
             throw MFTokenizerError.missingToolTemplate
@@ -652,6 +809,7 @@ public struct MFTokenizer: @unchecked Sendable {
             }
             if let toolCallID = message.toolCallID { value["tool_call_id"] = toolCallID }
             if let name = message.name { value["name"] = name }
+            if let reasoning = message.reasoningContent { value["reasoning_content"] = reasoning }
             return value
         }
         let upstreamTools: [ToolSpec] = try tools.map { tool in
@@ -677,7 +835,11 @@ public struct MFTokenizer: @unchecked Sendable {
             truncation: false,
             maxLength: nil,
             tools: upstreamTools,
-            additionalContext: ["enable_thinking": false]
+            additionalContext: usesSourceQwenTemplate(reasoningEffort: reasoningEffort)
+                ? ["enable_thinking": reasoningEffort != .off,
+                   "reasoning_effort": (reasoningEffort ?? .xhigh).rawValue,
+                   "preserve_thinking": true]
+                : ["enable_thinking": false]
         ).map(Int32.init)
     }
 
@@ -865,6 +1027,26 @@ public struct MFTokenizer: @unchecked Sendable {
                 Self.inklingUserMark + Self.inklingContentText + userContent
                     + Self.inklingEndMessage + Self.inklingModelMark,
                 addBOS: false)
+        case .minicpm:
+            // Same shape as the ChatML thinking families: close the cached
+            // assistant turn, open the next user turn, and the generation
+            // prompt. Content untrimmed — the template never trims.
+            let suffix: String
+            switch Self.miniCPMDefaultThinking {
+            case .enabled: suffix = "<think>\n"
+            case .disabled: suffix = "<think>\n\n</think>\n\n"
+            case .unspecified: suffix = ""
+            }
+            return [endOfTurnID] + encode(
+                "\n\(Self.imStartMark)user\n\(userContent)\(Self.imEndMark)\n"
+                    + "\(Self.imStartMark)assistant\n" + suffix,
+                addBOS: false)
+        case .glm5:
+            // The assistant turn has no closing token; `<|user|>` (== the
+            // end-of-turn id) is the separator the full render writes, so the
+            // bridge supplies it, then the user content (untrimmed, as the
+            // template) and the generation prompt.
+            return [endOfTurnID] + encode(userContent + Self.glm5GenerationSuffix, addBOS: false)
         }
     }
 
