@@ -248,6 +248,43 @@ struct ServerPromptCacheTests {
         #expect(cache.entry == nil)
     }
 
+    @Test func partialPrefixMatchReusesCommonTokens() async throws {
+        let tokenizer = try await MFTokenizer.load()
+        let initialTokens = (1...100).map { Int32($0) }
+        let initial = request(messages: [MFTokenizer.Message(role: .user, content: "test")])
+        var cache = ServerPromptCache()
+        cache.publish(
+            domain: domain,
+            request: initial,
+            content: "answer",
+            calls: [],
+            result: rawResult(
+                prompt: initialTokens,
+                kvBacked: initialTokens,
+                boundary: tokenizer.endOfTurnID,
+                reason: .endOfTurn))
+
+        // Continuation shares first 80 tokens, then diverges
+        let continuationTokens = (1...80).map { Int32($0) } + [999, 1000]
+        let continuation = request(messages: [
+            MFTokenizer.Message(role: .user, content: "test"),
+            MFTokenizer.Message(role: .assistant, content: "answer"),
+            MFTokenizer.Message(role: .user, content: "next")
+        ])
+        let match = cache.match(
+            domain: domain,
+            request: continuation,
+            renderedPromptIDs: continuationTokens,
+            tokenizer: tokenizer)
+        switch match {
+        case .hit(let effective, let cached):
+            #expect(cached == 80)
+            #expect(effective == continuationTokens)
+        case .miss:
+            Issue.record("Expected prefix hit for 80 common tokens")
+        }
+    }
+
     private func request(
         messages: [MFTokenizer.Message],
         tools: [MFTokenizer.FunctionDefinition] = []

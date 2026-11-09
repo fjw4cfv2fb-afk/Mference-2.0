@@ -44,6 +44,10 @@ struct ServerPromptCache: Sendable {
         entry = nil
     }
 
+    mutating func restore(_ saved: ServerPromptCacheEntry) {
+        entry = saved
+    }
+
     mutating func publish(
         domain: ServerPromptCacheDomain,
         request: ValidatedChatRequest,
@@ -71,7 +75,7 @@ struct ServerPromptCache: Sendable {
         }
         let assistant = MFTokenizer.Message(
             role: .assistant,
-            content: calls.isEmpty ? content : nil,
+            content: content.isEmpty ? nil : content,
             toolCalls: historicalCalls,
             reasoningContent: reasoningContent)
         entry = ServerPromptCacheEntry(
@@ -91,7 +95,8 @@ struct ServerPromptCache: Sendable {
         domain: ServerPromptCacheDomain,
         request: ValidatedChatRequest,
         renderedPromptIDs: [Int32],
-        tokenizer: MFTokenizer
+        tokenizer: MFTokenizer,
+        rewindablePosition: (Int) -> Int? = { $0 }
     ) -> ServerPromptCacheMatch {
         guard let entry,
               entry.domain == domain,
@@ -110,33 +115,52 @@ struct ServerPromptCache: Sendable {
                 cachedPromptTokens: entry.kvPosition)
         }
 
-        // Source-template effort and preserved reasoning are defined by the
-        // source template. Reuse only an exact rendered prefix; the legacy
-        // hand-written bridge cannot prove equivalence for this checkpoint.
-        guard !tokenizer.isSwiftQwen, request.reasoningEffort == nil,
-              entry.reasoningEffort == nil else { return .miss }
-        let inputCount = entry.inputMessages.count
-        guard request.messages.count > inputCount + 1,
-              request.messages.prefix(inputCount)
+        if !tokenizer.isSwiftQwen,
+           request.reasoningEffort == entry.reasoningEffort {
+            let inputCount = entry.inputMessages.count
+            if request.messages.count > inputCount + 1,
+               request.messages.prefix(inputCount)
                 .elementsEqual(entry.inputMessages),
-              assistantMatches(
+               assistantMatches(
                 request.messages[inputCount],
-                entry.assistantTurn.message) else {
-            return .miss
+                entry.assistantTurn.message) {
+                let continuation = Array(request.messages.dropFirst(inputCount + 1))
+                let contMatch: ServerPromptCacheMatch
+                if entry.assistantTurn.message.toolCalls.isEmpty {
+                    contMatch = matchTextContinuation(
+                        entry: entry,
+                        continuation: continuation,
+                        tokenizer: tokenizer)
+                } else {
+                    contMatch = matchToolContinuation(
+                        entry: entry,
+                        request: request,
+                        continuation: continuation,
+                        tokenizer: tokenizer)
+                }
+                if case .hit = contMatch {
+                    return contMatch
+                }
+            }
         }
-        let continuation = Array(request.messages.dropFirst(inputCount + 1))
 
-        if entry.assistantTurn.message.toolCalls.isEmpty {
-            return matchTextContinuation(
-                entry: entry,
-                continuation: continuation,
-                tokenizer: tokenizer)
+        // Longest common prefix slice: if renderedPromptIDs shares a common prefix of at least
+        // 32 tokens with entry.kvBackedTokenIDs, we can rewind/reuse KV up to a valid checkpoint.
+        let maxCommon = min(renderedPromptIDs.count - 1, entry.kvPosition)
+        var commonPrefix = 0
+        while commonPrefix < maxCommon && renderedPromptIDs[commonPrefix] == entry.kvBackedTokenIDs[commonPrefix] {
+            commonPrefix += 1
         }
-        return matchToolContinuation(
-            entry: entry,
-            request: request,
-            continuation: continuation,
-            tokenizer: tokenizer)
+        if commonPrefix >= 32,
+           let targetPos = rewindablePosition(commonPrefix),
+           targetPos >= 32,
+           targetPos < renderedPromptIDs.count {
+            return .hit(
+                effectivePromptIDs: renderedPromptIDs,
+                cachedPromptTokens: targetPos)
+        }
+
+        return .miss
     }
 
     private func assistantMatches(
@@ -146,16 +170,25 @@ struct ServerPromptCache: Sendable {
         guard incoming.role == .assistant,
               cached.role == .assistant,
               incoming.toolCalls == cached.toolCalls,
-              incoming.reasoningContent == cached.reasoningContent,
               incoming.toolCallID == cached.toolCallID,
               incoming.name == cached.name else {
             return false
         }
-        if !cached.toolCalls.isEmpty {
-            return (incoming.content ?? "").isEmpty
-                && (cached.content ?? "").isEmpty
+        let incomingReasoning = (incoming.reasoningContent ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let cachedReasoning = (cached.reasoningContent ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard incomingReasoning == cachedReasoning || incomingReasoning.isEmpty else {
+            return false
         }
-        return incoming.content == cached.content
+        let incomingContent = (incoming.content ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let cachedContent = (cached.content ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cached.toolCalls.isEmpty {
+            return incomingContent == cachedContent || incomingContent.isEmpty
+        }
+        return incomingContent == cachedContent
     }
 
     private func matchTextContinuation(
@@ -190,7 +223,8 @@ struct ServerPromptCache: Sendable {
         tokenizer: MFTokenizer
     ) -> ServerPromptCacheMatch {
         let calls = entry.assistantTurn.message.toolCalls
-        guard entry.assistantTurn.rawStopReason == .toolCalls,
+        guard (entry.assistantTurn.rawStopReason == .toolCalls
+               || entry.assistantTurn.rawStopReason == .endOfTurn),
               continuation.count == calls.count,
               zip(continuation, calls).allSatisfy({ message, call in
                   message.role == .tool
@@ -205,7 +239,8 @@ struct ServerPromptCache: Sendable {
             cachedMessages: entry.inputMessages,
             assistant: entry.assistantTurn.message,
             incomingMessages: request.messages,
-            tools: request.tools),
+            tools: request.tools,
+            reasoningEffort: request.reasoningEffort),
               bridge.first == entry.uncommittedBoundaryTokenIDs.first else {
             return .miss
         }

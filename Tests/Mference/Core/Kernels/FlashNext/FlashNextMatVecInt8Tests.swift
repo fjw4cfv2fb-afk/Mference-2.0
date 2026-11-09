@@ -146,8 +146,8 @@ import MferenceValidationSupport
     /// tensors are dtype 0 with half the bytes — loading through the INT4 path
     /// unchanged.
     @Test("the stored width is derived from bytes and shape, not from the family",
-          arguments: [(4, 512 * 2560 / 2), (8, 512 * 2560),
-                      (4, 1 * 2560 / 2), (8, 1 * 2560)])
+          arguments: [(4, 655_360), (8, 1_310_720),
+                      (4, 1_280), (8, 2_560)] as [(Int, Int)])
     func packedWidthIsDerivedFromTheEntry(bits: Int, bytes: Int) throws {
         let context = try MetalContext()
         let rows = UInt32(bytes * 8 / bits / 2560)

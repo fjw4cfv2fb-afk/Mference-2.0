@@ -13,6 +13,15 @@ public protocol LogitProducer: AnyObject, Sendable {
 public protocol ContinuableLogitProducer: LogitProducer {
     var continuationPosition: Int { get }
     func prepareForContinuation(expectedPosition: Int) throws
+    func setBasePrefixCheckpointPosition(_ position: Int?)
+    func rewindablePosition(atOrBefore maxPosition: Int) -> Int?
+    func recordContinuationCheckpoint()
+}
+
+extension ContinuableLogitProducer {
+    public func setBasePrefixCheckpointPosition(_ position: Int?) {}
+    public func rewindablePosition(atOrBefore maxPosition: Int) -> Int? { maxPosition }
+    public func recordContinuationCheckpoint() {}
 }
 
 protocol FusedHeadLogitProducer: LogitProducer {

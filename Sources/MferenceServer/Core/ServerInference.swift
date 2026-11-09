@@ -201,8 +201,10 @@ public actor ServerModelSession: ServerLoadedModel {
     public static func load(modelDirectory: URL,
                             maxContext: Int,
                             promptCacheMode: ServerPromptCacheMode = .singlePrefix,
-                            expertCacheSlots: Int = 32) async throws -> ServerModelSession {
-        let family = try ManifestReader.peekFamily(directoryURL: modelDirectory)
+                            expertCacheSlots: Int = 32,
+                            prefillChunkTokens: Int = 128,
+                            verification: ModelIntegrityPolicy = .fullSha256) async throws -> ServerModelSession {
+        _ = try ManifestReader.peekFamily(directoryURL: modelDirectory)
         let tokenizerFolder = MFTokenizer.tokenizerFolder(forModelDirectory: modelDirectory)
         guard let tokenizerFolder else {
             throw MFTokenizerError.missingToolTemplate
@@ -231,13 +233,14 @@ public actor ServerModelSession: ServerLoadedModel {
         let configSlots = expertCacheSlots
         let runtime = RuntimeConfiguration(
             expertCacheSlots: configSlots,
+            prefillChunkTokens: prefillChunkTokens,
             forceLogitsHead: true)
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
             streamingMode: streamingMode,
             expertCachePolicy: runtime.modelExpertCachePolicy,
-            integrityPolicy: .fullSha256)
+            integrityPolicy: verification)
         let forwardRuntime = try ForwardRunnerFactory.make(model: model,
                                                             context: context,
                                                             maxContext: maxContext,
@@ -336,11 +339,17 @@ public actor ServerModelSession: ServerLoadedModel {
         let request = prepared.request
         let needsToolTemplate = prepared.needsToolTemplate
         let promptIDs = prepared.promptIDs
+        let savedEntry = promptCache.entry
         var completed = false
         defer {
             if !completed {
-                promptCache.invalidate()
-                runner.reset()
+                if let savedEntry,
+                   (try? runner.prepareForContinuation(expectedPosition: savedEntry.kvPosition)) != nil {
+                    promptCache.restore(savedEntry)
+                } else {
+                    promptCache.invalidate()
+                    runner.reset()
+                }
             }
         }
 
@@ -351,19 +360,30 @@ public actor ServerModelSession: ServerLoadedModel {
                 domain: promptCacheDomain,
                 request: request,
                 renderedPromptIDs: promptIDs,
-                tokenizer: tokenizer) {
+                tokenizer: tokenizer,
+                rewindablePosition: { runner.rewindablePosition(atOrBefore: $0) }) {
             case .miss:
                 promptCache.invalidate()
                 effectivePromptIDs = promptIDs
                 completionStart = .reset
+                let eot = tokenizer.endOfTurnID
+                if let firstEotIdx = effectivePromptIDs.firstIndex(of: eot),
+                   firstEotIdx + 1 >= 32,
+                   firstEotIdx + 1 < effectivePromptIDs.count {
+                    runner.setBasePrefixCheckpointPosition(firstEotIdx + 1)
+                } else {
+                    runner.setBasePrefixCheckpointPosition(nil)
+                }
             case .hit(let effective, let cached):
                 effectivePromptIDs = effective
                 completionStart = .resume(cachedPromptTokens: cached)
+                runner.setBasePrefixCheckpointPosition(nil)
             }
         } else {
             promptCache.invalidate()
             effectivePromptIDs = promptIDs
             completionStart = .reset
+            runner.setBasePrefixCheckpointPosition(nil)
         }
         guard effectivePromptIDs.count < maxContext else {
             throw ServerRequestError.invalid(

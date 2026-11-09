@@ -715,6 +715,42 @@ struct ServerArgumentTests {
         #expect(arguments.maxContext == 16_384)
         #expect(arguments.queueLimit == 4)
         #expect(arguments.promptCacheMode == .singlePrefix)
+        #expect(arguments.expertCacheSlots == 32)
+        #expect(arguments.prefillChunkTokens == 128)
+        #expect(arguments.verification == .fullSha256)
+    }
+
+    @Test func parsesPrefillChunkTokens() throws {
+        let args = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--prefill-chunk", "2048",
+        ])
+        #expect(args.prefillChunkTokens == 2048)
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--prefill-chunk", "100",
+            ])
+        }
+    }
+
+    @Test func parsesVerificationPolicy() throws {
+        let trusted = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--verify", "trusted-receipt",
+        ])
+        #expect(trusted.verification == .sizeCheckTrustedReceipt)
+        let full = try ServerArguments.parse([
+            "--model", "model.gturbo",
+            "--verify", "full-sha256",
+        ])
+        #expect(full.verification == .fullSha256)
+        #expect(throws: ServerArgumentError.self) {
+            try ServerArguments.parse([
+                "--model", "model.gturbo",
+                "--verify", "fast",
+            ])
+        }
     }
 
     @Test func parsesAndAdvertises128KContext() throws {

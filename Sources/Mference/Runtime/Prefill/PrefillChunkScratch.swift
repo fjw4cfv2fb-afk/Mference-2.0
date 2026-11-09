@@ -48,7 +48,8 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
 
     init(config: ArchConfig, runtime: PrefillRuntimeConfig) {
         self.init(config: config,
-                  chunkTokens: runtime.chunkTokens)
+                  chunkTokens: runtime.chunkTokens,
+                  routedPairMicrobatchRows: max(32, min(128, runtime.chunkTokens)))
     }
 
     var hiddenElements: Int { chunkTokens * hiddenSize }
@@ -80,7 +81,9 @@ struct PrefillChunkScratchLayout: Sendable, Equatable {
     var sharedExpertScratchElements: Int {
         (sharedScalarGateElements > 0 ? chunkTokens : 1) * sharedIntermediate
     }
-    var routedGateUpActElements: Int { 3 * routedPairMicrobatchRows * routedIntermediate }
+    var routedGateUpActElements: Int {
+        3 * routedPairMicrobatchRows * routedIntermediate
+    }
     var routedDownOutputElements: Int { routedPairMicrobatchRows * hiddenSize }
 
     var devicePrivateBytes: Int {

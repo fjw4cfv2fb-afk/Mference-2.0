@@ -250,6 +250,8 @@ public func runRawCompletion(producer: any LogitProducer,
         uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
     }
 
+    (producer as? any ContinuableLogitProducer)?.recordContinuationCheckpoint()
+
     return RawDecodeResult(prefillTokens: promptIds.count,
                            cachedPromptTokens: cachedPromptTokens,
                            computedPrefillTokens: computedPrefillTokens,

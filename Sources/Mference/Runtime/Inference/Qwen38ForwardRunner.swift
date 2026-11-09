@@ -534,9 +534,12 @@ public final class Qwen38ForwardRunner: ContinuableLogitProducer, ContextWindowR
         // consumed stream; the speculator rewinds the KV/GDN state when the
         // requested cursor falls inside its last verify span.
         if let mtp { try mtp.prepareForContinuation(expectedPosition: expectedPosition) }
-        guard expectedPosition > 0, expectedPosition == kv.position else {
+        guard expectedPosition > 0, expectedPosition <= kv.position else {
             throw PrefillError.prefillCursorMismatch(
-                "Qwen 3.8 continuation cursor \(expectedPosition) does not match \(kv.position)")
+                "Qwen 3.8 continuation cursor \(expectedPosition) must be <= \(kv.position)")
+        }
+        if kv.position > expectedPosition {
+            kv.rewind(to: expectedPosition)
         }
     }
 

@@ -547,6 +547,58 @@ static inline float prefill_moe_int4_gemv_row_dev(
     return acc;
 }
 
+static inline float2 prefill_moe_int4_gate_up_row_dev(
+    device const uint8_t* gate_W,
+    device const bfloat* gate_S,
+    device const bfloat* gate_B,
+    device const uint8_t* up_W,
+    device const bfloat* up_S,
+    device const bfloat* up_B,
+    device const half* x,
+    uint row,
+    uint N
+) {
+    const uint groups = N / kPrefillGroupSize;
+    const uint row_bytes = N / 2u;
+    device const uint8_t* gate_W_row = gate_W + row * row_bytes;
+    device const bfloat* gate_s_row = gate_S + row * groups;
+    device const bfloat* gate_b_row = gate_B + row * groups;
+    device const uint8_t* up_W_row = up_W + row * row_bytes;
+    device const bfloat* up_s_row = up_S + row * groups;
+    device const bfloat* up_b_row = up_B + row * groups;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (uint g = 0; g < groups; ++g) {
+        const float gate_scale = float(gate_s_row[g]);
+        const float gate_bias = float(gate_b_row[g]);
+        const float up_scale = float(up_s_row[g]);
+        const float up_bias = float(up_b_row[g]);
+        device const uint8_t* gate_Wg = gate_W_row + g * (kPrefillGroupSize / 2u);
+        device const uint8_t* up_Wg = up_W_row + g * (kPrefillGroupSize / 2u);
+        device const half* xg = x + g * kPrefillGroupSize;
+        float gate_dot = 0.0f;
+        float up_dot = 0.0f;
+        float sum_x = 0.0f;
+        for (uint k = 0; k < kPrefillGroupSize / 2u; ++k) {
+            const uint8_t gate_packed = gate_Wg[k];
+            const uint8_t up_packed = up_Wg[k];
+            const float x0 = float(xg[2u * k]);
+            const float x1 = float(xg[2u * k + 1u]);
+            gate_dot = fma(float(uint(gate_packed & 0x0Fu)), x0, gate_dot);
+            gate_dot = fma(float(uint(gate_packed >> 4)), x1, gate_dot);
+            up_dot = fma(float(uint(up_packed & 0x0Fu)), x0, up_dot);
+            up_dot = fma(float(uint(up_packed >> 4)), x1, up_dot);
+            sum_x += x0 + x1;
+        }
+        gate_acc = fma(gate_scale, gate_dot, gate_acc);
+        gate_acc = fma(gate_bias, sum_x, gate_acc);
+        up_acc = fma(up_scale, up_dot, up_acc);
+        up_acc = fma(up_bias, sum_x, up_acc);
+    }
+    return float2(gate_acc, up_acc);
+}
+
 static inline float prefill_moe_int4_gemv_row_tg(
     device const uint8_t* W,
     device const bfloat* S,
@@ -754,16 +806,16 @@ kernel void inkling_prefill_expert_act(
 
     device const half* x = hidden
         + uint(pair_tokens[p.pair_start + t]) * p.hidden_stride;
-    const float gate = prefill_moe_int4_gemv_row_dev(
+    const float2 gate_up = prefill_moe_int4_gate_up_row_dev(
         expert + p.gate_W_off,
         reinterpret_cast<device const bfloat*>(expert + p.gate_s_off),
         reinterpret_cast<device const bfloat*>(expert + p.gate_b_off),
-        x, f, p.d);
-    const float up = prefill_moe_int4_gemv_row_dev(
         expert + p.up_W_off,
         reinterpret_cast<device const bfloat*>(expert + p.up_s_off),
         reinterpret_cast<device const bfloat*>(expert + p.up_b_off),
         x, f, p.d);
+    const float gate = gate_up.x;
+    const float up = gate_up.y;
     // Round gate and up to FP16 *before* combining. The per-token path this
     // replaces stored both GEMV results to FP16 scratch and `silu_mul_fp16`
     // read them back, so keeping the same two roundings keeps prefill's
@@ -828,14 +880,12 @@ kernel void prefill_grouped_routed_moe_batched_phase1(
     device const bfloat* up_s = reinterpret_cast<device const bfloat*>(expert + p.up_s_off);
     device const bfloat* up_b = reinterpret_cast<device const bfloat*>(expert + p.up_b_off);
 
-    const float gate = prefill_moe_int4_gemv_row_dev(gate_W, gate_s, gate_b, x, f, p.D);
-    const float up = prefill_moe_int4_gemv_row_dev(up_W, up_s, up_b, x, f, p.D);
+    const float2 gate_up = prefill_moe_int4_gate_up_row_dev(
+        gate_W, gate_s, gate_b, up_W, up_s, up_b, x, f, p.D);
     const uint row_elements = p.pair_count * p.F;
     const uint index = pair_local * p.F + f;
-    gate_up_act_scratch[index] = half(gate);
-    gate_up_act_scratch[row_elements + index] = half(up);
     gate_up_act_scratch[2u * row_elements + index] =
-        half(prefill_hidden_activation(gate) * up);
+        half(prefill_hidden_activation(gate_up.x) * gate_up.y);
 }
 
 kernel void prefill_grouped_routed_moe_batched_down(
@@ -847,6 +897,7 @@ kernel void prefill_grouped_routed_moe_batched_down(
     constant PrefillGroupedRoutedMoEStreamedParamsMSL&   p                    [[buffer(10)]],
     uint2                                                gid                  [[thread_position_in_grid]]
 ) {
+    (void)down_scratch;
     const uint d = gid.x;
     const uint pair_local = gid.y;
     if (d >= p.D || pair_local >= p.pair_count) return;
@@ -867,7 +918,6 @@ kernel void prefill_grouped_routed_moe_batched_down(
     device const bfloat* down_b = reinterpret_cast<device const bfloat*>(expert + p.down_b_off);
     device const half* act = gate_up_act_scratch + 2u * p.pair_count * p.F + pair_local * p.F;
     const half value = half(prefill_moe_int4_gemv_row_dev(down_W, down_s, down_b, act, d, p.F));
-    down_scratch[pair_local * p.D + d] = value;
     route_partials[(pair.token * p.top_k + pair.rank) * p.D + d] = value;
 }
 
@@ -884,13 +934,15 @@ kernel void prefill_grouped_routed_moe_resident_phase1(
     const PrefillTokenExpertPairMSL pair = pairs[gid.y];
     device const uint8_t* expert = slab + ulong(pair.expert) * ulong(stride);
     device const half* x = hidden + pair.token * p.hidden_stride_elements;
-    const float gate = prefill_moe_int4_gemv_row_dev(expert + p.gate_W_off,
+    const float2 gate_up = prefill_moe_int4_gate_up_row_dev(
+        expert + p.gate_W_off,
         reinterpret_cast<device const bfloat*>(expert + p.gate_s_off),
-        reinterpret_cast<device const bfloat*>(expert + p.gate_b_off), x, gid.x, p.D);
-    const float up = prefill_moe_int4_gemv_row_dev(expert + p.up_W_off,
+        reinterpret_cast<device const bfloat*>(expert + p.gate_b_off),
+        expert + p.up_W_off,
         reinterpret_cast<device const bfloat*>(expert + p.up_s_off),
-        reinterpret_cast<device const bfloat*>(expert + p.up_b_off), x, gid.x, p.D);
-    act[gid.y * p.F + gid.x] = half(prefill_hidden_activation(gate) * up);
+        reinterpret_cast<device const bfloat*>(expert + p.up_b_off),
+        x, gid.x, p.D);
+    act[gid.y * p.F + gid.x] = half(prefill_hidden_activation(gate_up.x) * gate_up.y);
 }
 
 kernel void prefill_grouped_routed_moe_resident_down(
@@ -1427,6 +1479,281 @@ kernel void attention_prefill_full_tensorops_2d_validity_v2(
     attention_prefill_full_tensorops_2d_validity_v2_impl(
         Q, K, V, O, p, tg, lid, threads3.x,
         query_tile, score_tile, weight_tile,
+        row_max, row_sum, row_old_scale);
+}
+
+constant constexpr int kPrefillTensorOpsHd256QueryTokens = 4;
+constant constexpr int kPrefillTensorOpsHd256QHeadsPerKV = 8;
+constant constexpr int kPrefillTensorOpsHd256Outputs =
+    kPrefillTensorOpsHd256QueryTokens * kPrefillTensorOpsHd256QHeadsPerKV;
+constant constexpr int kPrefillTensorOpsHd256Keys = 64;
+constant constexpr int kPrefillTensorOpsHd256HeadDim = 256;
+
+static inline void attention_prefill_full_tensorops_2d_validity_v2_hd256_impl(
+    device const half* Q,
+    device half* K,
+    device half* V,
+    device half* O,
+    constant PrefillAttentionParams& p,
+    uint3 tg,
+    uint lid,
+    uint threads,
+    threadgroup half* query_tile,
+    threadgroup float* score_weight_tile,
+    threadgroup float* row_max,
+    threadgroup float* row_sum,
+    threadgroup float* row_old_scale
+) {
+    constexpr auto qk_desc = matmul2d_descriptor(
+        kPrefillTensorOpsHd256Outputs,
+        kPrefillTensorOpsHd256Keys,
+        kPrefillTensorOpsHd256HeadDim,
+        false, true, false);
+    constexpr auto pv_desc = matmul2d_descriptor(
+        kPrefillTensorOpsHd256Outputs,
+        kPrefillTensorOpsHd256HeadDim,
+        kPrefillTensorOpsHd256Keys,
+        false, false, false);
+    matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+
+    using device_half_tensor =
+        tensor<device half, dextents<int32_t, 2>, tensor_inline>;
+    using threadgroup_half_tensor =
+        tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>;
+    using threadgroup_float_tensor =
+        tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+
+    const uint query_start = tg.x * uint(kPrefillTensorOpsHd256QueryTokens);
+    const uint qh_start = tg.y * uint(kPrefillTensorOpsHd256QHeadsPerKV);
+    const uint q_per_kv = p.numQHeads / p.numKVHeads;
+    const uint kvh = qh_start / q_per_kv;
+
+    for (uint linear = lid;
+         linear < uint(kPrefillTensorOpsHd256Outputs * kPrefillTensorOpsHd256HeadDim);
+         linear += threads) {
+        const uint output_row =
+            linear / uint(kPrefillTensorOpsHd256HeadDim);
+        const uint d = linear % uint(kPrefillTensorOpsHd256HeadDim);
+        const uint q_local = output_row / uint(kPrefillTensorOpsHd256QHeadsPerKV);
+        const uint qh_local = output_row % uint(kPrefillTensorOpsHd256QHeadsPerKV);
+        const uint query_idx = query_start + q_local;
+        if (query_idx < p.queryCount) {
+            query_tile[linear] = Q[
+                query_idx * p.qTokenStrideElements
+                + (qh_start + qh_local) * uint(kPrefillTensorOpsHd256HeadDim)
+                + d];
+        } else {
+            query_tile[linear] = half(0.0f);
+        }
+    }
+    if (lid < uint(kPrefillTensorOpsHd256Outputs)) {
+        row_max[lid] = -INFINITY;
+        row_sum[lid] = 0.0f;
+        row_old_scale[lid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup_half_tensor query_tensor(
+        query_tile,
+        dextents<int32_t, 2>(
+            kPrefillTensorOpsHd256HeadDim,
+            kPrefillTensorOpsHd256Outputs),
+        array<int32_t, 2>({1, kPrefillTensorOpsHd256HeadDim}));
+    threadgroup_float_tensor weight_tensor(
+        score_weight_tile,
+        dextents<int32_t, 2>(
+            kPrefillTensorOpsHd256Keys,
+            kPrefillTensorOpsHd256Outputs),
+        array<int32_t, 2>({1, kPrefillTensorOpsHd256Keys}));
+    device_half_tensor key_tensor(
+        K + kvh * uint(kPrefillTensorOpsHd256HeadDim),
+        dextents<int32_t, 2>(
+            kPrefillTensorOpsHd256HeadDim,
+            int32_t(p.kvValidCount)),
+        array<int32_t, 2>({1, int32_t(p.kvTokenStrideElements)}));
+    device_half_tensor value_tensor(
+        V + kvh * uint(kPrefillTensorOpsHd256HeadDim),
+        dextents<int32_t, 2>(
+            kPrefillTensorOpsHd256HeadDim,
+            int32_t(p.kvValidCount)),
+        array<int32_t, 2>({1, int32_t(p.kvTokenStrideElements)}));
+
+    auto query_slice = query_tensor.slice(0, 0);
+    auto first_value_slice = value_tensor.slice(0, 0);
+    auto output_accumulator =
+        pv_op.get_destination_cooperative_tensor<
+            decltype(weight_tensor), decltype(first_value_slice), float>();
+    #pragma clang loop unroll(full)
+    for (int element = 0;
+         element < output_accumulator.get_capacity();
+         ++element) {
+        if (output_accumulator.is_valid_element(element)) {
+            output_accumulator[element] = 0.0f;
+        }
+    }
+
+    const uint max_valid_query_end =
+        min(p.queryCount, query_start + uint(kPrefillTensorOpsHd256QueryTokens));
+    const uint last = max_valid_query_end > query_start
+        ? min(p.kvValidCount, p.startPosition + max_valid_query_end)
+        : 0u;
+    for (uint key_start = 0u;
+         key_start < last;
+         key_start += uint(kPrefillTensorOpsHd256Keys)) {
+        auto key_slice = key_tensor.slice(0, int32_t(key_start));
+        auto score_product =
+            qk_op.get_destination_cooperative_tensor<
+                decltype(query_slice), decltype(key_slice), float>();
+        #pragma clang loop unroll(full)
+        for (int element = 0;
+             element < score_product.get_capacity();
+             ++element) {
+            if (score_product.is_valid_element(element)) {
+                score_product[element] = 0.0f;
+            }
+        }
+        qk_op.run(query_slice, key_slice, score_product);
+
+        #pragma clang loop unroll(full)
+        for (int element = 0;
+             element < score_product.get_capacity();
+             ++element) {
+            if (!score_product.is_valid_element(element)) continue;
+            const auto position =
+                score_product.get_multidimensional_index(element);
+            const uint key_column = uint(position[0]);
+            const uint output_row = uint(position[1]);
+            score_weight_tile[
+                output_row * uint(kPrefillTensorOpsHd256Keys) + key_column] =
+                score_product[element] * p.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (lid < uint(kPrefillTensorOpsHd256Outputs)) {
+            const uint output_row = lid;
+            const uint q_local =
+                output_row / uint(kPrefillTensorOpsHd256QHeadsPerKV);
+            const uint query_idx = query_start + q_local;
+            const uint causal_last = query_idx < p.queryCount
+                ? min(p.kvValidCount, p.startPosition + query_idx + 1u)
+                : 0u;
+            const uint visible =
+                causal_last > key_start
+                    ? min(uint(kPrefillTensorOpsHd256Keys), causal_last - key_start)
+                    : 0u;
+
+            float tile_max = -INFINITY;
+            for (uint key = 0u; key < visible; ++key) {
+                tile_max = max(
+                    tile_max,
+                    score_weight_tile[
+                        output_row * uint(kPrefillTensorOpsHd256Keys) + key]);
+            }
+            const float next_max = max(row_max[output_row], tile_max);
+            const float old_scale = row_sum[output_row] > 0.0f
+                ? fast::exp(row_max[output_row] - next_max)
+                : 0.0f;
+            float tile_sum = 0.0f;
+            for (uint key = 0u;
+                 key < uint(kPrefillTensorOpsHd256Keys);
+                 ++key) {
+                const float weight = key < visible
+                    ? fast::exp(
+                        score_weight_tile[
+                            output_row * uint(kPrefillTensorOpsHd256Keys) + key]
+                        - next_max)
+                    : 0.0f;
+                score_weight_tile[
+                    output_row * uint(kPrefillTensorOpsHd256Keys) + key] = weight;
+                tile_sum += weight;
+            }
+            row_old_scale[output_row] = old_scale;
+            row_sum[output_row] =
+                row_sum[output_row] * old_scale + tile_sum;
+            row_max[output_row] = next_max;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto value_slice = value_tensor.slice(0, int32_t(key_start));
+        auto output_product =
+            pv_op.get_destination_cooperative_tensor<
+                decltype(weight_tensor), decltype(value_slice), float>();
+        #pragma clang loop unroll(full)
+        for (int element = 0;
+             element < output_product.get_capacity();
+             ++element) {
+            if (output_product.is_valid_element(element)) {
+                output_product[element] = 0.0f;
+            }
+        }
+        pv_op.run(weight_tensor, value_slice, output_product);
+        #pragma clang loop unroll(full)
+        for (int element = 0;
+             element < output_accumulator.get_capacity();
+             ++element) {
+            if (!output_accumulator.is_valid_element(element)
+                || !output_product.is_valid_element(element)) {
+                continue;
+            }
+            const auto position =
+                output_accumulator.get_multidimensional_index(element);
+            const uint output_row = uint(position[1]);
+            output_accumulator[element] =
+                fma(
+                    1.0f,
+                    output_product[element],
+                    output_accumulator[element] * row_old_scale[output_row]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma clang loop unroll(full)
+    for (int element = 0;
+         element < output_accumulator.get_capacity();
+         ++element) {
+        if (!output_accumulator.is_valid_element(element)) continue;
+        const auto position =
+            output_accumulator.get_multidimensional_index(element);
+        const uint d = uint(position[0]);
+        const uint output_row = uint(position[1]);
+        const uint q_local =
+            output_row / uint(kPrefillTensorOpsHd256QHeadsPerKV);
+        const uint qh_local =
+            output_row % uint(kPrefillTensorOpsHd256QHeadsPerKV);
+        const uint query_idx = query_start + q_local;
+        if (query_idx < p.queryCount) {
+            const float denominator = row_sum[output_row];
+            O[
+                query_idx * p.oTokenStrideElements
+                + (qh_start + qh_local) * uint(kPrefillTensorOpsHd256HeadDim)
+                + d] = denominator > 0.0f
+                    ? half(output_accumulator[element] / denominator)
+                    : half(0.0f);
+        }
+    }
+}
+
+kernel void attention_prefill_full_tensorops_2d_validity_v2_hd256(
+    device const half* Q [[buffer(0)]],
+    device half* K [[buffer(1)]],
+    device half* V [[buffer(2)]],
+    device half* O [[buffer(3)]],
+    constant PrefillAttentionParams& p [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint3 threads3 [[threads_per_threadgroup]]
+) {
+    threadgroup half query_tile[
+        kPrefillTensorOpsHd256Outputs * kPrefillTensorOpsHd256HeadDim];
+    threadgroup float score_weight_tile[
+        kPrefillTensorOpsHd256Outputs * kPrefillTensorOpsHd256Keys];
+    threadgroup float row_max[kPrefillTensorOpsHd256Outputs];
+    threadgroup float row_sum[kPrefillTensorOpsHd256Outputs];
+    threadgroup float row_old_scale[kPrefillTensorOpsHd256Outputs];
+    attention_prefill_full_tensorops_2d_validity_v2_hd256_impl(
+        Q, K, V, O, p, tg, lid, threads3.x,
+        query_tile, score_weight_tile,
         row_max, row_sum, row_old_scale);
 }
 

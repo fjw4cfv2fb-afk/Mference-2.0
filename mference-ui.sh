@@ -18,6 +18,8 @@ server_port=8080
 webui_port=3000
 max_context=16384
 prompt_cache_mode=single-prefix
+prefill_chunk=""
+verify_mode=""
 preload_model=""
 library_roots=()
 dry_run=0
@@ -59,6 +61,9 @@ usage: ./mference-ui.sh [options]                      start the UI
                          Use a separate directory for isolated release tests.
   --prompt-cache-mode <off|single-prefix>
                          Passed through to MferenceServer.
+  --prefill-chunk <tokens>
+                         Prefill chunk size (e.g. 2048). Passed to MferenceServer.
+  --verify <mode>        Model verification: full-sha256 or trusted-receipt.
   --dry-run              Print what would run, start nothing, exit 0. Works
                          for every subcommand, before or after it.
   --help                 Show this message.
@@ -96,6 +101,8 @@ while [[ $# -gt 0 ]]; do
     --build-path) require_value "$@"; build_path="$2"; shift 2 ;;
     --data-dir) require_value "$@"; data_directory="$2"; shift 2 ;;
     --prompt-cache-mode) require_value "$@"; prompt_cache_mode="$2"; shift 2 ;;
+    --prefill-chunk) require_value "$@"; prefill_chunk="$2"; shift 2 ;;
+    --verify) require_value "$@"; verify_mode="$2"; shift 2 ;;
     --dry-run) dry_run=1; shift ;;
     --help|-h) usage; exit 0 ;;
     *) note "error: unknown option $1"; usage >&2; exit 2 ;;
@@ -125,6 +132,12 @@ server_arguments=(
   --max-context "$max_context"
   --prompt-cache-mode "$prompt_cache_mode"
 )
+if [[ -n "$prefill_chunk" ]]; then
+  server_arguments+=(--prefill-chunk "$prefill_chunk")
+fi
+if [[ -n "$verify_mode" ]]; then
+  server_arguments+=(--verify "$verify_mode")
+fi
 if [[ ${#library_roots[@]} -eq 0 ]]; then
   server_arguments+=(--library)
 else

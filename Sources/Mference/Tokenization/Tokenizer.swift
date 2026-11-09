@@ -839,7 +839,8 @@ public struct MFTokenizer: @unchecked Sendable {
                 ? ["enable_thinking": reasoningEffort != .off,
                    "reasoning_effort": (reasoningEffort ?? .xhigh).rawValue,
                    "preserve_thinking": true]
-                : ["enable_thinking": false]
+                : ["enable_thinking": false,
+                   "preserve_thinking": true]
         ).map(Int32.init)
     }
 
@@ -1054,14 +1055,26 @@ public struct MFTokenizer: @unchecked Sendable {
         cachedMessages: [Message],
         assistant: Message,
         incomingMessages: [Message],
-        tools: [FunctionDefinition]
+        tools: [FunctionDefinition],
+        reasoningEffort: QwenReasoningEffort? = nil
     ) throws -> [Int32] {
-        // The ChatML template's `<think>` stripping depends on each assistant
-        // turn's position relative to the last user query, so a re-rendered
-        // prefix is not guaranteed to be a token prefix of the full render.
-        // DeepSeek merges tool results into user turns rather than keying on
-        // special tokens, so the boundary search below has nothing to anchor
-        // on. Callers (ServerPromptCache) fall back to prefix matching.
+        if dialect == .chatml {
+            let full = try encodeToolChat(
+                messages: incomingMessages,
+                tools: tools,
+                reasoningEffort: reasoningEffort)
+            guard let callEnd = full.lastIndex(of: toolCallEndID),
+                  callEnd + 1 < full.count else {
+                throw MFTokenizerError.invalidChatTemplate(
+                    "cached assistant tool-call boundary is missing")
+            }
+            let suffix = Array(full[(callEnd + 1)...])
+            guard suffix.first == endOfTurnID else {
+                throw MFTokenizerError.invalidChatTemplate(
+                    "tool-result continuation does not begin at the KV boundary")
+            }
+            return suffix
+        }
         guard dialect == .gemma else {
             throw MFTokenizerError.unsupportedForDialect("tool-result KV continuation")
         }

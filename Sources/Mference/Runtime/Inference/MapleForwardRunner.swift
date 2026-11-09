@@ -212,9 +212,12 @@ public final class MapleForwardRunner: ContinuableLogitProducer, ContextWindowRe
 
     public func prepareForContinuation(expectedPosition: Int) throws {
         try prefillChunkState.requireClean(operation: "prepareForContinuation")
-        guard expectedPosition > 0, expectedPosition == kv.position else {
+        guard expectedPosition > 0, expectedPosition <= kv.position else {
             throw PrefillError.prefillCursorMismatch(
-                "Maple continuation cursor \(expectedPosition) does not match \(kv.position)")
+                "Maple continuation cursor \(expectedPosition) must be <= \(kv.position)")
+        }
+        if kv.position > expectedPosition {
+            kv.rewind(to: expectedPosition)
         }
     }
 

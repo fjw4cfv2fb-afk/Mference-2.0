@@ -19,26 +19,26 @@ final class Elementwise {
 
     /// packed [H, 2D] per-head [query ; gate] → q [H, D], gate [H, D].
     /// `rows` > 1 processes consecutive token rows (packed stride 2*H*D,
-    /// output strides H*D).
+    /// output strides H*D) in a single dispatch over `rows * heads` logical heads.
     func encodeSplitQGate(commandBuffer: MTLCommandBuffer,
                           packed: MTLBuffer, packedOffset: Int = 0,
                           q: MTLBuffer, qOffset: Int = 0,
                           gate: MTLBuffer, gateOffset: Int = 0,
                           heads: Int, dim: Int, rows: Int = 1) {
-        let rowElems = heads * dim
-        for row in 0..<rows {
-            guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-            encoder.setComputePipelineState(splitQGatePSO)
-            encoder.setBuffer(packed, offset: packedOffset + row * 2 * rowElems * 2, index: 0)
-            encoder.setBuffer(q, offset: qOffset + row * rowElems * 2, index: 1)
-            encoder.setBuffer(gate, offset: gateOffset + row * rowElems * 2, index: 2)
-            var headCount = UInt32(heads)
-            var headDim = UInt32(dim)
-            encoder.setBytes(&headCount, length: MemoryLayout<UInt32>.size, index: 3)
-            encoder.setBytes(&headDim, length: MemoryLayout<UInt32>.size, index: 4)
-            dispatch(encoder, pipeline: splitQGatePSO, threads: rowElems)
-            encoder.endEncoding()
-        }
+        guard rows > 0, heads > 0, dim > 0 else { return }
+        let totalHeads = rows * heads
+        let totalElems = totalHeads * dim
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(splitQGatePSO)
+        encoder.setBuffer(packed, offset: packedOffset, index: 0)
+        encoder.setBuffer(q, offset: qOffset, index: 1)
+        encoder.setBuffer(gate, offset: gateOffset, index: 2)
+        var headCount = UInt32(totalHeads)
+        var headDim = UInt32(dim)
+        encoder.setBytes(&headCount, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&headDim, length: MemoryLayout<UInt32>.size, index: 4)
+        dispatch(encoder, pipeline: splitQGatePSO, threads: totalElems)
+        encoder.endEncoding()
     }
 
     /// out[i] *= sigmoid(gate[i])

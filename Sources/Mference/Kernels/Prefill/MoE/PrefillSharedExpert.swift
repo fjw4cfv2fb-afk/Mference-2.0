@@ -112,7 +112,7 @@ final class PrefillSharedExpert {
         let halfBytes = MemoryLayout<Float16>.stride
         let batchIntermediateBytes = queryCount * intermediate * halfBytes
         let canBatchInt4 = weightBits == 4
-            && queryCount >= MPPPrefillInt4QMM.tileN
+            && queryCount >= 8
             && tensorOpsInt4.isAvailable
             && xStrideElements == d
             && yStrideElements == d

@@ -402,9 +402,12 @@ public final class MiniCPM5ForwardRunner: ContinuableLogitProducer, ContextWindo
 
     public func prepareForContinuation(expectedPosition: Int) throws {
         try prefillChunkState.requireClean(operation: "prepareForContinuation")
-        guard expectedPosition > 0, expectedPosition == kv.position else {
+        guard expectedPosition > 0, expectedPosition <= kv.position else {
             throw PrefillError.prefillCursorMismatch(
-                "MiniCPM5 continuation cursor \(expectedPosition) does not match \(kv.position)")
+                "MiniCPM5 continuation cursor \(expectedPosition) must be <= \(kv.position)")
+        }
+        if kv.position > expectedPosition {
+            kv.rewind(to: expectedPosition)
         }
     }
 

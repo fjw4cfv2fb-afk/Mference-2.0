@@ -25,6 +25,107 @@ import MferenceValidationSupport
                                      seed: 0x714D_F211)
     }
 
+    @Test func fusedQwenGatedQKVEpilogue_matchesLegacyChainBitwise() throws {
+        var rng = SplitMix64(seed: 0x714D_9999)
+        let numQHeads = 16
+        let numKVHeads = 2
+        let headDim = 256
+        let rotaryDim: UInt32 = 64
+        let position: UInt32 = 29
+        let theta: Float = 10_000_000.0
+        let qCount = numQHeads * headDim
+        let kvCount = numKVHeads * headDim
+        let qPacked = (0..<(2 * qCount)).map { _ in Float16(rng.uniform(-1.0, 1.0)) }
+        let k = (0..<kvCount).map { _ in Float16(rng.uniform(-1.0, 1.0)) }
+        let qWeight = (0..<headDim).map { _ in Quantization.bf16Bits(rng.uniform(0.5, 1.5)) }
+        let kWeight = (0..<headDim).map { _ in Quantization.bf16Bits(rng.uniform(0.5, 1.5)) }
+
+        let ctx = try MetalContext()
+        let elementwise = try Elementwise(context: ctx)
+        let rms = try RMSNorm(context: ctx)
+        let rope = try RoPE(context: ctx)
+        let fused = try FusedQKVEpilogue(context: ctx)
+
+        guard
+            let qPackedBuf = ctx.device.makeBuffer(bytes: qPacked, length: Self.bytes(2 * qCount), options: .storageModeShared),
+            let qLegacy = ctx.device.makeBuffer(length: Self.bytes(qCount), options: .storageModeShared),
+            let gateLegacy = ctx.device.makeBuffer(length: Self.bytes(qCount), options: .storageModeShared),
+            let kLegacy = ctx.device.makeBuffer(bytes: k, length: Self.bytes(kvCount), options: .storageModeShared),
+            let qFused = ctx.device.makeBuffer(length: Self.bytes(qCount), options: .storageModeShared),
+            let gateFused = ctx.device.makeBuffer(length: Self.bytes(qCount), options: .storageModeShared),
+            let kFused = ctx.device.makeBuffer(bytes: k, length: Self.bytes(kvCount), options: .storageModeShared),
+            let qW = ctx.device.makeBuffer(bytes: qWeight, length: qWeight.count * MemoryLayout<UInt16>.size, options: .storageModeShared),
+            let kW = ctx.device.makeBuffer(bytes: kWeight, length: kWeight.count * MemoryLayout<UInt16>.size, options: .storageModeShared),
+            let cb = ctx.queue.makeCommandBuffer()
+        else {
+            Issue.record("Failed to allocate buffers")
+            return
+        }
+
+        elementwise.encodeSplitQGate(commandBuffer: cb,
+                                     packed: qPackedBuf,
+                                     q: qLegacy,
+                                     gate: gateLegacy,
+                                     heads: numQHeads,
+                                     dim: headDim)
+        rms.encodeBF16WPerHead(commandBuffer: cb,
+                               x: qLegacy,
+                               weight: qW,
+                               out: qLegacy,
+                               headDim: UInt32(headDim),
+                               numHeads: numQHeads,
+                               eps: 1e-6)
+        rms.encodeBF16WPerHead(commandBuffer: cb,
+                               x: kLegacy,
+                               weight: kW,
+                               out: kLegacy,
+                               headDim: UInt32(headDim),
+                               numHeads: numKVHeads,
+                               eps: 1e-6)
+        rope.encodeNeoxSubdim(commandBuffer: cb,
+                              data: qLegacy,
+                              position: position,
+                              headDim: UInt32(headDim),
+                              numHeads: UInt32(numQHeads),
+                              rotaryDim: rotaryDim,
+                              theta: theta)
+        rope.encodeNeoxSubdim(commandBuffer: cb,
+                              data: kLegacy,
+                              position: position,
+                              headDim: UInt32(headDim),
+                              numHeads: UInt32(numKVHeads),
+                              rotaryDim: rotaryDim,
+                              theta: theta)
+
+        fused.encodeQwenGated(commandBuffer: cb,
+                              qPacked: qPackedBuf,
+                              qOut: qFused,
+                              gateOut: gateFused,
+                              kInOut: kFused,
+                              qWeight: qW,
+                              kWeight: kW,
+                              headDim: UInt32(headDim),
+                              numQHeads: UInt32(numQHeads),
+                              numKVHeads: UInt32(numKVHeads),
+                              position: position,
+                              theta: theta,
+                              rotaryDim: rotaryDim,
+                              eps: 1e-6)
+        cb.commit()
+        cb.waitUntilCompleted()
+        if let err = cb.error {
+            Issue.record("Command buffer failed: \(err)")
+            return
+        }
+
+        #expect(Self.bufferBytes(qLegacy, count: qCount) == Self.bufferBytes(qFused, count: qCount),
+                "Qwen gated Q mismatch")
+        #expect(Self.bufferBytes(gateLegacy, count: qCount) == Self.bufferBytes(gateFused, count: qCount),
+                "Qwen gated Gate mismatch")
+        #expect(Self.bufferBytes(kLegacy, count: kvCount) == Self.bufferBytes(kFused, count: kvCount),
+                "Qwen gated K mismatch")
+    }
+
     private static func expectMatchesLegacy(numQHeads: Int,
                                             numKVHeads: Int,
                                             headDim: Int,

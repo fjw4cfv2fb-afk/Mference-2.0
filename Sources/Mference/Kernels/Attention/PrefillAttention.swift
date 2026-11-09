@@ -44,17 +44,23 @@ final class PrefillAttention {
     private let context: MetalContext
     private let psoCausalTiled: MTLComputePipelineState
     private let psoFullTensorOps2DValidityV2: MTLComputePipelineState?
+    private let psoFullTensorOps2DValidityV2HeadDim256: MTLComputePipelineState?
 
     /// Whether the Apple10 MPP tensor-ops prefill kernel is usable here. False
     /// on hosts without Apple10 support and on shader libraries compiled below
     /// MSL 4.0, in which case `encodeCausal` uses the causal-tiled kernel.
-    var tensorOpsPipelineAvailable: Bool { psoFullTensorOps2DValidityV2 != nil }
+    var tensorOpsPipelineAvailable: Bool {
+        psoFullTensorOps2DValidityV2 != nil && psoFullTensorOps2DValidityV2HeadDim256 != nil
+    }
 
     init(context: MetalContext) throws {
         self.context = context
         self.psoCausalTiled = try context.pipeline("attention_prefill_causal_tiled")
         self.psoFullTensorOps2DValidityV2 = context.device.supportsApple10TensorOps
             ? try? context.pipeline("attention_prefill_full_tensorops_2d_validity_v2")
+            : nil
+        self.psoFullTensorOps2DValidityV2HeadDim256 = context.device.supportsApple10TensorOps
+            ? try? context.pipeline("attention_prefill_full_tensorops_2d_validity_v2_hd256")
             : nil
     }
 
@@ -70,16 +76,30 @@ final class PrefillAttention {
 
         let requestsTensorOps = path == .fullTensorOps2DPreferred
             || path == .fullTensorOps2DValidityV2
-        // The pinned model uses 512/16/2 only for full attention; its
-        // sliding-window layers use 256/16/8. A future model that reuses this
-        // shape for sliding attention must add a full-visibility check here.
-        let tensorOpsShape = requestsTensorOps
+        let isFullVisibility = params.slidingWindow == 0
+            || params.slidingWindow >= params.kvValidCount
+        let tensorOps512Shape = requestsTensorOps
             && kvRingCapacity == 0
+            && isFullVisibility
             && params.headDim == 512
             && params.numQHeads == 16
             && params.numKVHeads == 2
             && params.scale == 1.0
-        let tensorOpsPipeline = tensorOpsShape ? psoFullTensorOps2DValidityV2 : nil
+        let tensorOps256Shape = requestsTensorOps
+            && kvRingCapacity == 0
+            && isFullVisibility
+            && params.headDim == 256
+            && params.numQHeads == 16
+            && params.numKVHeads == 2
+        let tensorOpsShape = tensorOps512Shape || tensorOps256Shape
+        let tensorOpsPipeline: MTLComputePipelineState?
+        if tensorOps512Shape {
+            tensorOpsPipeline = psoFullTensorOps2DValidityV2
+        } else if tensorOps256Shape {
+            tensorOpsPipeline = psoFullTensorOps2DValidityV2HeadDim256
+        } else {
+            tensorOpsPipeline = nil
+        }
         let useTensorOps = tensorOpsPipeline != nil
         let pipeline: MTLComputePipelineState
         if let tensorOpsPipeline {
@@ -94,7 +114,7 @@ final class PrefillAttention {
         } else {
             // Explicit mode also falls back for incompatible shapes, and on
             // hosts without Apple10 MPP tensor support or without MSL 4.0.
-            // Benchmark fixtures must use 512/16/2 to prove that TensorOps ran.
+            // Benchmark fixtures must use 512/16/2 or 256/16/2 to prove that TensorOps ran.
             pipeline = causalTiledPipeline(kvRingCapacity: kvRingCapacity)
         }
         let headDim = Int(params.headDim)
@@ -113,13 +133,20 @@ final class PrefillAttention {
         enc.setBuffer(out, offset: outOffset, index: 3)
         var p = params
         enc.setBytes(&p, length: MemoryLayout<PrefillAttentionParams>.stride, index: 4)
-        let groups = useTensorOps
-            ? MTLSize(width: Int(params.queryCount),
-                      height: Int(params.numQHeads) / 8,
-                      depth: 1)
-            : MTLSize(width: Int(params.queryCount),
-                      height: Int(params.numQHeads),
-                      depth: 1)
+        let groups: MTLSize
+        if useTensorOps && tensorOps256Shape {
+            groups = MTLSize(width: (Int(params.queryCount) + 3) / 4,
+                             height: Int(params.numQHeads) / 8,
+                             depth: 1)
+        } else if useTensorOps {
+            groups = MTLSize(width: Int(params.queryCount),
+                             height: Int(params.numQHeads) / 8,
+                             depth: 1)
+        } else {
+            groups = MTLSize(width: Int(params.queryCount),
+                             height: Int(params.numQHeads),
+                             depth: 1)
+        }
         enc.dispatchThreadgroups(
             groups,
             threadsPerThreadgroup: MTLSize(width: threadCount, height: 1, depth: 1))

@@ -222,6 +222,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let prefillRouter: PrefillRouter
     private let prefillSharedExpert: PrefillSharedExpert
     private let prefillGroupedMoE: PrefillGroupedRoutedMoE
+    private let prefillMPPGroupedMoE: MPPGroupedRoutedMoE
     private let prefillMoE: PrefillMoE
     private let prefillLayerTail: PrefillLayerTail
     private let prefillFinalRowHead: PrefillFinalRowHeadInt4
@@ -338,6 +339,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let onesPerExpertScale: MTLBuffer?
     private var prefillChunkState = PrefillChunkCommitState()
     private var prefillScratch: PrefillChunkScratchBuffers?
+    private var gdnSnapshots: [Int: GDNStateManager.Snapshot] = [:]
+    private var pinnedGDNCheckpointPosition: Int?
+    private var nextBasePrefixCheckpointPosition: Int?
+    private var gdnStagingStateBuffer: MTLBuffer?
+    private var gdnStagingTailBuffer: MTLBuffer?
     /// Lazily built layer-major DeepSeek-V4 prefill; see
     /// `RealForwardRunner+DSV4Prefill.swift`.
     private var dsv4Prefill: DSV4ChunkedPrefill?
@@ -352,7 +358,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private static let rdadviseAdaptiveMissCap = 12
     private static let rdadviseAdaptiveByteCap: UInt64 = 384 * 1_048_576
     private static let rdadviseAdaptiveSlowCallNanos: UInt64 = 1_000_000
-    private static let prefillRoutedTileSchedulerConfig = PrefillRoutedTileSchedulerConfig()
+    private static let prefillRoutedTileSchedulerConfig = PrefillRoutedTileSchedulerConfig(maxPendingDepth: 1, tileExperts: 16)
+    private static let decodeRoutedTileSchedulerConfig = PrefillRoutedTileSchedulerConfig()
 
     /// Per-layer `router.scale * D^-0.5` pre-folded into one BF16 buffer
     /// allocation per layer. ~168 KB total at 30 layers × 2816 BF16 — bounded
@@ -621,6 +628,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             siluActivation: silu)
         self.prefillGroupedMoE = try PrefillGroupedRoutedMoE(context: context,
                                                              siluActivation: silu)
+        self.prefillMPPGroupedMoE = MPPGroupedRoutedMoE(context: context)
         self.prefillMoE = try PrefillMoE(context: context)
         self.prefillLayerTail = try PrefillLayerTail(context: context)
         self.prefillFinalRowHead = try PrefillFinalRowHeadInt4(context: context,
@@ -986,6 +994,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     public func reset() {
         kv?.reset()
         gdnState?.reset()
+        gdnSnapshots.removeAll()
+        pinnedGDNCheckpointPosition = nil
         dsv4State?.reset()
         // Short-conv history dies with the KV cache, and ONLY with it:
         // `prepareForContinuation` retains both, so a resumed conversation
@@ -1003,15 +1013,61 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         kv?.position ?? 0
     }
 
+    public func setBasePrefixCheckpointPosition(_ position: Int?) {
+        nextBasePrefixCheckpointPosition = position
+    }
+
+    public func rewindablePosition(atOrBefore maxPosition: Int) -> Int? {
+        guard gdnState != nil else { return maxPosition }
+        if let kvPos = kv?.position, maxPosition >= kvPos {
+            return kvPos
+        }
+        return gdnSnapshots.keys.filter { $0 <= maxPosition }.max()
+    }
+
+    public func recordContinuationCheckpoint() {
+        guard let gdnState, let pos = kv?.position, pos > 0 else { return }
+        storeGDNSnapshot(gdnState.makeSnapshot(), at: pos, pinned: false)
+    }
+
+    private func storeGDNSnapshot(_ snapshot: GDNStateManager.Snapshot, at position: Int, pinned: Bool) {
+        gdnSnapshots[position] = snapshot
+        if pinned {
+            pinnedGDNCheckpointPosition = position
+        }
+        // Keep the pinned base-prefix snapshot plus at most the 2 most recent turn/chunk snapshots.
+        let unpinnedSorted = gdnSnapshots.keys
+            .filter { $0 != pinnedGDNCheckpointPosition }
+            .sorted()
+        if unpinnedSorted.count > 2 {
+            for oldKey in unpinnedSorted.prefix(unpinnedSorted.count - 2) {
+                gdnSnapshots.removeValue(forKey: oldKey)
+            }
+        }
+    }
+
     public func prepareForContinuation(expectedPosition: Int) throws {
         try prefillChunkState.requireClean(operation: "prepareForContinuation")
         guard let kv else {
             throw PrefillError.prefillCursorMismatch(
                 "continuation requires an initialized KV cache")
         }
-        guard expectedPosition > 0, kv.position == expectedPosition else {
+        guard expectedPosition > 0, expectedPosition <= kv.position else {
             throw PrefillError.prefillCursorMismatch(
-                "continuation expected KV position \(expectedPosition), current \(kv.position)")
+                "continuation expected KV position <= \(kv.position), got \(expectedPosition)")
+        }
+        if kv.position > expectedPosition {
+            if let gdnState {
+                guard let snapshot = gdnSnapshots[expectedPosition] else {
+                    throw PrefillError.prefillCursorMismatch(
+                        "continuation rewind to \(expectedPosition) missing GDN state snapshot")
+                }
+                gdnState.restore(snapshot)
+            }
+            kv.rewind(to: expectedPosition)
+            for key in gdnSnapshots.keys where key > expectedPosition && key != pinnedGDNCheckpointPosition {
+                gdnSnapshots.removeValue(forKey: key)
+            }
         }
         resetTransientState()
     }
@@ -1799,7 +1855,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                   tokenCount: Int,
                                   xStrideElements: Int,
                                   yStrideElements: Int) {
-            if tokenCount >= 32,
+            if tokenCount >= 8,
                family == .q || family == .kv || family == .o,
                let candidate = prefillMPPAffineInt4 {
                 let path = candidate.encode(
@@ -1917,6 +1973,32 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         prefillChunkState.markDirty(startPosition: startPosition, tokenCount: tokens.count)
 
+        let interiorCheckpointRows: Int? = {
+            guard let target = nextBasePrefixCheckpointPosition,
+                  let gdnState,
+                  target > startPosition,
+                  target < startPosition + t,
+                  target - startPosition >= cfg.linearAttention.convKernelSize - 1 else {
+                return nil
+            }
+            if gdnStagingStateBuffer == nil {
+                gdnStagingStateBuffer = ctx.device.makeBuffer(
+                    length: max(gdnState.stateBytesPerLayer, 1),
+                    options: .storageModeShared)
+            }
+            if gdnStagingTailBuffer == nil {
+                gdnStagingTailBuffer = ctx.device.makeBuffer(
+                    length: max(gdnState.convTailBytesPerLayer, 1),
+                    options: .storageModeShared)
+            }
+            guard gdnStagingStateBuffer != nil, gdnStagingTailBuffer != nil else {
+                return nil
+            }
+            return target - startPosition
+        }()
+        var interiorGDNStates = [Data?](repeating: nil, count: cfg.numLayers)
+        var interiorGDNTails = [Data?](repeating: nil, count: cfg.numLayers)
+
         guard var cb = ctx.queue.makeCommandBuffer() else {
             throw ModelError.residentBufferWrapFailed
         }
@@ -2020,17 +2102,64 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                  rows: t)
                 let aLog = views.linALog!
                 let dtBias = views.linDtBias!
-                gdn.encodeDeltaStepPrefill(commandBuffer: cb,
-                                           convOut: scratch.gdnConvOut,
-                                           aProj: scratch.gdnA,
-                                           bProj: scratch.gdnB,
-                                           aLog: aLog.buffer,
-                                           aLogOffset: Int(aLog.offset),
-                                           dtBias: dtBias.buffer,
-                                           dtBiasOffset: Int(dtBias.offset),
-                                           state: gdnState.stateBuffer(layer: L),
-                                           y: scratch.gdnY,
-                                           rows: t)
+                if let pRows = interiorCheckpointRows,
+                   let stagingState = gdnStagingStateBuffer,
+                   let stagingTail = gdnStagingTailBuffer {
+                    gdn.encodeDeltaStepPrefill(commandBuffer: cb,
+                                               convOut: scratch.gdnConvOut,
+                                               aProj: scratch.gdnA,
+                                               bProj: scratch.gdnB,
+                                               aLog: aLog.buffer,
+                                               aLogOffset: Int(aLog.offset),
+                                               dtBias: dtBias.buffer,
+                                               dtBiasOffset: Int(dtBias.offset),
+                                               state: gdnState.stateBuffer(layer: L),
+                                               y: scratch.gdnY,
+                                               rows: pRows)
+                    if let blit = cb.makeBlitCommandEncoder() {
+                        blit.copy(from: gdnState.stateBuffer(layer: L),
+                                  sourceOffset: 0,
+                                  to: stagingState,
+                                  destinationOffset: 0,
+                                  size: gdnState.stateBytesPerLayer)
+                        let history = la.convKernelSize - 1
+                        let tailRowOffset = (pRows - history) * la.qkvDim * MemoryLayout<Float16>.stride
+                        blit.copy(from: scratch.q,
+                                  sourceOffset: tailRowOffset,
+                                  to: stagingTail,
+                                  destinationOffset: 0,
+                                  size: gdnState.convTailBytesPerLayer)
+                        blit.endEncoding()
+                    }
+                    let fp16Stride = MemoryLayout<Float16>.stride
+                    gdn.encodeDeltaStepPrefill(commandBuffer: cb,
+                                               convOut: scratch.gdnConvOut,
+                                               convOutOffset: pRows * la.qkvDim * fp16Stride,
+                                               aProj: scratch.gdnA,
+                                               aProjOffset: pRows * la.numVHeads * fp16Stride,
+                                               bProj: scratch.gdnB,
+                                               bProjOffset: pRows * la.numVHeads * fp16Stride,
+                                               aLog: aLog.buffer,
+                                               aLogOffset: Int(aLog.offset),
+                                               dtBias: dtBias.buffer,
+                                               dtBiasOffset: Int(dtBias.offset),
+                                               state: gdnState.stateBuffer(layer: L),
+                                               y: scratch.gdnY,
+                                               yOffset: pRows * la.valueDim * fp16Stride,
+                                               rows: t - pRows)
+                } else {
+                    gdn.encodeDeltaStepPrefill(commandBuffer: cb,
+                                               convOut: scratch.gdnConvOut,
+                                               aProj: scratch.gdnA,
+                                               bProj: scratch.gdnB,
+                                               aLog: aLog.buffer,
+                                               aLogOffset: Int(aLog.offset),
+                                               dtBias: dtBias.buffer,
+                                               dtBiasOffset: Int(dtBias.offset),
+                                               state: gdnState.stateBuffer(layer: L),
+                                               y: scratch.gdnY,
+                                               rows: t)
+                }
                 let gatedNormW = views.linNorm!
                 gdn.encodeGatedNorm(commandBuffer: cb,
                                     y: scratch.gdnY,
@@ -2271,6 +2400,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     if let error = cb.error {
                         throw error
                     }
+                    if isLinear, interiorCheckpointRows != nil,
+                       let gdnState,
+                       let stagingState = gdnStagingStateBuffer,
+                       let stagingTail = gdnStagingTailBuffer {
+                        interiorGDNStates[L] = Data(bytes: stagingState.contents(),
+                                                    count: gdnState.stateBytesPerLayer)
+                        interiorGDNTails[L] = Data(bytes: stagingTail.contents(),
+                                                   count: gdnState.convTailBytesPerLayer)
+                    }
 
                     // The shared branch depends only on routedX, which the
                     // completed attention/router command has already
@@ -2376,7 +2514,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         let tileIndex: Int
                         let commandBuffer: MTLCommandBuffer
                         let fetch: PrefillStreamedTileFetchResult
-                        let argumentBuffer: PrefillStreamedTileArgumentBuffer
+                        let argumentBuffer: MTLBuffer
                     }
                     var pendingTiles: [PendingPrefillTile] = []
                     var tileLifetime = PrefillStreamedTileSlotLifetime()
@@ -2404,10 +2542,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             let pendingAssignedSlots = pendingTiles.flatMap(\.fetch.plannedAssignedSlots)
                             if !pendingAssignedSlots.isEmpty {
                                 let pendingSlots = Set(pendingAssignedSlots)
-                                let plan = try model.planRoutedExpertsIfPossible(
-                                    layer: L,
-                                    experts: expertIDs,
-                                    avoidingSlots: pendingSlots)
+                                let plan = pendingTiles.count <= schedulerConfig.maxPendingDepth
+                                    ? try model.planRoutedExpertsIfPossible(
+                                        layer: L,
+                                        experts: expertIDs,
+                                        avoidingSlots: pendingSlots)
+                                    : nil
                                 let decision = routedTileScheduler.decide(
                                     PrefillRoutedTileSchedulerInput(
                                         hasPendingTile: true,
@@ -2470,9 +2610,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             try tileLifetime.begin(tileIndex: tileIndex,
                                                    plannedSlots: fetch.plannedMissSlots)
                         }
-                        let argumentBuffer = try prefillGroupedMoE.makeStreamedArgumentBuffer(
-                            device: ctx.device,
-                            binding: fetch.binding)
                         let streamedParams = PrefillGroupedRoutedMoEStreamedParams(
                             pairStart: tile.pairStart,
                             pairCount: tile.pairCount,
@@ -2485,6 +2622,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         guard let tileCB = ctx.queue.makeCommandBuffer() else {
                             throw ModelError.residentBufferWrapFailed
                         }
+                        let argumentBuffer = try prefillGroupedMoE.makeStreamedArgumentBuffer(
+                            device: ctx.device,
+                            binding: fetch.binding)
                         _ = prefillGroupedMoE.encodeStreamedBatched(
                             commandBuffer: tileCB,
                             hidden: scratch.routedX,
@@ -2496,11 +2636,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             binding: fetch.binding,
                             params: streamedParams,
                             pairMicrobatchRows: scratch.layout.routedPairMicrobatchRows)
+                        let retainedArgBuffer = argumentBuffer.buffer
                         tileCB.commit()
                         pendingTiles.append(PendingPrefillTile(tileIndex: tileIndex,
                                                                commandBuffer: tileCB,
                                                                fetch: fetch,
-                                                               argumentBuffer: argumentBuffer))
+                                                               argumentBuffer: retainedArgBuffer))
                         while pendingTiles.count > schedulerConfig.maxPendingDepth {
                             try drainOldestPendingTile()
                         }
@@ -2621,6 +2762,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         kv?.advance(by: tokens.count)
+        let chunkEndPosition = startPosition + tokens.count
+        if let pRows = interiorCheckpointRows {
+            let interiorPos = startPosition + pRows
+            storeGDNSnapshot(
+                GDNStateManager.Snapshot(states: interiorGDNStates, convTails: interiorGDNTails),
+                at: interiorPos,
+                pinned: true)
+            nextBasePrefixCheckpointPosition = nil
+        }
+        if let gdnState {
+            let isPinnedBoundary = (nextBasePrefixCheckpointPosition == chunkEndPosition)
+            storeGDNSnapshot(gdnState.makeSnapshot(), at: chunkEndPosition, pinned: isPinnedBoundary)
+            if isPinnedBoundary {
+                nextBasePrefixCheckpointPosition = nil
+            }
+        }
         prefillChunkState.markCommitted()
     }
 
@@ -2700,20 +2857,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             for i in 0..<slots.count { ptr[i] = slots[i] }
         }
 
-        // Embed lookup + sqrt(H) fused.
+        // Embed lookup + sqrt(H) fused (encoded inside Layer 0's command buffer
+        // to avoid a synchronous CPU-GPU round-trip per decoded token).
         let emb = model.embedding
-        do {
-            runSync { cb in
-                embedInt4.encode(commandBuffer: cb,
-                                 table:  emb.buffer, tableOffset:  Int(emb.offset),
-                                 scales: emb.buffer, scalesOffset: Int(emb.scaleOffset),
-                                 biases: emb.buffer, biasesOffset: Int(emb.biasOffset),
-                                 out: hidden,
-                                 tokenId: UInt32(bitPattern: token),
-                                 d: D,
-                                 outScale: embedOutScale)
-            }
-        }
 
         for L in 0..<cfg.numLayers {
             let isLinear = cfg.layerIsLinear(L)
@@ -2741,6 +2887,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // the only reason to break is the CPU readback of router indices
             // needed to issue I/O for the routed-expert blobs.
             let cb = ctx.queue.makeCommandBuffer()!
+            if L == 0 {
+                embedInt4.encode(commandBuffer: cb,
+                                 table:  emb.buffer, tableOffset:  Int(emb.offset),
+                                 scales: emb.buffer, scalesOffset: Int(emb.scaleOffset),
+                                 biases: emb.buffer, biasesOffset: Int(emb.biasOffset),
+                                 out: hidden,
+                                 tokenId: UInt32(bitPattern: token),
+                                 d: D,
+                                 outScale: embedOutScale)
+            }
             rms.encodeBF16W(commandBuffer: cb,
                             x: hidden,
                             weight: inNorm.buffer, weightOffset: Int(inNorm.offset),
@@ -2932,7 +3088,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if slotMapEnabled,
                Self.slotMapOnlyLayer == nil || Self.slotMapOnlyLayer == L,
                !cfg.ffnSandwichNorms,
-               !isLinear,
                model.config.family == .qwen36,
                cfg.topKExperts == MoE.maxStreamedExperts,
                let binding = try? model.routedSlotMapBinding(layer: L) {
@@ -3324,12 +3479,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 encodeAndCommitNanos: clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tCb2Start)
             continue
         }
-        if let pending = pendingRoutedCommand {
-            finishPendingRoutedCommand(pending, waitIfNeeded: true)
-            pendingRoutedCommand = nil
-        }
-        try throwIfEagerFillFailed()
-
         // The fused head skips the vocab buffer and leaves a greedy token in
         // greedyTokenBuf; the logits path writes the complete vector.
         let fNorm = model.finalNorm
@@ -3360,18 +3509,37 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         if emitHead {
             let useFusedHeadForThisToken = useFusedGreedyHead && outputMode == .greedyIfAvailable
-            let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let headCB = ctx.queue.makeCommandBuffer()!
             if useFusedHeadForThisToken {
-                runSync(gFusionHead)
+                gFusionHead(headCB)
+            } else {
+                gFinalNorm(headCB)
+                gLmHead(headCB)
+            }
+            trackGpuInterval(headCB)
+            headCB.commit()
+            if let pending = pendingRoutedCommand {
+                finishPendingRoutedCommand(pending, waitIfNeeded: true)
+                pendingRoutedCommand = nil
+            }
+            try throwIfEagerFillFailed()
+            let tHead = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            waitForCompletion(headCB)
+            if let err = headCB.error {
+                print("CB error: \(err)")
+            }
+            if useFusedHeadForThisToken {
                 totalHeadFusedNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
             } else {
-                runSync { cb in
-                    gFinalNorm(cb)
-                    gLmHead(cb)
-                }
                 totalHeadNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
             }
+        } else {
+            if let pending = pendingRoutedCommand {
+                finishPendingRoutedCommand(pending, waitIfNeeded: true)
+                pendingRoutedCommand = nil
+            }
+            try throwIfEagerFillFailed()
         }
 
         kv?.advance()
@@ -4531,7 +4699,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             // off), the next iteration drains first and demand-fetches,
             // which *is* the old serialized behavior.
             let tileScheduler = PrefillRoutedTileScheduler(
-                config: Self.prefillRoutedTileSchedulerConfig)
+                config: Self.decodeRoutedTileSchedulerConfig)
             var pendingExpertCB: (cb: MTLCommandBuffer, slots: [Int])?
             var prefetched: (expert: Int, plan: RoutedExpertFetchPlan,
                              blob: TensorView)?
@@ -4798,43 +4966,23 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             qRows: 2 * qDim,
                             kvRows: kvDim,
                             n: D)
-        elementwise.encodeSplitQGate(commandBuffer: cb,
-                                     packed: qPackedScratch,
-                                     q: qScratch,
-                                     gate: attnGateScratch,
-                                     heads: cfg.numHeads,
-                                     dim: headDim)
-        rms.encodeBF16WPerHead(commandBuffer: cb,
-                               x: qScratch,
-                               weight: qNormW.buffer,
-                               weightOffset: Int(qNormW.offset),
-                               out: qScratch,
-                               headDim: UInt32(headDim),
-                               numHeads: cfg.numHeads,
-                               eps: eps)
-        rms.encodeBF16WPerHead(commandBuffer: cb,
-                               x: kSlot.buffer, xOffset: kSlot.offset,
-                               weight: kNormW.buffer,
-                               weightOffset: Int(kNormW.offset),
-                               out: kSlot.buffer, outOffset: kSlot.offset,
-                               headDim: UInt32(headDim),
-                               numHeads: numKV,
-                               eps: eps)
-        rope.encodeNeoxSubdim(commandBuffer: cb,
-                              data: qScratch,
-                              position: UInt32(position),
-                              headDim: UInt32(headDim),
-                              numHeads: UInt32(cfg.numHeads),
-                              rotaryDim: rotaryDim,
-                              theta: Float(cfg.fullRopeTheta))
-        rope.encodeNeoxSubdim(commandBuffer: cb,
-                              data: kSlot.buffer,
-                              dataOffset: kSlot.offset,
-                              position: UInt32(position),
-                              headDim: UInt32(headDim),
-                              numHeads: UInt32(numKV),
-                              rotaryDim: rotaryDim,
-                              theta: Float(cfg.fullRopeTheta))
+        fusedQKVEpilogue.encodeQwenGated(commandBuffer: cb,
+                                         qPacked: qPackedScratch,
+                                         qOut: qScratch,
+                                         gateOut: attnGateScratch,
+                                         kInOut: kSlot.buffer,
+                                         kInOutOffset: kSlot.offset,
+                                         qWeight: qNormW.buffer,
+                                         qWeightOffset: Int(qNormW.offset),
+                                         kWeight: kNormW.buffer,
+                                         kWeightOffset: Int(kNormW.offset),
+                                         headDim: UInt32(headDim),
+                                         numQHeads: UInt32(cfg.numHeads),
+                                         numKVHeads: UInt32(numKV),
+                                         position: UInt32(position),
+                                         theta: Float(cfg.fullRopeTheta),
+                                         rotaryDim: rotaryDim,
+                                         eps: eps)
         attention.encodeFull(commandBuffer: cb,
                              q: qScratch,
                              k: kSlot.buffer, kOffset: 0,

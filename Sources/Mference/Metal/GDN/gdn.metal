@@ -729,6 +729,85 @@ kernel void gdn_delta_step_prefill(
     }
 }
 
+[[kernel, max_total_threads_per_threadgroup(128)]]
+kernel void gdn_delta_step_prefill_qwen(
+    device const half*   conv_out [[buffer(0)]],   // [T, C]
+    device const half*   a_proj   [[buffer(1)]],   // [T, Hv]
+    device const half*   b_proj   [[buffer(2)]],   // [T, Hv]
+    device const bfloat* A_log    [[buffer(3)]],   // [Hv]
+    device const bfloat* dt_bias  [[buffer(4)]],   // [Hv]
+    device float*        state    [[buffer(5)]],   // [Hv, Dv, Dk]
+    device half*         y        [[buffer(6)]],   // [T, Hv * Dv]
+    constant uint&       kHeads   [[buffer(7)]],
+    constant uint&       vHeads   [[buffer(8)]],
+    constant uint&       keyDim   [[buffer(9)]],
+    constant uint&       valueDim [[buffer(10)]],
+    constant uint&       rows     [[buffer(11)]],
+    constant uint&       rowStride [[buffer(12)]], // C, conv_out elements/row
+    uint2 tg [[threadgroup_position_in_grid]],
+    uint2 tpos [[thread_position_in_threadgroup]]
+) {
+    constexpr uint Hk = 16u;
+    constexpr uint Hv = 32u;
+    constexpr uint Dk = 128u;
+    constexpr uint Dv = 128u;
+    if (kHeads != Hk || vHeads != Hv || keyDim != Dk || valueDim != Dv) return;
+
+    const uint T = rows;
+    const uint C = rowStride;
+    const uint h = tg.x;
+    const uint dv = tg.y * 4u + tpos.y;
+    const uint lane = tpos.x;
+    if (h >= Hv || dv >= Dv) return;
+
+    const uint hk = h / 2u;
+    const float expA = exp(float(A_log[h]));
+    const float dtb = float(dt_bias[h]);
+    const uint laneBase = lane * 4u;
+
+    device float* srow = state + (h * Dv + dv) * Dk + laneBase;
+
+    float s[4];
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4u; ++i) {
+        s[i] = srow[i];
+    }
+
+    for (uint t = 0; t < T; ++t) {
+        device const half* rowBase = conv_out + t * C;
+        device const half* q = rowBase + hk * Dk + laneBase;
+        device const half* k = rowBase + Hk * Dk + hk * Dk + laneBase;
+        device const half* v = rowBase + 2u * Hk * Dk + h * Dv;
+
+        const float g = exp(-expA * gdn_softplus(float(a_proj[t * Hv + h]) + dtb));
+        const float beta = 1.0f / (1.0f + exp(-float(b_proj[t * Hv + h])));
+
+        float kv = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            s[i] *= g;
+            kv = fma(s[i], float(k[i]), kv);
+        }
+        kv = simd_sum(kv);
+
+        const float delta = (float(v[dv]) - kv) * beta;
+
+        float out = 0.0f;
+        #pragma clang loop unroll(full)
+        for (uint i = 0; i < 4u; ++i) {
+            s[i] = fma(float(k[i]), delta, s[i]);
+            out = fma(s[i], float(q[i]), out);
+        }
+        out = simd_sum(out);
+        if (lane == 0u) y[t * (Hv * Dv) + h * Dv + dv] = half(out);
+    }
+
+    #pragma clang loop unroll(full)
+    for (uint i = 0; i < 4u; ++i) {
+        srow[i] = s[i];
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Gated output norm: out = rmsnorm(y; weight, eps) * silu(z), per value head.
 // One threadgroup per (head, row), 128 threads. Norm statistics span one

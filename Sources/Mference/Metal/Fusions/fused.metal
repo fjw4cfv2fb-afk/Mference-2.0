@@ -173,6 +173,113 @@ void fused_qkv_epilogue(
 }
 
 // ============================================================================
+// fused_qwen_gated_qkv_epilogue — Qwen 3.6 gated full-attention decode Q/K
+// post-processing in a single dispatch.
+//
+// Fuses 5 separate decode dispatches per full-attention layer:
+//   1. split_q_gate_fp16(q_packed -> q_out, gate_out)
+//   2. rmsnorm_bf16w_perhead(q_out, q_weight)
+//   3. rmsnorm_bf16w_perhead(k_inout, k_weight)
+//   4. rope_neox_subdim(q_out, rotary_dim)
+//   5. rope_neox_subdim(k_inout, rotary_dim)
+//
+// Preserves the exact FP16 rounding boundary between RMSNorm and NeoX subdim
+// RoPE via `head_tg`.
+// ============================================================================
+[[kernel, max_total_threads_per_threadgroup(kFusedThreads)]]
+void fused_qwen_gated_qkv_epilogue(
+    device const half*   q_packed       [[buffer(0)]],  // [num_q_heads, 2 * head_dim]
+    device       half*   q_out          [[buffer(1)]],  // [num_q_heads, head_dim]
+    device       half*   gate_out       [[buffer(2)]],  // [num_q_heads, head_dim]
+    device       half*   k_inout        [[buffer(3)]],  // [num_kv_heads, head_dim]
+    device const bfloat* q_weight       [[buffer(4)]],  // [head_dim]
+    device const bfloat* k_weight       [[buffer(5)]],  // [head_dim]
+    constant     uint&   head_dim       [[buffer(6)]],
+    constant     uint&   num_q_heads    [[buffer(7)]],
+    constant     uint&   num_kv_heads   [[buffer(8)]],
+    constant     uint&   position       [[buffer(9)]],
+    constant     float&  theta_base     [[buffer(10)]],
+    constant     uint&   rotary_dim     [[buffer(11)]],
+    constant     float&  rms_eps        [[buffer(12)]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  lsize            [[threads_per_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]],
+    uint  simdgroups       [[simdgroups_per_threadgroup]],
+    uint  head_group       [[threadgroup_position_in_grid]]
+) {
+    threadgroup half  head_tg[kFusedMaxHeadDim];
+    threadgroup float partial[kFusedMaxSimdGroups];
+
+    const uint HD = fused_fc_head_dim(head_dim);
+    const uint NQ = fused_fc_num_q_heads(num_q_heads);
+    const uint NKV = fused_fc_num_kv_heads(num_kv_heads);
+    const uint RD = fused_fc_rotary(rotary_dim);
+
+    const bool is_q = head_group < NQ;
+    const bool is_k = !is_q && head_group < (NQ + NKV);
+    if (!is_q && !is_k) return;
+
+    const uint local_head = is_q ? head_group : (head_group - NQ);
+    device half* dst = is_q ? (q_out + local_head * HD)
+                            : (k_inout + local_head * HD);
+    device const bfloat* w = is_q ? q_weight : k_weight;
+
+    float acc = 0.0f;
+    if (is_q) {
+        device const half* packed_head = q_packed + local_head * 2u * HD;
+        device half* gate_head = gate_out + local_head * HD;
+        for (uint i = lid; i < HD; i += lsize) {
+            const half qv = packed_head[i];
+            gate_head[i] = packed_head[HD + i];
+            head_tg[i] = qv;
+            const float xv = float(qv);
+            acc = fma(xv, xv, acc);
+        }
+    } else {
+        for (uint i = lid; i < HD; i += lsize) {
+            const half kv = dst[i];
+            head_tg[i] = kv;
+            const float xv = float(kv);
+            acc = fma(xv, xv, acc);
+        }
+    }
+
+    acc = simd_sum(acc);
+    if (simd_lane_id == 0) {
+        partial[simd_group_id] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        float sum = (simd_lane_id < simdgroups) ? partial[simd_lane_id] : 0.0f;
+        sum = simd_sum(sum);
+        if (simd_lane_id == 0) {
+            partial[0] = rsqrt(sum / float(HD) + rms_eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float inv = partial[0];
+    for (uint i = lid; i < HD; i += lsize) {
+        head_tg[i] = half(float(head_tg[i]) * inv * float(w[i]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint half_rotary = RD / 2u;
+    for (uint pair = lid; pair < half_rotary; pair += lsize) {
+        float x0 = float(head_tg[pair]);
+        float x1 = float(head_tg[half_rotary + pair]);
+        fused_rope_neox_pair(x0, x1, pair, RD, float(position), theta_base);
+        dst[pair] = half(x0);
+        dst[half_rotary + pair] = half(x1);
+    }
+    for (uint i = RD + lid; i < HD; i += lsize) {
+        dst[i] = head_tg[i];
+    }
+}
+
+// ============================================================================
 // fused_layer_tail — real Gemma 4 decoder-layer tail.
 //
 // Replaces the cb2 chain:

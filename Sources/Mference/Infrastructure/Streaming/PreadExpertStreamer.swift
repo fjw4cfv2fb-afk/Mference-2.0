@@ -107,6 +107,9 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         guard openedFD >= 0 else {
             throw StreamerError.openFailed(path: layout.path, errno: errno)
         }
+        if ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"] == "1" {
+            _ = fcntl(openedFD, F_NOCACHE, 1)
+        }
         self.fd = openedFD
 
         var fileStats = stat()
@@ -277,6 +280,16 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         precondition(plan.assignedSlots.count == plan.experts.count,
                      "expert cache plan slot count mismatch")
 
+        guard !plan.misses.isEmpty else {
+            return expertCachePlanBuffers(plan)
+        }
+        // Large prefill tiles (>8 experts) sweep nearly the entire expert file
+        // and would thrash the macOS Unified Buffer Cache on 16 GB hosts; decode
+        // plans (<=8 experts) benefit from OS page-cache retention.
+        if ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"] != "0" {
+            _ = fcntl(fd, F_NOCACHE, plan.experts.count > 8 ? 1 : 0)
+        }
+
         let missFileOffsets = try plan.misses.map { index in
             try fileOffsetForExpert(plan.experts[index])
         }
@@ -388,6 +401,9 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         _ reservation: [(expert: Int, slot: Int)]
     ) -> UInt64 {
         guard !reservation.isEmpty else { return 0 }
+        if ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"] != "1" {
+            _ = fcntl(fd, F_NOCACHE, 0)
+        }
         let fileOffsets = reservation.map { entry in
             (try? fileOffsetForExpert(entry.expert)) ?? UInt64.max
         }

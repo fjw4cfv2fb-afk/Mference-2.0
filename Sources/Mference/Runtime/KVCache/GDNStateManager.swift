@@ -85,6 +85,46 @@ public final class GDNStateManager {
         return buffer
     }
 
+    public struct Snapshot: Sendable {
+        public var states: [Data?]
+        public var convTails: [Data?]
+
+        public init(layerCount: Int) {
+            self.states = [Data?](repeating: nil, count: layerCount)
+            self.convTails = [Data?](repeating: nil, count: layerCount)
+        }
+
+        public init(states: [Data?], convTails: [Data?]) {
+            self.states = states
+            self.convTails = convTails
+        }
+    }
+
+    public func makeSnapshot() -> Snapshot {
+        let states = stateBuffers.map { buf -> Data? in
+            guard let buf else { return nil }
+            return Data(bytes: buf.contents(), count: buf.length)
+        }
+        let tails = convTailBuffers.map { buf -> Data? in
+            guard let buf else { return nil }
+            return Data(bytes: buf.contents(), count: buf.length)
+        }
+        return Snapshot(states: states, convTails: tails)
+    }
+
+    public func restore(_ snapshot: Snapshot) {
+        guard snapshot.states.count == stateBuffers.count,
+              snapshot.convTails.count == convTailBuffers.count else { return }
+        for i in stateBuffers.indices {
+            if let dst = stateBuffers[i], let src = snapshot.states[i], src.count == dst.length {
+                src.copyBytes(to: dst.contents().assumingMemoryBound(to: UInt8.self), count: dst.length)
+            }
+            if let dst = convTailBuffers[i], let src = snapshot.convTails[i], src.count == dst.length {
+                src.copyBytes(to: dst.contents().assumingMemoryBound(to: UInt8.self), count: dst.length)
+            }
+        }
+    }
+
     public func isLinear(layer: Int) -> Bool { stateBuffers[layer] != nil }
 
     /// Reset all recurrent state to the empty-context value (zeros).

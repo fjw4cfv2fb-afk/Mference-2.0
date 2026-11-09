@@ -118,54 +118,111 @@ enum PrefillMoEGrouping {
                                                            actual: pairs.count)
         }
 
-        var seenTokenRanks: Set<UInt64> = []
-        seenTokenRanks.reserveCapacity(pairs.count)
-        for pair in pairs {
-            guard pair.token < UInt32(queryCount) else {
+        var isCanonicalOrder = true
+        let topKU32 = UInt32(topK)
+        let queryCountU32 = UInt32(queryCount)
+        let numExpertsU32 = UInt32(numExperts)
+        var counts = Array(repeating: UInt32(0), count: numExperts)
+
+        for idx in 0..<expectedPairs {
+            let pair = pairs[idx]
+            guard pair.token < queryCountU32 else {
                 throw PrefillMoEGroupingError.tokenOutOfRange(pair.token)
             }
-            guard pair.rank < UInt32(topK) else {
+            guard pair.rank < topKU32 else {
                 throw PrefillMoEGroupingError.rankOutOfRange(pair.rank)
             }
-            guard pair.expert < UInt32(numExperts) else {
+            guard pair.expert < numExpertsU32 else {
                 throw PrefillMoEGroupingError.expertOutOfRange(pair.expert)
             }
-            let key = UInt64(pair.token) << 32 | UInt64(pair.rank)
-            guard seenTokenRanks.insert(key).inserted else {
-                throw PrefillMoEGroupingError.duplicateTokenRank(token: pair.token,
-                                                                rank: pair.rank)
+            let expectedToken = UInt32(idx / topK)
+            let expectedRank = UInt32(idx % topK)
+            if pair.token != expectedToken || pair.rank != expectedRank {
+                isCanonicalOrder = false
             }
+            counts[Int(pair.expert)] &+= 1
         }
 
-        let sortedPairs = pairs.sorted {
-            if let expertSortKeys {
-                let lhsKey = expertSortKeys[Int($0.expert)]
-                let rhsKey = expertSortKeys[Int($1.expert)]
-                if lhsKey != rhsKey { return lhsKey < rhsKey }
-            }
-            if $0.expert != $1.expert { return $0.expert < $1.expert }
-            if $0.token != $1.token { return $0.token < $1.token }
-            return $0.rank < $1.rank
-        }
-
+        let sortedPairs: [PrefillTokenExpertPair]
         var offsets = Array(repeating: UInt32.max, count: numExperts)
-        var counts = Array(repeating: UInt32(0), count: numExperts)
         var groups: [PrefillMoEGroup] = []
-        groups.reserveCapacity(min(numExperts, sortedPairs.count))
+        groups.reserveCapacity(min(numExperts, expectedPairs))
 
-        var i = 0
-        while i < sortedPairs.count {
-            let expert = sortedPairs[i].expert
-            let start = i
-            while i < sortedPairs.count, sortedPairs[i].expert == expert {
-                i += 1
+        if isCanonicalOrder {
+            // Fast O(N + numExperts log numExperts) bucket sort when pairs
+            // arrive in canonical (token, rank) order from PrefillRouter.
+            var orderedExperts: [Int] = []
+            orderedExperts.reserveCapacity(min(numExperts, expectedPairs))
+            for expert in 0..<numExperts where counts[expert] > 0 {
+                orderedExperts.append(expert)
             }
-            let count = i - start
-            offsets[Int(expert)] = UInt32(start)
-            counts[Int(expert)] = UInt32(count)
-            groups.append(PrefillMoEGroup(expert: expert,
-                                          pairStart: UInt32(start),
-                                          pairCount: UInt32(count)))
+            if let expertSortKeys {
+                orderedExperts.sort { lhs, rhs in
+                    let lhsKey = expertSortKeys[lhs]
+                    let rhsKey = expertSortKeys[rhs]
+                    if lhsKey != rhsKey { return lhsKey < rhsKey }
+                    return lhs < rhs
+                }
+            }
+
+            var writeCursor = Array(repeating: 0, count: numExperts)
+            var runningStart = 0
+            for expert in orderedExperts {
+                let count = Int(counts[expert])
+                offsets[expert] = UInt32(runningStart)
+                writeCursor[expert] = runningStart
+                groups.append(PrefillMoEGroup(expert: UInt32(expert),
+                                              pairStart: UInt32(runningStart),
+                                              pairCount: UInt32(count)))
+                runningStart += count
+            }
+
+            sortedPairs = Array(unsafeUninitializedCapacity: expectedPairs) { buffer, initializedCount in
+                for idx in 0..<expectedPairs {
+                    let pair = pairs[idx]
+                    let e = Int(pair.expert)
+                    let dst = writeCursor[e]
+                    buffer.initializeElement(at: dst, to: pair)
+                    writeCursor[e] = dst &+ 1
+                }
+                initializedCount = expectedPairs
+            }
+        } else {
+            var seenTokenRanks: Set<UInt64> = []
+            seenTokenRanks.reserveCapacity(pairs.count)
+            for pair in pairs {
+                let key = UInt64(pair.token) << 32 | UInt64(pair.rank)
+                guard seenTokenRanks.insert(key).inserted else {
+                    throw PrefillMoEGroupingError.duplicateTokenRank(token: pair.token,
+                                                                    rank: pair.rank)
+                }
+            }
+
+            sortedPairs = pairs.sorted {
+                if let expertSortKeys {
+                    let lhsKey = expertSortKeys[Int($0.expert)]
+                    let rhsKey = expertSortKeys[Int($1.expert)]
+                    if lhsKey != rhsKey { return lhsKey < rhsKey }
+                }
+                if $0.expert != $1.expert { return $0.expert < $1.expert }
+                if $0.token != $1.token { return $0.token < $1.token }
+                return $0.rank < $1.rank
+            }
+
+            var i = 0
+            while i < sortedPairs.count {
+                let expert = sortedPairs[i].expert
+                let start = i
+                while i < sortedPairs.count, sortedPairs[i].expert == expert {
+                    i += 1
+                }
+                let count = i - start
+                offsets[Int(expert)] = UInt32(start)
+                counts[Int(expert)] = UInt32(count)
+                groups.append(PrefillMoEGroup(expert: expert,
+                                              pairStart: UInt32(start),
+                                              pairCount: UInt32(count)))
+            }
         }
 
         var tiles: [PrefillMoETile] = []

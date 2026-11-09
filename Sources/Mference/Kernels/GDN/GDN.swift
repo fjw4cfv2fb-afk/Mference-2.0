@@ -19,6 +19,7 @@ final class GDN {
     private let qwenDeltaDecodePSO: MTLComputePipelineState?
     private let qwenDeltaGatedDecodePSO: MTLComputePipelineState?
     private let deltaPrefillPSO: MTLComputePipelineState
+    private let qwenDeltaPrefillPSO: MTLComputePipelineState?
     private let gatedNormPSO: MTLComputePipelineState
     private let inProjPSO: MTLComputePipelineState
     private let inProjSpecializedPSO: MTLComputePipelineState?
@@ -87,6 +88,11 @@ final class GDN {
             self.qwenDeltaGatedDecodePSO = nil
         }
         self.deltaPrefillPSO = try context.pipeline("gdn_delta_step_prefill")
+        self.qwenDeltaPrefillPSO = useQwenDecodeSpecialization && isQwenGeometry
+            ? try context.pipeline("gdn_delta_step_prefill_qwen",
+                                   constants: [],
+                                   maxTotalThreadsPerThreadgroup: 128)
+            : nil
         self.gatedNormPSO = try context.pipeline("gdn_gated_norm",
                                                  constants: outputGate.constants)
         self.inProjPSO = try context.pipeline("gdn_in_proj_gemv_simd",
@@ -325,7 +331,7 @@ final class GDN {
                                 y: MTLBuffer, yOffset: Int = 0,
                                 rows: Int) {
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
-        encoder.setComputePipelineState(deltaPrefillPSO)
+        encoder.setComputePipelineState(qwenDeltaPrefillPSO ?? deltaPrefillPSO)
         encoder.setBuffer(convOut, offset: convOutOffset, index: 0)
         encoder.setBuffer(aProj, offset: aProjOffset, index: 1)
         encoder.setBuffer(bProj, offset: bProjOffset, index: 2)

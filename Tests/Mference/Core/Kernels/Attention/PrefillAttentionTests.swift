@@ -166,6 +166,42 @@ import MferenceValidationSupport
                 "TensorOps 2D rel=\(rel) maxAbs=\(maxAbs) keys=\(visibleKeys)")
     }
 
+    @Test(arguments: [
+        1,
+        63, 64, 65,
+        255, 256,
+        1_023,
+    ])
+    func tensorOps2DFullAttentionHeadDim256MatchesReference(_ visibleKeys: Int) throws {
+        let context = try MetalContext()
+        guard context.device.supportsApple10TensorOps else { return }
+        for chunk in [1, 3, 4, 8] {
+            var fixture = Self.makeFixture(start: max(0, visibleKeys - 1),
+                                           chunk: chunk,
+                                           window: 0,
+                                           seed: 0xB970 + UInt64(visibleKeys * 17 + chunk),
+                                           headDim: 256,
+                                           qHeads: 16,
+                                           kvHeads: 2)
+            fixture.scale = 1.0 / Foundation.sqrt(256.0)
+            let candidate = try Self.runKernel(
+                fixture,
+                path: .fullTensorOps2DValidityV2)
+            let repeated = try Self.runKernel(
+                fixture,
+                path: .fullTensorOps2DValidityV2)
+            let reference = Self.reference(fixture)
+            let maxAbs = RelError.maxAbsDiff(candidate, reference)
+            let rel = RelError.compute(actual: candidate, reference: reference)
+            #expect(candidate == repeated,
+                    "TensorOps 2D hd256 full attention is not byte-stable at \(visibleKeys) keys chunk=\(chunk)")
+            #expect(maxAbs <= 2e-2,
+                    "TensorOps 2D hd256 maxAbs=\(maxAbs) rel=\(rel) keys=\(visibleKeys) chunk=\(chunk)")
+            #expect(rel <= 2e-2,
+                    "TensorOps 2D hd256 rel=\(rel) maxAbs=\(maxAbs) keys=\(visibleKeys) chunk=\(chunk)")
+        }
+    }
+
     @Test func preferredTensorOpsPathUsesSafeHardwareFallback() throws {
         let context = try MetalContext()
         let fixture = Self.makeFixture(start: 128,
