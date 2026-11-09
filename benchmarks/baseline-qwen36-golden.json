@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-11-09T14:18:13Z",
+  "model": "qwen36.gturbo",
+  "tests": [
+    {
+      "name": "Math_Proof",
+      "prompt": "Prove that the square root of 2 is irrational using a step-by-step contradiction proof.",
+      "tok_per_sec": 20.109,
+      "tokens": 150,
+      "decode_seconds": 7.46,
+      "output_preview": "To prove that $\\sqrt{2}$ is irrational, we use a proof by contradiction.\n\n**Step 1: Assume the opposite.**\nAssume, for the sake of contradiction, that $\\sqrt{2}$ is rational. By definition, a rational number can be expressed as a fraction a/b, where a and b are integers with no common factors other than 1, and b != 0."
+    },
+    {
+      "name": "Swift_Systems_Code",
+      "prompt": "Write an actor in Swift that manages a thread-safe LRU cache with an async retrieve/insert API and eviction policy.",
+      "tok_per_sec": 22.262,
+      "tokens": 250,
+      "decode_seconds": 11.23,
+      "output_preview": "import Foundation\n\nactor LRUCache<Key: Hashable, Value> {\n    private let capacity: Int\n    private var cache: [Key: Value] = [:]\n    private var order: [Key] = []\n\n    init(capacity: Int) {\n        self.capacity = capacity\n    }\n\n    func get(_ key: Key) -> Value? {\n        guard let value = cache[key] else { return nil }\n        if let index = order.firstIndex(of: key) { order.remove(at: index); order.append(key) }\n        return value\n    }\n}"
+    },
+    {
+      "name": "Logic_Deduction",
+      "prompt": "Alice, Bob, and Charlie each wear a colored hat (red or blue). Alice sees Bob and Charlie. Bob sees only Charlie. Charlie sees no hats. Alice says: 'I do not know my hat color.' Bob hears Alice and says: 'I do not know my hat color.' Assuming all are perfect logicians, what is Charlie's hat color and why?",
+      "tok_per_sec": 22.531,
+      "tokens": 180,
+      "decode_seconds": 7.99,
+      "output_preview": "Charlie's hat color is **Red**.\n\n1. Alice can see both Bob's and Charlie's hats. If both Bob and Charlie were wearing Blue hats, Alice would know that she must be wearing a Red hat (since at least one hat is Red). Because Alice says 'I do not know', it is impossible that both Bob and Charlie have Blue hats."
+    },
+    {
+      "name": "MoE_Architecture_Synthesis",
+      "prompt": "Summarize the key trade-offs between dense Transformers and Mixture-of-Experts (MoE) in 3 concise bullet points, followed by a markdown table comparing memory footprint, FLOPs per token, and routing overhead.",
+      "tok_per_sec": 21.928,
+      "tokens": 200,
+      "decode_seconds": 9.12,
+      "output_preview": "1. Parameter Capacity vs FLOPs: MoEs scale total capacity to hundreds of billions of parameters while keeping per-token inference FLOPs identical to a much smaller dense model.\n2. Memory Footprint: MoE models require massive VRAM/RAM to hold all expert weights resident.\n3. Routing Dynamics: Expert load balancing adds non-trivial routing latency and communication overhead."
+    },
+    {
+      "name": "Conceptual_Analogy",
+      "prompt": "Explain the concept of speculative decoding in LLMs using an analogy to a master chef and a sous-chef in a restaurant.",
+      "tok_per_sec": 21.623,
+      "tokens": 150,
+      "decode_seconds": 6.94,
+      "output_preview": "Think of speculative decoding as a high-end kitchen run by a Master Chef (the large, high-quality LLM) and an energetic Sous-Chef (the small, fast draft model).\n\nNormally, the Master Chef prepares every single garnish and chop slowly and meticulously, one token at a time."
+    }
+  ],
+  "summary": {
+    "average_tok_per_sec": 21.75,
+    "total_tokens": 930,
+    "total_decode_seconds": 42.74
+  }
+}
