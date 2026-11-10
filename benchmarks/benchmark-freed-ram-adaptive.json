@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-11-10T15:07:36Z",
+  "model": "qwen36.gturbo",
+  "tests": [
+    {
+      "name": "Math_Proof",
+      "prompt": "Prove that the square root of 2 is irrational using a step-by-step contradiction proof.",
+      "tok_per_sec": 20.533,
+      "tokens": 150,
+      "decode_seconds": 7.31,
+      "output_preview": "\n\nTo prove that $\\sqrt{2}$ is irrational, we use a proof by contradiction.\n\n**Step 1: Assume the opposite.**  \nAssume, for the sake of contradiction, that $\\sqrt{2}$ is rational. By definition, a rational number can be expressed as a fraction $\\frac{a}{b}$, where $a$ and $b$ are integers with no common factors other than 1 (i.e., the fraction is in lowest terms), and $b \\neq 0$.\n\nSo, suppose:\n$$\n\\sqrt{2} = \\frac{a}{b}\n$$\n\n**Step 2: Square both sides.**  \nSquaring both sides of the equation gives:\n"
+    },
+    {
+      "name": "Swift_Systems_Code",
+      "prompt": "Write an actor in Swift that manages a thread-safe LRU cache with an async retrieve/insert API and eviction policy.",
+      "tok_per_sec": 21.068,
+      "tokens": 250,
+      "decode_seconds": 11.87,
+      "output_preview": "\n\n```swift\nimport Foundation\n\nactor LRUCache<Key: Hashable, Value> {\n    private var capacity: Int\n    private var cache: [Key: Value]\n    private var order: [Key]\n\n    init(capacity: Int) {\n        self.capacity = capacity\n        self.cache = [:]\n        self.order = []\n    }\n\n    func get(_ key: Key) -> Value? {\n        guard let value = cache[key] else { return nil }\n        // Move accessed key to the end (most recently used)\n        order.removeAll { $0 == key }\n        order.append(key)\n        return value\n    }\n\n    func put(_ key: Key, value: Value) {\n        if cache[key] != nil {\n            // Update existing key\n            order.removeAll { $0 == key }\n        } else if cache.count >= capacity {\n            // Evict least recently used\n"
+    },
+    {
+      "name": "Logic_Deduction",
+      "prompt": "Alice, Bob, and Charlie each wear a colored hat (red or blue). Alice sees Bob and Charlie. Bob sees only Charlie. Charlie sees no hats. Alice says: 'I do not know my hat color.' Bob hears Alice and says: 'I do not know my hat color.' Assuming all are perfect logicians, what is Charlie's hat color and why?",
+      "tok_per_sec": 22.454,
+      "tokens": 180,
+      "decode_seconds": 8.02,
+      "output_preview": "\n\n<think>\nHere's a thinking process that leads to the solution:\n\n1.  **Analyze the Setup:**\n    *   **People:** Alice (A), Bob (B), Charlie (C).\n    *   **Items:** Hats (Red or Blue).\n    *   **Visibility:**\n        *   Alice sees Bob and Charlie.\n        *   Bob sees Charlie.\n        *   Charlie sees nothing.\n    *   **Information Flow:**\n        1.  Alice speaks first: \"I do not know my hat color.\"\n        2.  Bob hears Alice, then speaks: \"I do not know my hat color.\"\n    *   **Goal:** Determine Charlie's hat color based on these statements, assuming perfect logic.\n\n2.  **Deconstruct Alice's Statement:**\n    *   Alice sees Bob's hat ($\n"
+    },
+    {
+      "name": "MoE_Architecture_Synthesis",
+      "prompt": "Summarize the key trade-offs between dense Transformers and Mixture-of-Experts (MoE) in 3 concise bullet points, followed by a markdown table comparing memory footprint, FLOPs per token, and routing overhead.",
+      "tok_per_sec": 21.948,
+      "tokens": 200,
+      "decode_seconds": 9.11,
+      "output_preview": "\n\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Topic:** Dense Transformers vs. Mixture-of-Experts (MoE)\n   - **Key Requirements:**\n     - Summarize key trade-offs in exactly 3 concise bullet points\n     - Follow with a markdown table comparing:\n       - Memory footprint\n       - FLOPs per token\n       - Routing overhead\n   - **Constraints:** Concise, accurate, structured as requested.\n\n2.  **Deconstruct the Topic (Dense vs. MoE):**\n   - *Dense Transformers:* All parameters active for every token. Simple architecture, predictable compute/memory, but scales linearly with parameters for every token.\n   - *MoE (Mixture-of-Experts):* Only a subset of parameters (experts) activated per token via a routing mechanism. Scales model capacity without proportional compute/memory increase per token, but introduces routing complexity\n"
+    },
+    {
+      "name": "Conceptual_Analogy",
+      "prompt": "Explain the concept of speculative decoding in LLMs using an analogy to a master chef and a sous-chef in a restaurant.",
+      "tok_per_sec": 21.711,
+      "tokens": 150,
+      "decode_seconds": 6.91,
+      "output_preview": "\n\n<think>\nHere's a thinking process:\n\n1.  **Understand User Request:**\n   - **Topic:** Speculative decoding in Large Language Models (LLMs)\n   - **Requirement:** Explain using an analogy of a master chef and a sous-chef in a restaurant\n   - **Goal:** Make the technical concept accessible and intuitive through the analogy while maintaining accuracy.\n\n2.  **Deconstruct Speculative Decoding (Technical Core):**\n   - What is it? A technique to speed up LLM inference.\n   - How does it work?\n     - A smaller, faster \"draft\" model generates multiple candidate tokens quickly.\n     - The larger, more accurate \"target\" model verifies these candidates in\n"
+    }
+  ],
+  "summary": {
+    "average_tok_per_sec": 21.51,
+    "total_tokens": 930,
+    "total_decode_seconds": 43.22
+  }
+}

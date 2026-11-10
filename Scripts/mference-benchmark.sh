@@ -6,6 +6,7 @@ set -euo pipefail
 
 CLI_BIN="${CLI_BIN:-/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI}"
 MODEL_DIR="${MODEL_DIR:-/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo}"
+RDADVISE_MODE="${RDADVISE_MODE:-off}"
 BENCHMARK_DIR="/Users/vladslugin/Documents/Mference/benchmarks"
 OUT_FILE="${1:-${BENCHMARK_DIR}/baseline-qwen36-$(date +%Y%m%d_%H%M%S).json}"
 
@@ -73,6 +74,7 @@ for i in "${!TEST_NAMES[@]}"; do
         --prompt "$PROMPT" \
         --max-new "$MAX_TOK" \
         --expert-cache-slots 96 \
+        --rdadvise "$RDADVISE_MODE" \
         --verify trusted-receipt 2>&1)
 
     # Extract timing metrics from Mference footer
