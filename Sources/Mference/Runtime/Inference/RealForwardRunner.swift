@@ -352,6 +352,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Test-only failure seam. Prior layer work is drained at this boundary;
     /// production leaves it nil and adds no GPU synchronization.
     var prefillWillEncodeLayer: ((Int) throws -> Void)?
+    /// Qwen 3.6 MTP (multi-token-prediction) speculative draft runner.
+    var mtp: Qwen36MTPSpeculator?
 
     private static let rdadviseBoundedMissCap = 12
     private static let rdadviseBoundedMaxCallNanos: UInt64 = 250_000
@@ -989,9 +991,21 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             self.onesPerExpertScale = try bf16OnesBuffer(count: cfg.numExperts,
                                                          label: "per_expert_scale.ones")
         }
+
+        if model.config.family == .qwen36 {
+            let mtpSetting = ProcessInfo.processInfo.environment["MFERENCE_MTP"]
+            let enableMTP = CheckpointIdentity.qwenMTPEnabled(modelID: model.modelID, setting: mtpSetting)
+            if enableMTP {
+                self.mtp = try? Qwen36MTPSpeculator.probe(model: model,
+                                                          context: ctx,
+                                                          config: cfg,
+                                                          maxContext: maxContext)
+            }
+        }
     }
 
     public func reset() {
+        mtp?.reset()
         kv?.reset()
         gdnState?.reset()
         gdnSnapshots.removeAll()
@@ -1048,6 +1062,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
     public func prepareForContinuation(expectedPosition: Int) throws {
         try prefillChunkState.requireClean(operation: "prepareForContinuation")
+        try mtp?.prepareForContinuation(expectedPosition: expectedPosition)
         guard let kv else {
             throw PrefillError.prefillCursorMismatch(
                 "continuation requires an initialized KV cache")
@@ -1494,11 +1509,34 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
     public func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws {
         try prefillChunkState.requireClean(operation: "produce")
+        if let mtp, useFusedGreedyHead {
+            if let queued = try mtp.consumePending(token: token, position: position) {
+                lastGreedyToken = queued
+                return
+            }
+        }
         try await produceToken(token: token,
                                position: position,
                                into: logits,
                                emitHead: true,
                                outputMode: .greedyIfAvailable)
+        if let mtp, useFusedGreedyHead, mtp.canRunRound(position: position) {
+            let targetArgmax = lastGreedyToken
+            if let drafts = try? mtp.draft(bonus: token, position: position, count: 1),
+               let d1 = drafts.first {
+                if UInt32(bitPattern: d1) == targetArgmax {
+                    // Speculative accept: evaluate d1 at position + 1 to fetch the bonus token
+                    try await produceToken(token: d1,
+                                           position: position + 1,
+                                           into: logits,
+                                           emitHead: true,
+                                           outputMode: .greedyIfAvailable)
+                    let nextTargetArgmax = lastGreedyToken
+                    mtp.recordAccepted(drafts: [d1], emitted: [targetArgmax, nextTargetArgmax], position: position)
+                    lastGreedyToken = targetArgmax
+                }
+            }
+        }
     }
 
     public func prefillChunked(tokens: ArraySlice<Int32>,
@@ -2759,6 +2797,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if outputMode == .greedyIfAvailable, useFusedGreedyHead {
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
             }
+            if let mtp {
+                if let normCB = ctx.queue.makeCommandBuffer() {
+                    self.rms.encodeBF16W(commandBuffer: normCB,
+                                         x: scratch.hidden,
+                                         xOffset: (t - 1) * D * MemoryLayout<Float16>.stride,
+                                         weight: finalNorm.buffer,
+                                         weightOffset: Int(finalNorm.offset),
+                                         out: mtp.lastHiddenBuf,
+                                         d: UInt32(D), eps: eps)
+                    normCB.commit()
+                    waitForCompletion(normCB)
+                }
+            }
         }
 
         kv?.advance(by: tokens.count)
@@ -3533,6 +3584,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
             } else {
                 totalHeadNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
+            }
+            if let mtp {
+                if let normCB = ctx.queue.makeCommandBuffer() {
+                    self.rms.encodeBF16W(commandBuffer: normCB,
+                                         x: self.hidden,
+                                         weight: fNorm.buffer,
+                                         weightOffset: Int(fNorm.offset),
+                                         out: mtp.lastHiddenBuf,
+                                         d: D, eps: eps)
+                    normCB.commit()
+                    waitForCompletion(normCB)
+                }
             }
         } else {
             if let pending = pendingRoutedCommand {
