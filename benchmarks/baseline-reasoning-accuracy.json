@@ -9,27 +9,27 @@
       "category": "Algebra / Word Problem",
       "prompt": "A train leaves Station A traveling at 60 mph. Two hours later, a second train leaves Station A on a parallel track traveling at 90 mph in the same direction. How many hours after the second train leaves will it overtake the first train? Provide concise step-by-step arithmetic and on the final line write: Final Answer: <number>",
       "target": "4",
-      "output": "Let $t$ be the time in hours after the second train leaves.\n\n1.  **Determine the head start of the first train:**\n    The first train travels for 2 hours before the second train leaves.\n    Distance covered by the first train during this head start = $60 \\text{ mph} \\times 2 \\text{ hours} = 120 \\text{ miles}$.\n\n2.  **Set up the equation for overtaking:**\n    Let $t$ be the time in hours after the second train leaves.\n    - Distance traveled by the first train after the second train leaves: $60t$\n    - Total distance of the first train from Station A: $120 + 60t$\n    - Distance traveled by the second train from Station A: $90t$\n\n    The second train overtakes the first when their distances from Station A are equal:\n    $$90t = 120 + 60t$$\n\n3.  **Solve for $t$:**\n    Subtract $60t$ from both sides:\n    $$30t = 120$$\n    Divide by 30:\n    $$t = 4$$\n\nFinal Answer: 4",
+      "output": "Let $t$ be the time in hours after the second train leaves.\n\n1.  **Determine the head start of the first train:**\n    The first train travels for 2 hours before the second train leaves.\n    Distance head start = Speed $\\times$ Time = $60 \\text{ mph} \\times 2 \\text{ hours} = 120 \\text{ miles}$.\n\n2.  **Set up the equation for distance:**\n    Let $t$ be the time in hours after the second train leaves.\n    *   Distance traveled by the first train = $60(t + 2)$\n    *   Distance traveled by the second train = $90t$\n\n    When the second train overtakes the first, their distances from Station A are equal:\n    $$90t = 60(t + 2)$$\n\n3.  **Solve for $t$:**\n    $$90t = 60t + 120$$\n    Subtract $60t$ from both sides:\n    $$30t = 120$$\n    Divide by 30:\n    $$t = 4$$\n\nThe second train overtakes the first train 4 hours after it leaves.\n\nFinal Answer: 4",
       "is_correct": true,
-      "tok_per_sec": 18.228
+      "tok_per_sec": 22.864
     },
     {
       "id": "race_logic_ranking",
       "category": "Deductive Logic",
       "prompt": "Five runners (A, B, C, D, E) finish a race with no ties. A finishes ahead of B. C finishes between A and B. D finishes after B. E finishes ahead of A. Who finished in second place? Provide concise reasoning and on the final line write: Final Answer: <letter>",
       "target": "A",
-      "output": "To determine the finishing order, let's analyze the constraints step by step:\n\n1.  **\"A finishes ahead of B\"**: This gives us the relative order $A < B$.\n2.  **\"C finishes between A and B\"**: This implies the order $A < C < B$.\n3.  **\"E finishes ahead of A\"**: Combining this with the previous point, we get $E < A < C < B$.\n4.  **\"D finishes after B\"**: Adding D to the end of the chain, we get $E < A < C < B < D$.\n\nThe complete finishing order from first to fifth is:\n1.  E\n2.  A\n3.  C\n4.  B\n5.  D\n\nThe runner who finished in second place is A.\n\nFinal Answer: A",
+      "output": "To determine who finished in second place, let's analyze the constraints step by step:\n\n1.  **A finishes ahead of B**: $A < B$\n2.  **C finishes between A and B**: This implies the order is either $A < C < B$ or $B < C < A$. Since we know $A < B$, the order must be $A < C < B$.\n3.  **D finishes after B**: $B < D$.\n4.  **E finishes ahead of A**: $E < A$.\n\nCombining these inequalities:\n*   From (4) and (2), we have $E < A < C < B$.\n*   From (3), we know $B < D$.\n\nSo, the full sequence of finishes is:\n$E \\rightarrow A \\rightarrow C \\rightarrow B \\rightarrow D$\n\nLet's verify the positions:\n1.  First: E\n2.  Second: A\n3.  Third: C\n4.  Fourth: B\n5.  Fifth: D\n\nThe runner in second place is A.\n\nFinal Answer: A",
       "is_correct": true,
-      "tok_per_sec": 19.594
+      "tok_per_sec": 25.554
     },
     {
       "id": "combinatorics_permutations",
       "category": "Discrete Math",
       "prompt": "How many distinct positive 3-digit integers can be formed using only the digits 2, 4, 6, and 8, if each digit can be used at most once? Provide concise calculation and on the final line write: Final Answer: <number>",
       "target": "24",
-      "output": "To find the number of distinct positive 3-digit integers that can be formed using the digits {2, 4, 6, 8} with each digit used at most once:\n1. Hundreds place: 4 choices (2, 4, 6, or 8)\n2. Tens place: 3 remaining choices\n3. Units place: 2 remaining choices\nTotal permutations: 4 * 3 * 2 = 24\n\nFinal Answer: 24",
+      "output": "To find the number of distinct positive 3-digit integers formed using the digits $\\{2, 4, 6, 8\\}$ with each digit used at most once, we can use the permutation formula or the multiplication principle.\n\n1.  **First Digit (Hundreds place):** There are 4 available digits $\\{2, 4, 6, 8\\}$. We can choose any of them. So, there are **4** choices.\n2.  **Second Digit (Tens place):** Since each digit can be used at most once, we have used 1 digit for the hundreds place. There are $4 - 1 = 3$ digits remaining. So, there are **3** choices.\n3.  **Third Digit (Units place):** We have used 2 digits so far. There are $4 - 2 = 2$ digits remaining. So, there are **2** choices.\n\nUsing the multiplication principle, the total number of distinct integers is:\n$$ 4 \\times 3 \\times 2 = 24 $$\n\nAlternatively, this is the number of permutations of 4 items taken 3 at a time, denoted as $P(4, 3)$:\n$$ P(4, 3) = \\frac{4!}{(4-3)!} = \\frac{4!}{1!} = 4 \\times 3 \\times 2 = 24 $$\n\nFinal Answer: 24",
       "is_correct": true,
-      "tok_per_sec": 19.94
+      "tok_per_sec": 23.143
     },
     {
       "id": "recursion_trace",
@@ -38,16 +38,16 @@
       "target": "11",
       "output": "To calculate the values for the recurrence relation $f(n) = f(n - 1) + 2 \\cdot f(n - 2)$ with base cases $f(0) = 0$ and $f(1) = 1$:\n\n1.  **Calculate $f(2)$**:\n    $$f(2) = f(1) + 2 \\cdot f(0) = 1 + 2(0) = 1$$\n\n2.  **Calculate $f(3)$**:\n    $$f(3) = f(2) + 2 \\cdot f(1) = 1 + 2(1) = 3$$\n\n3.  **Calculate $f(4)$**:\n    $$f(4) = f(3) + 2 \\cdot f(2) = 3 + 2(1) = 5$$\n\n4.  **Calculate $f(5)$**:\n    $$f(5) = f(4) + 2 \\cdot f(3) = 5 + 2(3) = 11$$\n\nFinal Answer: 11",
       "is_correct": true,
-      "tok_per_sec": 19.773
+      "tok_per_sec": 19.471
     },
     {
       "id": "cube_packing_geometry",
       "category": "Spatial / Geometry",
       "prompt": "A hollow cube has an inner edge length of 10 cm. How many solid 2 cm cubes can fit completely inside it? Provide concise calculation and on the final line write: Final Answer: <number>",
       "target": "125",
-      "output": "To determine how many solid 2 cm cubes fit inside a hollow cube with an inner edge length of 10 cm, we calculate the number of cubes that fit along each dimension.\n\n1.  **Calculate the number of cubes along one edge:**\n    $$ \\frac{\\text{Inner Edge Length}}{\\text{Cube Edge Length}} = \\frac{10 \\text{ cm}}{2 \\text{ cm}} = 5 $$\n    So, 5 cubes fit along the length, 5 along the width, and 5 along the height.\n\n2.  **Calculate the total number of cubes:**\n    $$ 5 \\times 5 \\times 5 = 125 $$\n\nFinal Answer: 125",
+      "output": "To determine how many solid 2 cm cubes fit inside a hollow cube with an inner edge length of 10 cm, we calculate the number of cubes that fit along each dimension.\n\n1.  **Calculate the number of cubes along one edge:**\n    $$ \\frac{\\text{Inner Edge Length}}{\\text{Cube Edge Length}} = \\frac{10 \\text{ cm}}{2 \\text{ cm}} = 5 $$\n    This means 5 cubes fit along the length, 5 along the width, and 5 along the height.\n\n2.  **Calculate the total number of cubes:**\n    Since the cubes are arranged in a 3D grid:\n    $$ 5 \\times 5 \\times 5 = 125 $$\n\nFinal Answer: 125",
       "is_correct": true,
-      "tok_per_sec": 19.693
+      "tok_per_sec": 19.833
     }
   ]
 }
