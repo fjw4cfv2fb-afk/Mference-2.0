@@ -355,6 +355,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Qwen 3.6 MTP (multi-token-prediction) speculative draft runner.
     var mtp: Qwen36MTPSpeculator?
 
+    public var mtpSpecStats: Qwen38ForwardRunner.MTPSpecStats? {
+        mtp.map {
+            Qwen38ForwardRunner.MTPSpecStats(
+                rounds: $0.stats.rounds,
+                draftedTokens: $0.stats.draftedTokens,
+                acceptedTokens: $0.stats.acceptedTokens,
+                emittedTokens: $0.stats.emittedTokens,
+                rollbacks: $0.stats.rollbacks,
+                draftNanos: $0.stats.draftNanos,
+                verifyNanos: $0.stats.verifyNanos,
+                acceptNanos: $0.stats.acceptNanos,
+                positionTrials: [],
+                positionAccepts: [])
+        }
+    }
+
     private static let rdadviseBoundedMissCap = 12
     private static let rdadviseBoundedMaxCallNanos: UInt64 = 250_000
     private static let rdadviseAdaptiveMissCap = 12
@@ -996,10 +1012,17 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             let mtpSetting = ProcessInfo.processInfo.environment["MFERENCE_MTP"]
             let enableMTP = CheckpointIdentity.qwenMTPEnabled(modelID: model.modelID, setting: mtpSetting)
             if enableMTP {
-                self.mtp = try? Qwen36MTPSpeculator.probe(model: model,
-                                                          context: ctx,
-                                                          config: cfg,
-                                                          maxContext: maxContext)
+                do {
+                    self.mtp = try Qwen36MTPSpeculator.probe(model: model,
+                                                              context: ctx,
+                                                              config: cfg,
+                                                              maxContext: maxContext)
+                    if self.mtp != nil && ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
+                        print("[mtp probe]: Qwen 3.6 MTP speculator probed and armed successfully!")
+                    }
+                } catch {
+                    print("[mtp probe error]: \(error)")
+                }
             }
         }
     }
@@ -1522,18 +1545,24 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                outputMode: .greedyIfAvailable)
         if let mtp, useFusedGreedyHead, mtp.canRunRound(position: position) {
             let targetArgmax = lastGreedyToken
-            if let drafts = try? mtp.draft(bonus: token, position: position, count: 1),
-               let d1 = drafts.first {
-                if UInt32(bitPattern: d1) == targetArgmax {
-                    // Speculative accept: evaluate d1 at position + 1 to fetch the bonus token
-                    try await produceToken(token: d1,
-                                           position: position + 1,
-                                           into: logits,
-                                           emitHead: true,
-                                           outputMode: .greedyIfAvailable)
-                    let nextTargetArgmax = lastGreedyToken
-                    mtp.recordAccepted(drafts: [d1], emitted: [targetArgmax, nextTargetArgmax], position: position)
-                    lastGreedyToken = targetArgmax
+            do {
+                let drafts = try mtp.draft(bonus: token, position: position, count: 1)
+                if let d1 = drafts.first {
+                    if UInt32(bitPattern: d1) == targetArgmax {
+                        // Speculative accept: evaluate d1 at position + 1 to fetch the bonus token
+                        try await produceToken(token: d1,
+                                               position: position + 1,
+                                               into: logits,
+                                               emitHead: true,
+                                               outputMode: .greedyIfAvailable)
+                        let nextTargetArgmax = lastGreedyToken
+                        mtp.recordAccepted(drafts: [d1], emitted: [targetArgmax, nextTargetArgmax], position: position)
+                        lastGreedyToken = targetArgmax
+                    }
+                }
+            } catch {
+                if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
+                    print("[mtp draft error]: \(error)")
                 }
             }
         }

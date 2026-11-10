@@ -269,6 +269,7 @@ final class Qwen36MTPSpeculator {
         }
 
         let draftStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        stats.rounds += 1
         var drafts: [Int32] = []
         var slot = mtpLen
         var tok: Int32

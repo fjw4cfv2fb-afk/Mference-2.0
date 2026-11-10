@@ -4,7 +4,11 @@ set -euo pipefail
 # Mference Objective Benchmark Suite
 # Measures exact decode tok/s, prefill latency, and quality across standardized prompts.
 
-CLI_BIN="${CLI_BIN:-/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI}"
+DEFAULT_BIN="/Users/vladslugin/Documents/Mference/.build/out/Products/Release/MferenceCLI"
+if [ ! -x "$DEFAULT_BIN" ]; then
+    DEFAULT_BIN="/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI"
+fi
+CLI_BIN="${CLI_BIN:-$DEFAULT_BIN}"
 MODEL_DIR="${MODEL_DIR:-/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo}"
 RDADVISE_MODE="${RDADVISE_MODE:-off}"
 BENCHMARK_DIR="/Users/vladslugin/Documents/Mference/benchmarks"

@@ -11,7 +11,10 @@ import subprocess
 import sys
 import tempfile
 
-CLI_BIN = os.environ.get("CLI_BIN", "/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI")
+default_bin = "/Users/vladslugin/Documents/Mference/.build/out/Products/Release/MferenceCLI"
+if not os.path.exists(default_bin):
+    default_bin = "/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI"
+CLI_BIN = os.environ.get("CLI_BIN", default_bin)
 MODEL_DIR = os.environ.get("MODEL_DIR", "/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo")
 OUT_FILE = sys.argv[1] if len(sys.argv) > 1 else "/Users/vladslugin/Documents/Mference/benchmarks/baseline-reasoning-accuracy.json"
 

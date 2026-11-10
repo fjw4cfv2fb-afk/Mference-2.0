@@ -271,9 +271,13 @@ public func run(args: Args,
             lines += "  expert io: none (dense family)\n"
             stderr.write(Data(lines.utf8))
         }
+        let specStats: Qwen38ForwardRunner.MTPSpecStats? = {
+            if let q38 = runner as? Qwen38ForwardRunner { return q38.mtpSpecStats }
+            if let real = runner as? RealForwardRunner { return real.mtpSpecStats }
+            return nil
+        }()
         if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1",
-           let q38 = runner as? Qwen38ForwardRunner,
-           let spec = q38.mtpSpecStats, spec.rounds > 0 {
+           let spec = specStats, spec.rounds > 0 {
             let ms = { (n: UInt64) in String(format: "%.1f", Double(n) / 1e6) }
             let acceptRate = spec.draftedTokens > 0
                 ? Double(spec.acceptedTokens) / Double(spec.draftedTokens) : 0
