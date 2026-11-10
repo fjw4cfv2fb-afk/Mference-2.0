@@ -61,14 +61,14 @@ public enum MTPAttachTool {
         guard var manifestRoot = try JSONSerialization
                 .jsonObject(with: manifestData) as? [String: Any],
               let arch = manifestRoot["arch"] as? [String: Any],
-              let family = arch["family"] as? String, family == "qwen38",
+              let family = arch["family"] as? String, (family == "qwen38" || family == "qwen36"),
               let d = arch["hiddenSize"] as? Int,
-              let f = arch["ffnIntermediate"] as? Int,
+              let f = (arch["moeIntermediateSize"] as? Int) ?? (arch["ffnIntermediate"] as? Int),
               let numHeads = arch["numHeads"] as? Int,
-              let numKVHeads = arch["numFullKVHeads"] as? Int,
-              let headDim = arch["fullHeadDim"] as? Int else {
+              let numKVHeads = (arch["numFullKVHeads"] as? Int) ?? (arch["numKVHeads"] as? Int),
+              let headDim = (arch["fullHeadDim"] as? Int) ?? (arch["headDim"] as? Int) else {
             throw RepackError.configurationInvalid(
-                detail: "\(manifestPath) is not a Qwen 3.8 manifest")
+                detail: "\(manifestPath) is not a supported Qwen 3.8/3.6 manifest")
         }
         // -- Every manifest file must exist at its recorded size BEFORE the
         // irreversible append: a pre-existing missing/truncated sidecar would
