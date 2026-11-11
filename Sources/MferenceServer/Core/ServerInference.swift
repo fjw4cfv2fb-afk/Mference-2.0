@@ -231,10 +231,13 @@ public actor ServerModelSession: ServerLoadedModel {
         let context = try MetalContext()
         let streamingMode: ExpertStreamingMode = .pread(slotCount: expertCacheSlots)
         let configSlots = expertCacheSlots
+        let specActive = ProcessInfo.processInfo.environment["MFERENCE_SPEC"] == "on"
+            || ProcessInfo.processInfo.environment["MFERENCE_MTP"] == "1"
+            || ProcessInfo.processInfo.environment["MFERENCE_FORCE_LOGITS_HEAD"] == "0"
         let runtime = RuntimeConfiguration(
             expertCacheSlots: configSlots,
             prefillChunkTokens: prefillChunkTokens,
-            forceLogitsHead: true)
+            forceLogitsHead: !specActive)
         let model = try Model.load(
             directoryURL: modelDirectory,
             device: context.device,
