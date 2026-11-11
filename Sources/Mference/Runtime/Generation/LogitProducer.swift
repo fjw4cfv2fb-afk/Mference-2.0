@@ -27,6 +27,11 @@ extension ContinuableLogitProducer {
 protocol FusedHeadLogitProducer: LogitProducer {
     var usesFusedGreedyHead: Bool { get }
     var lastGreedyToken: UInt32 { get }
+    func setOutputMode(_ mode: PrefillOutputMode)
+}
+
+extension FusedHeadLogitProducer {
+    func setOutputMode(_ mode: PrefillOutputMode) {}
 }
 
 protocol ContextWindowReporting: Sendable {

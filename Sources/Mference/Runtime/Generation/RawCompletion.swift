@@ -97,11 +97,8 @@ public func runRawCompletion(producer: any LogitProducer,
         throw GeneratorError.emptyPrompt
     }
     let fusedRunner = producer as? any FusedHeadLogitProducer
-    let fusedGreedy = fusedRunner?.usesFusedGreedyHead == true
-    guard !fusedGreedy || config.isPureGreedy else {
-        throw PrefillError.unsupportedPrefillSeed(
-            "the fused-head producer cannot serve this sampling configuration; use a logits head")
-    }
+    let fusedGreedy = fusedRunner?.usesFusedGreedyHead == true && config.isPureGreedy
+    fusedRunner?.setOutputMode(fusedGreedy ? .greedyIfAvailable : .logits)
 
     let cachedPromptTokens: Int
     switch start {

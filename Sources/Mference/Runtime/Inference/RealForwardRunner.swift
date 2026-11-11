@@ -1560,6 +1560,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     }
     public private(set) var lastGreedyToken: UInt32 = 0
     public var usesFusedGreedyHead: Bool { useFusedGreedyHead }
+    public var activeOutputMode: PrefillOutputMode = .greedyIfAvailable
+    public func setOutputMode(_ mode: PrefillOutputMode) {
+        self.activeOutputMode = mode
+    }
     public private(set) var totalRDAdviseNanos: UInt64 = 0
     public private(set) var totalRDAdviseCalls: UInt64 = 0
     public private(set) var totalRDAdviseBytes: UInt64 = 0
@@ -1734,7 +1738,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     public func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws {
         try prefillChunkState.requireClean(operation: "produce")
         speculator?.notifyTokens(tokens: [token][...], startPosition: position)
-        if let speculator, useFusedGreedyHead {
+        if let speculator, useFusedGreedyHead, activeOutputMode == .greedyIfAvailable {
             if let queued = try speculator.consumePending(token: token, position: position) {
                 lastGreedyToken = queued
                 return
@@ -1756,7 +1760,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                position: position,
                                into: logits,
                                emitHead: true,
-                               outputMode: .greedyIfAvailable)
+                               outputMode: activeOutputMode)
     }
 
     public func prefillChunked(tokens: ArraySlice<Int32>,
