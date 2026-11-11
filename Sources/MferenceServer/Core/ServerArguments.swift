@@ -92,7 +92,7 @@ public struct ServerArguments: Equatable, Sendable {
                              Prompt KV reuse mode (default single-prefix).
       --expert-cache-slots <slots>
                              Routed expert slot cache count (default 32). Allowed:
-                             8, 16, 24, 32, 48, 64, 96, 128.
+                             8, 16, 24, 32, 48, 64, 96, 104, 112, 128.
       --prefill-chunk <tokens>
                              Prefill chunk tokens: 32, 64, 128, 256, 512, 1024,
                              2048, or 4096 (default 128). Larger chunks cut
@@ -186,9 +186,9 @@ public struct ServerArguments: Equatable, Sendable {
                 promptCacheMode = parsed
             case "--expert-cache-slots":
                 guard let parsed = Int(value),
-                      [8, 16, 24, 32, 48, 64, 96, 128].contains(parsed) else {
+                      [8, 16, 24, 32, 48, 64, 96, 104, 112, 128].contains(parsed) else {
                     throw ServerArgumentError.invalid(
-                        "--expert-cache-slots must be one of 8, 16, 24, 32, 48, 64, 96, or 128")
+                        "--expert-cache-slots must be one of 8, 16, 24, 32, 48, 64, 96, 104, 112, or 128")
                 }
                 expertCacheSlots = parsed
             case "--prefill-chunk":

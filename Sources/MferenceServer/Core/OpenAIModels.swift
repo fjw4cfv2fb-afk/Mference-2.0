@@ -291,7 +291,12 @@ public enum OpenAIRequestValidator {
                                 dialect: ChatDialect,
                                 swiftQwen: Bool?,
                                 qwenReasoning: Bool?) throws -> ValidatedChatRequest {
-        guard request.model == modelID else { throw ServerRequestError.unknownModel }
+        let isAllowedModel = request.model == modelID
+            || request.model == "deepseek-chat"
+            || request.model == "deepseek-reasoner"
+            || request.model == "default"
+            || request.model.contains("qwen")
+        guard isAllowedModel else { throw ServerRequestError.unknownModel }
         let isSwiftQwen = swiftQwen ?? (modelID.split(separator: "@").first == Substring(CheckpointIdentity.swiftQwen38))
         let supportsEffort = qwenReasoning ?? (isSwiftQwen ||
             modelID.split(separator: "@").first == Substring(CheckpointIdentity.baseQwen38))

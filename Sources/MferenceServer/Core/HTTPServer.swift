@@ -202,12 +202,18 @@ private final class ServerHTTPHandler: ChannelInboundHandler, @unchecked Sendabl
         case (.GET, "/v1/models"):
             switch mode {
             case .single(let modelID, _, _):
+                var list: [OpenAIModelList.Model] = [
+                    .init(id: modelID, object: "model", created: 0, ownedBy: "mference")
+                ]
+                if modelID != "deepseek-chat" {
+                    list.append(.init(id: "deepseek-chat", object: "model", created: 0, ownedBy: "mference"))
+                }
+                if modelID != "deepseek-reasoner" {
+                    list.append(.init(id: "deepseek-reasoner", object: "model", created: 0, ownedBy: "mference"))
+                }
                 let response = OpenAIModelList(
                     object: "list",
-                    data: [.init(id: modelID,
-                                 object: "model",
-                                 created: 0,
-                                 ownedBy: "mference")])
+                    data: list)
                 writeCodable(context, status: .ok, response)
             case .library(let library):
                 writeCodable(context, status: .ok, library.snapshot.modelList)
