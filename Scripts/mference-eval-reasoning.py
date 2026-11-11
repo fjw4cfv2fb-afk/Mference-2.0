@@ -4,6 +4,7 @@
 Runs verifiable multi-step reasoning problems with exact ground-truth answers
 using official chat formatting to measure baseline vs patched model intelligence.
 """
+import argparse
 import json
 import os
 import re
@@ -15,8 +16,8 @@ default_bin = "/Users/vladslugin/Documents/Mference/.build/out/Products/Release/
 if not os.path.exists(default_bin):
     default_bin = "/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI"
 CLI_BIN = os.environ.get("CLI_BIN", default_bin)
-MODEL_DIR = os.environ.get("MODEL_DIR", "/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo")
-OUT_FILE = sys.argv[1] if len(sys.argv) > 1 else "/Users/vladslugin/Documents/Mference/benchmarks/baseline-reasoning-accuracy.json"
+MODEL_DIR = os.environ.get("MODEL_DIR", "/Users/vladslugin/Documents/Mference/scratch/test_qwen36.gturbo")
+DEFAULT_OUT_FILE = "/Users/vladslugin/Documents/Mference/benchmarks/baseline-reasoning-accuracy.json"
 
 PROBLEMS = [
     {
@@ -57,7 +58,7 @@ PROBLEMS = [
 ]
 
 
-def run_problem(p):
+def run_problem(p, expert_slots="96"):
     messages = [{"role": "user", "content": p["prompt"]}]
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
         json.dump(messages, f)
@@ -68,8 +69,9 @@ def run_problem(p):
             CLI_BIN,
             "--model", MODEL_DIR,
             "--messages-file", msg_file,
-            "--max-new", "350",
-            "--expert-cache-slots", "96",
+            "--max-new", "450",
+            "--expert-cache-slots", str(expert_slots),
+            "--temperature", "0",
             "--verify", "trusted-receipt"
         ]
         res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -98,21 +100,35 @@ def run_problem(p):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate reasoning accuracy on Mference")
+    parser.add_argument("out_file", nargs="?", default=DEFAULT_OUT_FILE, help="Path to write JSON results")
+    parser.add_argument("--cases", nargs="*", default=None, help="Filter problem IDs to evaluate")
+    parser.add_argument("--expert-cache-slots", default="96", help="Expert cache slots (e.g. 96, 128)")
+    args = parser.parse_args()
+
+    out_file = args.out_file
+    if out_file.startswith("--"): # In case someone passed flags without out_file
+        out_file = DEFAULT_OUT_FILE
+
     print("=" * 64)
     print("  Mference Objective Reasoning & Intelligence Benchmark")
     print("=" * 64)
     print(f"Model:  {os.path.basename(MODEL_DIR)}")
     print(f"Binary: {CLI_BIN}")
     print(f"Mode:   Official Chat Template via messages-file")
-    print(f"Tests:  {len(PROBLEMS)} verifiable reasoning tasks")
+    print(f"Slots:  {args.expert_cache_slots}")
+    cases_to_run = PROBLEMS
+    if args.cases:
+        cases_to_run = [p for p in PROBLEMS if p["id"] in args.cases]
+    print(f"Tests:  {len(cases_to_run)} verifiable reasoning tasks")
     print("=" * 64)
 
     results = []
     correct_count = 0
 
-    for i, p in enumerate(PROBLEMS, 1):
-        print(f"\n[{i}/{len(PROBLEMS)}] Evaluating: {p['category']} ({p['id']})...")
-        r = run_problem(p)
+    for i, p in enumerate(cases_to_run, 1):
+        print(f"\n[{i}/{len(cases_to_run)}] Evaluating: {p['category']} ({p['id']})...")
+        r = run_problem(p, expert_slots=args.expert_cache_slots)
         results.append(r)
         if r["is_correct"]:
             correct_count += 1
@@ -120,26 +136,28 @@ def main():
         else:
             print(f"  Result: 🔴 FAIL (Expected: {p['target']}) | {r['tok_per_sec']} tok/s")
 
-    pct = (correct_count / len(PROBLEMS)) * 100
+    pct = (correct_count / len(cases_to_run)) * 100 if cases_to_run else 0.0
     print("\n" + "=" * 64)
     print("  REASONING ACCURACY SUMMARY")
     print("=" * 64)
-    print(f"Score:    {correct_count} / {len(PROBLEMS)} ({pct:.1f}%)")
+    print(f"Score:    {correct_count} / {len(cases_to_run)} ({pct:.1f}%)")
     print(f"Target:   Assess whether future patches preserve or increase this")
     print("=" * 64)
 
-    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
+    out_dir = os.path.dirname(out_file)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     out_data = {
         "model": os.path.basename(MODEL_DIR),
-        "total_tests": len(PROBLEMS),
+        "total_tests": len(cases_to_run),
         "correct": correct_count,
         "accuracy_pct": pct,
         "results": results
     }
-    with open(OUT_FILE, "w", encoding="utf-8") as f:
+    with open(out_file, "w", encoding="utf-8") as f:
         json.dump(out_data, f, indent=2)
 
-    print(f"Saved evaluation report to: {OUT_FILE}")
+    print(f"Saved evaluation report to: {out_file}")
 
 
 if __name__ == "__main__":

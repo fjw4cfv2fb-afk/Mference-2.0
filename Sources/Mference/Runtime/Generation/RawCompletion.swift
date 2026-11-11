@@ -232,6 +232,9 @@ public func runRawCompletion(producer: any LogitProducer,
         }
 
         let delta = detok.push(tokenID)
+        if ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1" {
+            print("[token]: id=\(tokenID), str=\(delta.debugDescription)")
+        }
         let visible = stopMatcher.push(delta)
         onProgress(.token(index: generated - 1, id: tokenID, delta: visible))
 

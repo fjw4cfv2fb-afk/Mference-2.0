@@ -23,6 +23,7 @@ final class GDN {
     private let gatedNormPSO: MTLComputePipelineState
     private let inProjPSO: MTLComputePipelineState
     private let inProjSpecializedPSO: MTLComputePipelineState?
+    private let stateSnapshotPSO: MTLComputePipelineState?
 
     let config: LinearAttentionConfig
 
@@ -112,6 +113,34 @@ final class GDN {
         } else {
             self.inProjSpecializedPSO = nil
         }
+        self.stateSnapshotPSO = try? context.pipeline("gdn_state_snapshot")
+    }
+
+    /// Zero-barrier compute copy for GDN recurrent state and conv tail.
+    /// Runs directly within the compute queue without opening/closing blit encoders.
+    func encodeStateSnapshot(commandBuffer: MTLCommandBuffer,
+                             srcState: MTLBuffer, srcStateOffset: Int = 0,
+                             dstState: MTLBuffer, dstStateOffset: Int = 0,
+                             srcTail: MTLBuffer, srcTailOffset: Int = 0,
+                             dstTail: MTLBuffer, dstTailOffset: Int = 0,
+                             stateBytes: Int,
+                             tailBytes: Int) {
+        guard let pso = stateSnapshotPSO,
+              let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pso)
+        encoder.setBuffer(srcState, offset: srcStateOffset, index: 0)
+        encoder.setBuffer(dstState, offset: dstStateOffset, index: 1)
+        encoder.setBuffer(srcTail, offset: srcTailOffset, index: 2)
+        encoder.setBuffer(dstTail, offset: dstTailOffset, index: 3)
+        var stateVecs = UInt32(stateBytes / 16)
+        var tailVecs = UInt32(tailBytes / 8)
+        encoder.setBytes(&stateVecs, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&tailVecs, length: MemoryLayout<UInt32>.size, index: 5)
+        let totalThreads = max(Int(stateVecs), Int(tailVecs))
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (totalThreads + 255) / 256, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
     }
 
     /// Fused `in_proj_qkv` / `in_proj_z` / `in_proj_a` / `in_proj_b` INT4 GEMV.
@@ -121,10 +150,10 @@ final class GDN {
     /// unchanged.
     func encodeInputProjections(commandBuffer: MTLCommandBuffer,
                                 x: MTLBuffer, xOffset: Int = 0,
-                                qkv: TensorView, qkvOut: MTLBuffer,
-                                z: TensorView, zOut: MTLBuffer,
-                                a: TensorView, aOut: MTLBuffer,
-                                b: TensorView, bOut: MTLBuffer,
+                                qkv: TensorView, qkvOut: MTLBuffer, qkvOutOffset: Int = 0,
+                                z: TensorView, zOut: MTLBuffer, zOutOffset: Int = 0,
+                                a: TensorView, aOut: MTLBuffer, aOutOffset: Int = 0,
+                                b: TensorView, bOut: MTLBuffer, bOutOffset: Int = 0,
                                 hiddenSize: Int) {
         precondition(hiddenSize % Quantization.groupSize == 0,
                      "hiddenSize must be a multiple of \(Quantization.groupSize)")
@@ -141,10 +170,10 @@ final class GDN {
             encoder.setBuffer(view.buffer, offset: Int(view.biasOffset), index: slot * 3 + 2)
         }
         encoder.setBuffer(x, offset: xOffset, index: 12)
-        encoder.setBuffer(qkvOut, offset: 0, index: 13)
-        encoder.setBuffer(zOut, offset: 0, index: 14)
-        encoder.setBuffer(aOut, offset: 0, index: 15)
-        encoder.setBuffer(bOut, offset: 0, index: 16)
+        encoder.setBuffer(qkvOut, offset: qkvOutOffset, index: 13)
+        encoder.setBuffer(zOut, offset: zOutOffset, index: 14)
+        encoder.setBuffer(aOut, offset: aOutOffset, index: 15)
+        encoder.setBuffer(bOut, offset: bOutOffset, index: 16)
         var qkvRows = UInt32(config.qkvDim)
         var zRows = UInt32(config.valueDim)
         var abRows = UInt32(config.numVHeads)

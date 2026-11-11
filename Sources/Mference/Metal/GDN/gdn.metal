@@ -859,3 +859,25 @@ kernel void gdn_gated_norm(
         out[base + i] = half(normed * gate);
     }
 }
+
+// ----------------------------------------------------------------------------
+// Zero-barrier vector copy for GDN state and conv tail snapshotting.
+// Avoids MTLBlitCommandEncoder switches between compute kernels.
+// ----------------------------------------------------------------------------
+kernel void gdn_state_snapshot(
+    device const float4* srcState  [[buffer(0)]],
+    device float4*       dstState  [[buffer(1)]],
+    device const half4*  srcTail   [[buffer(2)]],
+    device half4*        dstTail   [[buffer(3)]],
+    constant uint&       stateVecs [[buffer(4)]],
+    constant uint&       tailVecs  [[buffer(5)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid < stateVecs) {
+        dstState[tid] = srcState[tid];
+    }
+    if (tid < tailVecs) {
+        dstTail[tid] = srcTail[tid];
+    }
+}
+

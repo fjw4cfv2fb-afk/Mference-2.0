@@ -226,8 +226,17 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         var reserved = [Bool](repeating: false, count: slotCount)
 
         for index in experts.indices {
+            let expert = experts[index]
+            if expert >= 0 && expert < layout.expertsPerLayer {
+                let slot = Int(slotOfPointer[expert])
+                if slot >= 0 && slot < slotCount && !reserved[slot] {
+                    assignedSlots[index] = slot
+                    reserved[slot] = true
+                    continue
+                }
+            }
             for slot in 0..<slotCount
-                where !reserved[slot] && slotExpert[slot] == experts[index] {
+                where !reserved[slot] && slotExpert[slot] == expert {
                 assignedSlots[index] = slot
                 reserved[slot] = true
                 break
@@ -246,10 +255,16 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         }
 
         let misses = experts.indices.filter { assignedSlots[$0] == -1 }
-        let evictable = (0..<slotCount)
-            .filter { !reserved[$0] }
-            .sorted { shouldEvictSlot($0, before: $1) }
-        guard misses.count <= evictable.count else { return nil }
+        var evictableSlots: [Int] = []
+        if !misses.isEmpty {
+            let unreserved = (0..<slotCount).filter { !reserved[$0] }
+            guard misses.count <= unreserved.count else { return nil }
+            if unreserved.count <= misses.count {
+                evictableSlots = unreserved
+            } else {
+                evictableSlots = unreserved.sorted { shouldEvictSlot($0, before: $1) }
+            }
+        }
 
         useClock = clock
         for expert in experts where expert >= 0 && expert < expertUseCount.count {
@@ -259,7 +274,7 @@ public final class PreadExpertStreamer: @unchecked Sendable {
             slotLastUse[slot] = clock
         }
         for (offset, index) in misses.enumerated() {
-            let slot = evictable[offset]
+            let slot = evictableSlots[offset]
             assignedSlots[index] = slot
             reserved[slot] = true
             setSlotExpert(slot, to: -1)
@@ -465,10 +480,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         for expert in experts where expert >= 0 && expert < expertUseCount.count {
             expertUseCount[expert] &+= 1
         }
-        for expert in experts {
-            for slot in 0..<slotCount where slotExpert[slot] == expert {
+        for expert in experts where expert >= 0 && expert < layout.expertsPerLayer {
+            let slot = Int(slotOfPointer[expert])
+            if slot >= 0 && slot < slotCount {
                 slotLastUse[slot] = useClock
-                break
             }
         }
     }

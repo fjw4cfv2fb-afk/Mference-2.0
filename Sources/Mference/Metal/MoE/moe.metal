@@ -740,6 +740,35 @@ kernel void router_slot_lookup_k8(
     out_all_hit[0] = all_hit;
 }
 
+kernel void router_slot_lookup_k8_batch(
+    device const uint* indices [[buffer(0)]],
+    device const short* slot_of [[buffer(1)]],
+    device uint* out_slot_offsets [[buffer(2)]],
+    device uint* out_all_hit [[buffer(3)]],
+    constant uint& top_k [[buffer(4)]],
+    constant uint& slot_stride [[buffer(5)]],
+    constant uint& num_experts [[buffer(6)]],
+    constant uint& query_count [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;
+    uint all_hit = 1u;
+    for (uint t = 0; t < query_count; ++t) {
+        for (uint k = 0; k < top_k; ++k) {
+            const uint idx = t * top_k + k;
+            const uint e = min(indices[idx], num_experts - 1u);
+            const short slot = slot_of[e];
+            if (slot < 0) {
+                all_hit = 0u;
+                out_slot_offsets[idx] = 0u;
+            } else {
+                out_slot_offsets[idx] = uint(slot) * slot_stride;
+            }
+        }
+    }
+    out_all_hit[0] = all_hit;
+}
+
 kernel void moe_phase1_gate_up_act_slotmap(
     device const uint8_t* slab [[buffer(0)]],
     device const uint* slot_offsets [[buffer(1)]],

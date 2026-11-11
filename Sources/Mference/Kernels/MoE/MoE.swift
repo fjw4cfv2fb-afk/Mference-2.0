@@ -67,6 +67,7 @@ final class MoE {
     private let phase1U16PSO: MTLComputePipelineState
     private let phase1U16SpecializedPSO: MTLComputePipelineState
     private let slotLookupPSO: MTLComputePipelineState
+    private let slotLookupBatchPSO: MTLComputePipelineState
     private let phase1SlotmapPSO: MTLComputePipelineState
     private let phase1SlotmapSpecializedPSO: MTLComputePipelineState
     private let phase2SlotmapPSO: MTLComputePipelineState
@@ -153,6 +154,7 @@ final class MoE {
             "moe_phase1_gate_up_act_u16load",
             constants: moeConstants)
         self.slotLookupPSO = try context.pipeline("router_slot_lookup_k8")
+        self.slotLookupBatchPSO = try context.pipeline("router_slot_lookup_k8_batch")
         self.phase1SlotmapPSO = try context.pipeline(
             "moe_phase1_gate_up_act_slotmap", constants: activationConstants)
         self.phase1SlotmapSpecializedPSO = try context.pipeline(
@@ -363,10 +365,14 @@ final class MoE {
     /// all-hit flag and slab offsets the moment it wakes.
     func encodeSlotLookup(commandBuffer: MTLCommandBuffer,
                           indices: MTLBuffer,
+                          indicesOffset: Int = 0,
                           table: MTLBuffer,
+                          tableOffset: Int = 0,
                           slotStride: Int,
                           slotOffsets: MTLBuffer,
+                          slotOffsetsOffset: Int = 0,
                           allHit: MTLBuffer,
+                          allHitOffset: Int = 0,
                           numExperts: UInt32,
                           topK: UInt32) {
         precondition(Self.routedComputeWidths.contains(topK))
@@ -375,13 +381,47 @@ final class MoE {
         var stride = UInt32(slotStride)
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.setComputePipelineState(slotLookupPSO)
-        encoder.setBuffer(indices, offset: 0, index: 0)
-        encoder.setBuffer(table, offset: 0, index: 1)
-        encoder.setBuffer(slotOffsets, offset: 0, index: 2)
-        encoder.setBuffer(allHit, offset: 0, index: 3)
+        encoder.setBuffer(indices, offset: indicesOffset, index: 0)
+        encoder.setBuffer(table, offset: tableOffset, index: 1)
+        encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 2)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 3)
         encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&stride, length: MemoryLayout<UInt32>.stride, index: 5)
         encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    func encodeSlotLookupBatch(commandBuffer: MTLCommandBuffer,
+                               indices: MTLBuffer,
+                               indicesOffset: Int = 0,
+                               table: MTLBuffer,
+                               tableOffset: Int = 0,
+                               slotStride: Int,
+                               slotOffsets: MTLBuffer,
+                               slotOffsetsOffset: Int = 0,
+                               allHit: MTLBuffer,
+                               allHitOffset: Int = 0,
+                               numExperts: UInt32,
+                               topK: UInt32,
+                               queryCount: UInt32) {
+        precondition(Self.routedComputeWidths.contains(topK))
+        var expertCount = numExperts
+        var k = topK
+        var stride = UInt32(slotStride)
+        var qCount = queryCount
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(slotLookupBatchPSO)
+        encoder.setBuffer(indices, offset: indicesOffset, index: 0)
+        encoder.setBuffer(table, offset: tableOffset, index: 1)
+        encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 2)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 3)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&stride, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&qCount, length: MemoryLayout<UInt32>.stride, index: 7)
         encoder.dispatchThreadgroups(
             MTLSize(width: 1, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
@@ -525,6 +565,8 @@ final class MoE {
             MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
+        encoder.memoryBarrier(scope: .buffers)
+
         encoder.setComputePipelineState(
             specialized ? phase2SlotmapSpecializedPSO : phase2SlotmapPSO)
         encoder.setBuffer(slab, offset: slabOffset, index: 0)
@@ -549,15 +591,24 @@ final class MoE {
     /// byte-identical to the argument-buffer fallback.
     func encodeSlotMapGuardedFFN(commandBuffer: MTLCommandBuffer,
                                  slab: MTLBuffer,
+                                 slabOffset: Int = 0,
                                  slotOffsets: MTLBuffer,
+                                 slotOffsetsOffset: Int = 0,
                                  allHit: MTLBuffer,
+                                 allHitOffset: Int = 0,
                                  routedOffsets: MoEExpertOffsets,
                                  x: MTLBuffer,
+                                 xOffset: Int = 0,
                                  acts: MTLBuffer,
+                                 actsOffset: Int = 0,
                                  routingWeights: MTLBuffer,
+                                 routingWeightsOffset: Int = 0,
                                  residual: MTLBuffer,
+                                 residualOffset: Int = 0,
                                  y: MTLBuffer,
+                                 yOffset: Int = 0,
                                  hidden: MTLBuffer,
+                                 hiddenOffset: Int = 0,
                                  d: UInt32,
                                  f: UInt32,
                                  topK: UInt32) {
@@ -574,12 +625,12 @@ final class MoE {
         encoder.useResource(slab, usage: .read)
         encoder.setComputePipelineState(
             specialized ? phase1SlotmapSpecializedPSO : phase1SlotmapPSO)
-        encoder.setBuffer(slab, offset: 0, index: 0)
-        encoder.setBuffer(slotOffsets, offset: 0, index: 1)
-        encoder.setBuffer(allHit, offset: 0, index: 2)
+        encoder.setBuffer(slab, offset: slabOffset, index: 0)
+        encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 1)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
         encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
-        encoder.setBuffer(x, offset: 0, index: 4)
-        encoder.setBuffer(acts, offset: 0, index: 5)
+        encoder.setBuffer(x, offset: xOffset, index: 4)
+        encoder.setBuffer(acts, offset: actsOffset, index: 5)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
         encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 8)
@@ -587,27 +638,31 @@ final class MoE {
             MTLSize(width: (Int(topK * f) + 7) / 8, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
+        encoder.memoryBarrier(scope: .buffers)
+
         encoder.setComputePipelineState(
             specialized ? phase2SlotmapSpecializedPSO : phase2SlotmapPSO)
-        encoder.setBuffer(slab, offset: 0, index: 0)
-        encoder.setBuffer(slotOffsets, offset: 0, index: 1)
-        encoder.setBuffer(allHit, offset: 0, index: 2)
+        encoder.setBuffer(slab, offset: slabOffset, index: 0)
+        encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 1)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
         encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
-        encoder.setBuffer(acts, offset: 0, index: 4)
-        encoder.setBuffer(routingWeights, offset: 0, index: 5)
-        encoder.setBuffer(residual, offset: 0, index: 6)
-        encoder.setBuffer(y, offset: 0, index: 7)
+        encoder.setBuffer(acts, offset: actsOffset, index: 4)
+        encoder.setBuffer(routingWeights, offset: routingWeightsOffset, index: 5)
+        encoder.setBuffer(residual, offset: residualOffset, index: 6)
+        encoder.setBuffer(y, offset: yOffset, index: 7)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
         encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 9)
         encoder.dispatchThreadgroups(
             MTLSize(width: Int(d), height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
 
+        encoder.memoryBarrier(scope: .buffers)
+
         encoder.setComputePipelineState(residualAddGuardedPSO)
-        encoder.setBuffer(hidden, offset: 0, index: 0)
-        encoder.setBuffer(y, offset: 0, index: 1)
+        encoder.setBuffer(hidden, offset: hiddenOffset, index: 0)
+        encoder.setBuffer(y, offset: yOffset, index: 1)
         encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 2)
-        encoder.setBuffer(allHit, offset: 0, index: 3)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 3)
         encoder.dispatchThreadgroups(
             MTLSize(width: (Int(d) + 255) / 256, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))

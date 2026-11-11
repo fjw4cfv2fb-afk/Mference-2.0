@@ -454,18 +454,37 @@ final class Qwen36MTPSpeculator {
 
     // MARK: - Acceptance Recording
 
-    func recordAccepted(drafts: [Int32], emitted: [UInt32], position: Int) {
+    func recordAccepted(drafts: [Int32], emitted: [UInt32], position: Int, verifyNanos: UInt64 = 0) {
         let accepted = emitted.count - 1
         stats.acceptedTokens += accepted
-        stats.rounds += 1
         if accepted < drafts.count {
             stats.rollbacks += 1
         }
+        stats.verifyNanos &+= verifyNanos
         pending = (1..<emitted.count).map {
             (expectInput: Int32(bitPattern: emitted[$0 - 1]), emit: emitted[$0])
         }
         pendingPosition = position + 1
-        stats.emittedTokens += 1
+        stats.emittedTokens += emitted.count
         mtpLen += (accepted + 1)
     }
 }
+
+extension Qwen36MTPSpeculator: SpeculativeDrafter {
+    public var specStats: Qwen38ForwardRunner.MTPSpecStats {
+        let s = self.stats
+        return Qwen38ForwardRunner.MTPSpecStats(
+            rounds: s.rounds,
+            draftedTokens: s.draftedTokens,
+            acceptedTokens: s.acceptedTokens,
+            emittedTokens: s.emittedTokens,
+            rollbacks: s.rollbacks,
+            draftNanos: s.draftNanos,
+            verifyNanos: s.verifyNanos,
+            acceptNanos: s.acceptNanos,
+            positionTrials: [],
+            positionAccepts: []
+        )
+    }
+}
+
