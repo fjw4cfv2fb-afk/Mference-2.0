@@ -28,7 +28,7 @@ public final class OpenAIServerManager {
     public var maxContext: Int = 32768
     public var prefillChunk: Int = 2048
     public var promptCacheMode: String = "single-prefix"
-    public var expertCacheSlots: Int = 32
+    public var expertCacheSlots: Int = 48
     public var verifyMode: String = "trusted-receipt"
 
     private var process: Process?

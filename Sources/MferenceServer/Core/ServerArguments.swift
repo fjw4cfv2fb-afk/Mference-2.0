@@ -31,7 +31,7 @@ public struct ServerArguments: Equatable, Sendable {
                 maxContext: Int = 16_384,
                 queueLimit: Int = 4,
                 promptCacheMode: ServerPromptCacheMode = .singlePrefix,
-                expertCacheSlots: Int = 32,
+                expertCacheSlots: Int = 48,
                 prefillChunkTokens: Int = 128,
                 verification: ModelIntegrityPolicy = .fullSha256,
                 library: ServerLibraryOption? = nil,
@@ -91,7 +91,7 @@ public struct ServerArguments: Equatable, Sendable {
       --prompt-cache-mode <off|single-prefix>
                              Prompt KV reuse mode (default single-prefix).
       --expert-cache-slots <slots>
-                             Routed expert slot cache count (default 32). Allowed:
+                             Routed expert slot cache count (default 48). Allowed:
                              8, 16, 24, 32, 48, 64, 96, 104, 112, 128.
       --prefill-chunk <tokens>
                              Prefill chunk tokens: 32, 64, 128, 256, 512, 1024,
@@ -112,7 +112,7 @@ public struct ServerArguments: Equatable, Sendable {
         var maxContext = 16_384
         var queueLimit = 4
         var promptCacheMode: ServerPromptCacheMode = .singlePrefix
-        var expertCacheSlots = 32
+        var expertCacheSlots = 48
         var prefillChunkTokens = 128
         var verification = ModelIntegrityPolicy.fullSha256
         var libraryRoots: [String] = []
