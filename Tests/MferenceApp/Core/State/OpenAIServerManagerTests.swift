@@ -14,7 +14,7 @@ import Testing
         #expect(manager.maxContext == 32768)
         #expect(manager.prefillChunk == 2048)
         #expect(manager.promptCacheMode == "single-prefix")
-        #expect(manager.expertCacheSlots == 32)
+        #expect(manager.expertCacheSlots == 48)
         #expect(manager.verifyMode == "trusted-receipt")
         #expect(manager.serverURLString == "http://127.0.0.1:8080")
     }
@@ -29,7 +29,7 @@ import Testing
         #expect(cmd.contains("--max-context 32768"))
         #expect(cmd.contains("--prefill-chunk 2048"))
         #expect(cmd.contains("--prompt-cache-mode single-prefix"))
-        #expect(cmd.contains("--expert-cache-slots 32"))
+        #expect(cmd.contains("--expert-cache-slots 48"))
         #expect(cmd.contains("--verify trusted-receipt"))
     }
 

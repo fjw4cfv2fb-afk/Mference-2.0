@@ -109,6 +109,8 @@ public final class AppModel {
         self.settingsPersistenceEnabled = settingsPersistenceEnabled
         self.installETAClock = installETAClock
         self.installETAOrigin = installETAClock.now
+        self.openAIServer.expertCacheSlots = settings.expertCacheSlots
+        self.openAIServer.maxContext = settings.contextTokens
         refreshInstallReadiness()
         synchronizeOutputWithSelectedChat()
         if let recoveryURL = chatLoadResult.recoveryURL {
@@ -412,6 +414,8 @@ public final class AppModel {
         if canUnloadModel {
             unloadModel()
         }
+        openAIServer.expertCacheSlots = runtimeOptions.expertCacheSlots
+        openAIServer.maxContext = maxContextTokens
         openAIServer.start(modelPath: modelPathText)
     }
 

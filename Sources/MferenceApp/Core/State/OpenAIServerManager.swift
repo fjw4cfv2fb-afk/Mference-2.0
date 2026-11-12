@@ -80,9 +80,15 @@ public final class OpenAIServerManager {
         }
     }
 
-    public func fullCommandString(modelPath: String? = nil) -> String {
+    public func fullCommandString(
+        modelPath: String? = nil,
+        maxContext: Int? = nil,
+        expertCacheSlots: Int? = nil
+    ) -> String {
         let resolved = Self.resolveModelPath(candidate: modelPath)
-        return ".build/release/MferenceServer --model \(resolved) --port \(port) --bind loopback --model-id \(modelId) --max-context \(maxContext) --prefill-chunk \(prefillChunk) --prompt-cache-mode \(promptCacheMode) --expert-cache-slots \(expertCacheSlots) --verify \(verifyMode)"
+        let ctx = maxContext ?? self.maxContext
+        let slots = expertCacheSlots ?? self.expertCacheSlots
+        return ".build/release/MferenceServer --model \(resolved) --port \(port) --bind loopback --model-id \(modelId) --max-context \(ctx) --prefill-chunk \(prefillChunk) --prompt-cache-mode \(promptCacheMode) --expert-cache-slots \(slots) --verify \(verifyMode)"
     }
 
     public var latestCommandPreview: String {

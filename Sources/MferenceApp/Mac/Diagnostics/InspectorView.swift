@@ -72,14 +72,21 @@ struct InspectorView: View {
             .disabled(model.openAIServer.isStarting)
             .help(model.openAIServer.latestCommandPreview)
             Button {
+                model.openAIServer.expertCacheSlots = model.runtimeOptions.expertCacheSlots
+                model.openAIServer.maxContext = model.maxContextTokens
+                let cmd = model.openAIServer.fullCommandString(
+                    modelPath: model.modelPathText,
+                    maxContext: model.maxContextTokens,
+                    expertCacheSlots: model.runtimeOptions.expertCacheSlots
+                )
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(model.openAIServer.fullCommandString(modelPath: model.modelPathText), forType: .string)
+                NSPasteboard.general.setString(cmd, forType: .string)
             } label: {
                 Label("Copy Server Command", systemImage: "terminal")
             }
             .buttonStyle(.borderless)
             .font(.caption)
-            .help("Copy exact CLI command: \(model.openAIServer.fullCommandString(modelPath: model.modelPathText))")
+            .help("Copy exact CLI command: \(model.openAIServer.fullCommandString(modelPath: model.modelPathText, maxContext: model.maxContextTokens, expertCacheSlots: model.runtimeOptions.expertCacheSlots))")
             Divider()
             LabeledContent("State") {
                 Text(model.presentation.label)
