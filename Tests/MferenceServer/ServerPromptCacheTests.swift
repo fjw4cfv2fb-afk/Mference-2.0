@@ -285,6 +285,181 @@ struct ServerPromptCacheTests {
         }
     }
 
+    @Test func chatMLStrippedReasoningStillUsesContinuationBridge() async throws {
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Mference/Core/Tokenization/Fixtures/ChatMLTokenizer")
+        let tok = try await MFTokenizer.load(from: fixture, family: .qwen38)
+        let initial = request(messages: [.init(role: .user, content: "Explain primes")])
+        let prompt = [Int32](1...35)
+        let kvBacked = [Int32](1...120)
+        var cache = ServerPromptCache()
+        cache.publish(
+            domain: domain,
+            request: initial,
+            content: "77",
+            calls: [],
+            result: rawResult(prompt: prompt, kvBacked: kvBacked, boundary: tok.endOfTurnID, reason: .endOfTurn),
+            reasoningContent: "2+3+5+7+11+13+17+19 = 77")
+
+        let continuation = request(messages: initial.messages + [
+            .init(role: .assistant, content: "77"),
+            .init(role: .user, content: "Double it"),
+        ])
+        let renderedStripped = [Int32](1...45)
+        let match = cache.match(
+            domain: domain,
+            request: continuation,
+            renderedPromptIDs: renderedStripped,
+            tokenizer: tok)
+        guard case .hit(let effective, let cached) = match else {
+            Issue.record("Expected continuation hit when ChatML template strips historical thinking tokens")
+            return
+        }
+        let bridge = tok.encodeTextContinuation(userContent: "Double it")
+        #expect(cached == kvBacked.count)
+        #expect(effective == kvBacked + bridge)
+    }
+
+    @Test func interleavedConversationsStayCachedWithoutEviction() async throws {
+        let tokenizer = try await MFTokenizer.load()
+        #expect(ServerPromptCache.recommendedMaxSlots(availableMemoryBytes: 3 * 1024 * 1024 * 1024) == 2)
+
+        let reqA1 = request(messages: [.init(role: .user, content: "Explain radix sort in Swift")])
+        let promptA1 = tokenizer.encode(try tokenizer.applyChatTemplate(reqA1.messages), addBOS: false)
+        let kvA1 = promptA1 + tokenizer.encode("Radix sort processes digits", addBOS: false)
+
+        let reqB1 = request(messages: [.init(role: .user, content: "Explain bloom filters briefly")])
+        let promptB1 = tokenizer.encode(try tokenizer.applyChatTemplate(reqB1.messages), addBOS: false)
+        let kvB1 = promptB1 + tokenizer.encode("Bloom filters test membership", addBOS: false)
+
+        let reqC1 = request(messages: [.init(role: .user, content: "Explain skip lists briefly")])
+        let promptC1 = tokenizer.encode(try tokenizer.applyChatTemplate(reqC1.messages), addBOS: false)
+        let kvC1 = promptC1 + tokenizer.encode("Skip lists layer pointers", addBOS: false)
+
+        var cache = ServerPromptCache(maxSlots: 2)
+        let outA1 = cache.publish(
+            domain: domain,
+            request: reqA1,
+            content: "Radix sort processes digits",
+            calls: [],
+            result: rawResult(prompt: promptA1, kvBacked: kvA1, boundary: tokenizer.endOfTurnID, reason: .endOfTurn))
+        let idA1 = try #require(outA1.publishedSlotID)
+        #expect(outA1.evictedSlotIDs.isEmpty)
+        #expect(cache.slotCount == 1)
+
+        let outB1 = cache.publish(
+            domain: domain,
+            request: reqB1,
+            content: "Bloom filters test membership",
+            calls: [],
+            result: rawResult(prompt: promptB1, kvBacked: kvB1, boundary: tokenizer.endOfTurnID, reason: .endOfTurn))
+        let idB1 = try #require(outB1.publishedSlotID)
+        #expect(outB1.evictedSlotIDs.isEmpty)
+        #expect(cache.slotCount == 2)
+
+        let reqA2 = request(messages: reqA1.messages + [
+            .init(role: .assistant, content: "Radix sort processes digits"),
+            .init(role: .user, content: "Now show time complexity"),
+        ])
+        let renderedA2 = tokenizer.encode(try tokenizer.applyChatTemplate(reqA2.messages), addBOS: false)
+        let hitA = cache.matchSlot(
+            domain: domain,
+            request: reqA2,
+            renderedPromptIDs: renderedA2,
+            tokenizer: tokenizer)
+        guard case .hit(let matchedA, _, let cachedA) = hitA else {
+            Issue.record("Expected interleaved hit for conversation A")
+            return
+        }
+        #expect(matchedA == idA1)
+        #expect(cachedA == kvA1.count)
+
+        let kvA2 = kvA1 + tokenizer.encode("O(nk) time complexity", addBOS: false)
+        let outA2 = cache.publish(
+            domain: domain,
+            request: reqA2,
+            content: "O(nk) time complexity",
+            calls: [],
+            result: rawResult(prompt: renderedA2, kvBacked: kvA2, boundary: tokenizer.endOfTurnID, reason: .endOfTurn),
+            replacesSlotID: matchedA)
+        let idA2 = try #require(outA2.publishedSlotID)
+        #expect(cache.slotCount == 2)
+        #expect(cache.contains(slotID: idB1))
+
+        let reqB2 = request(messages: reqB1.messages + [
+            .init(role: .assistant, content: "Bloom filters test membership"),
+            .init(role: .user, content: "Mention false positives"),
+        ])
+        let renderedB2 = tokenizer.encode(try tokenizer.applyChatTemplate(reqB2.messages), addBOS: false)
+        let hitB = cache.matchSlot(
+            domain: domain,
+            request: reqB2,
+            renderedPromptIDs: renderedB2,
+            tokenizer: tokenizer)
+        guard case .hit(let matchedB, _, let cachedB) = hitB else {
+            Issue.record("Expected interleaved hit for conversation B after A turn 2")
+            return
+        }
+        #expect(matchedB == idB1)
+        #expect(cachedB == kvB1.count)
+
+        let outC1 = cache.publish(
+            domain: domain,
+            request: reqC1,
+            content: "Skip lists layer pointers",
+            calls: [],
+            result: rawResult(prompt: promptC1, kvBacked: kvC1, boundary: tokenizer.endOfTurnID, reason: .endOfTurn))
+        #expect(outC1.evictedSlotIDs == [idA2])
+        #expect(cache.slotCount == 2)
+        #expect(cache.contains(slotID: idB1))
+    }
+
+    @Test func memoryPressureShrinksCacheToSingleSlotAndPicksLongestMatch() async throws {
+        let tokenizer = try await MFTokenizer.load()
+        let threshold: UInt64 = 2_560 * 1024 * 1024
+        #expect(ServerPromptCache.recommendedMaxSlots(availableMemoryBytes: threshold) == 1)
+        #expect(ServerPromptCache.recommendedMaxSlots(availableMemoryBytes: threshold + 1) == 2)
+
+        let common = (1...40).map { Int32($0) }
+        let branchA = common + (101...130).map { Int32($0) }
+        let branchB = common + (201...220).map { Int32($0) }
+
+        var cache = ServerPromptCache(maxSlots: 2)
+        let outA = cache.publish(
+            domain: domain,
+            request: request(messages: [.init(role: .user, content: "branch A")]),
+            content: "A",
+            calls: [],
+            result: rawResult(prompt: branchA, kvBacked: branchA, boundary: tokenizer.endOfTurnID, reason: .endOfTurn))
+        let idA = try #require(outA.publishedSlotID)
+
+        let outB = cache.publish(
+            domain: domain,
+            request: request(messages: [.init(role: .user, content: "branch B")]),
+            content: "B",
+            calls: [],
+            result: rawResult(prompt: branchB, kvBacked: branchB, boundary: tokenizer.endOfTurnID, reason: .endOfTurn))
+        let idB = try #require(outB.publishedSlotID)
+
+        let extendA = branchA + [301, 302, 303]
+        let bestMatch = cache.matchSlot(
+            domain: domain,
+            request: request(messages: [.init(role: .user, content: "branch A follow-up")]),
+            renderedPromptIDs: extendA,
+            tokenizer: tokenizer)
+        guard case .hit(let bestID, _, let cached) = bestMatch else {
+            Issue.record("Expected longest prefix hit across multi-slot cache")
+            return
+        }
+        #expect(bestID == idA)
+        #expect(cached == branchA.count)
+
+        let evicted = cache.setMaxSlots(1, preferredLiveSlotID: idB)
+        #expect(evicted == [idA])
+        #expect(cache.slotCount == 1)
+        #expect(cache.contains(slotID: idB))
+    }
+
     private func request(
         messages: [MFTokenizer.Message],
         tools: [MFTokenizer.FunctionDefinition] = []

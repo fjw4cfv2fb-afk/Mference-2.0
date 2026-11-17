@@ -236,4 +236,19 @@ struct QwenToolCallParserTests {
         """)
         #expect(call.arguments == .object(["q": .string("second")]))
     }
+
+    @Test("Quantized inline parameters, trailing commas, and JSON fallback are repaired")
+    func quantizedFormattingSlipsAreRepaired() throws {
+        // 1. Inline `<parameter=k>v</parameter>` without inner newlines and with trailing comma in JSON object
+        let inlineBody = "<function=run_query><parameter=filters>{\"active\": true, }</parameter></function>"
+        let inlineCall = try parse(inlineBody)
+        #expect(inlineCall.name == "run_query")
+        #expect(inlineCall.arguments == .object(["filters": .object(["active": .bool(true)])]))
+
+        // 2. JSON-style tool call emitted inside `<tool_call>`
+        let jsonBody = #"{"name": "get_weather", "arguments": {"city": "Berlin",}}"#
+        let jsonCall = try parse(jsonBody)
+        #expect(jsonCall.name == "get_weather")
+        #expect(jsonCall.arguments == .object(["city": .string("Berlin")]))
+    }
 }

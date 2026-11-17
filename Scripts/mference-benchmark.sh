@@ -4,14 +4,16 @@ set -euo pipefail
 # Mference Objective Benchmark Suite
 # Measures exact decode tok/s, prefill latency, and quality across standardized prompts.
 
-DEFAULT_BIN="/Users/vladslugin/Documents/Mference/.build/out/Products/Release/MferenceCLI"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+DEFAULT_BIN="${REPO_ROOT}/.build/out/Products/Release/MferenceCLI"
 if [ ! -x "$DEFAULT_BIN" ]; then
-    DEFAULT_BIN="/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI"
+    DEFAULT_BIN="${REPO_ROOT}/.build/arm64-apple-macosx/release/MferenceCLI"
 fi
 CLI_BIN="${CLI_BIN:-$DEFAULT_BIN}"
-MODEL_DIR="${MODEL_DIR:-/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo}"
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/scratch/qwen36.gturbo}"
 RDADVISE_MODE="${RDADVISE_MODE:-off}"
-BENCHMARK_DIR="/Users/vladslugin/Documents/Mference/benchmarks"
+BENCHMARK_DIR="${REPO_ROOT}/benchmarks"
 OUT_FILE="${1:-${BENCHMARK_DIR}/baseline-qwen36-$(date +%Y%m%d_%H%M%S).json}"
 
 mkdir -p "$BENCHMARK_DIR"

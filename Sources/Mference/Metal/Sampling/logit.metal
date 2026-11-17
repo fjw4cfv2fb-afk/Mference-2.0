@@ -742,7 +742,7 @@ void lm_head_greedy_int4_rows_chunk_raw(
 
 [[kernel, max_total_threads_per_threadgroup(256)]]
 void lm_head_greedy_int4_rows_reduce(
-    device const float*   summaries    [[buffer(0)]],
+    device       float*   summaries    [[buffer(0)]],
     device       uint*    out_token    [[buffer(1)]],
     constant     uint&    row_groups   [[buffer(2)]],
     uint  lid            [[thread_position_in_threadgroup]],
@@ -753,16 +753,22 @@ void lm_head_greedy_int4_rows_reduce(
 ) {
     threadgroup float partial_v[kLogitMaxSimdGroups];
     threadgroup uint  partial_i[kLogitMaxSimdGroups];
+    threadgroup uint  winner_tg;
+    threadgroup float winner_val_tg;
 
     float best_v = -INFINITY;
     uint best_i = 0xFFFFFFFFu;
+    float second_v = -INFINITY;
     for (uint i = lid; i < row_groups; i += lsize) {
         device const float* slot = summaries + i * kLMHeadRowSummaryStride;
         const float v = slot[0];
         const uint idx = as_type<uint>(slot[1]);
         if (v > best_v || (v == best_v && idx < best_i)) {
+            second_v = best_v;
             best_v = v;
             best_i = idx;
+        } else if (v > second_v) {
+            second_v = v;
         }
     }
 
@@ -785,6 +791,27 @@ void lm_head_greedy_int4_rows_reduce(
         i_all = simd_min(i_all);
         if (simd_lane_id == 0) {
             out_token[0] = (i_all == 0xFFFFFFFFu) ? 0u : i_all;
+            winner_tg = i_all;
+            winner_val_tg = v_all;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float runner_up = (best_i == winner_tg) ? second_v : best_v;
+    const float r_simd = simd_max(runner_up);
+    if (simd_lane_id == 0) {
+        partial_v[simd_group_id] = r_simd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0) {
+        const bool active = simd_lane_id < simdgroups;
+        const float r = active ? partial_v[simd_lane_id] : -INFINITY;
+        const float r_all = simd_max(r);
+        if (simd_lane_id == 0) {
+            const float v_all = winner_val_tg;
+            summaries[0] = (isfinite(v_all) && isfinite(r_all))
+                ? max(0.0f, v_all - r_all) : 0.0f;
         }
     }
 }

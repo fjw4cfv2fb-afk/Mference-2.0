@@ -8,7 +8,8 @@ import json
 import os
 import sys
 
-MANIFEST_PATH = "/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo/manifest.json"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MANIFEST_PATH = os.path.join(REPO_ROOT, "scratch/qwen36.gturbo/manifest.json")
 
 def main():
     if not os.path.exists(MANIFEST_PATH):
@@ -70,7 +71,7 @@ def main():
     print("=" * 68)
 
     # Save to JSON spec
-    out_spec = "/Users/vladslugin/Documents/Mference/scratch/qwen36_mtp_spec.json"
+    out_spec = os.path.join(REPO_ROOT, "scratch/qwen36_mtp_spec.json")
     with open(out_spec, "w") as f:
         json.dump({"model": "qwen36", "tensors": tensors, "total_raw_bytes": total_bytes}, f, indent=2)
     print(f"Saved spec to: {out_spec}")

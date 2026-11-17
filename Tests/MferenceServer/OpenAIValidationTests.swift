@@ -715,7 +715,7 @@ struct ServerArgumentTests {
         #expect(arguments.maxContext == 16_384)
         #expect(arguments.queueLimit == 4)
         #expect(arguments.promptCacheMode == .singlePrefix)
-        #expect(arguments.expertCacheSlots == 32)
+        #expect(arguments.expertCacheSlots == 48)
         #expect(arguments.prefillChunkTokens == 128)
         #expect(arguments.verification == .fullSha256)
     }

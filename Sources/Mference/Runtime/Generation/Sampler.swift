@@ -15,6 +15,15 @@ public struct GenerationConfig: Sendable {
     public var seed: UInt64? = nil         // nil = nondeterministic
     public var stopStrings: [String] = []
     public var extraStopTokens: Set<Int32> = []
+    /// Bounded sliding window for repetition penalty (`0` = unbounded full history).
+    public var repetitionWindow: Int = 0
+    /// Consecutive suffix repeats (`>= 2`) that trigger a single-step `.logits` penalty break
+    /// on the fused-greedy / MTP path before resuming fast speculation (`0` = disabled).
+    public var loopGuardRepeats: Int = 0
+    /// Repetition penalty applied to the repeating cycle tokens when `loopGuardRepeats` fires.
+    public var loopGuardPenalty: Float = 1.3
+    /// Optional ceiling on `<think>` reasoning tokens before forcing `</think>\n\n` transition (`0` = unlimited).
+    public var maxThinkingTokens: Int = 0
 
     public init(maxNewTokens: Int = 256,
                 temperature: Float = 1.0,
@@ -23,7 +32,11 @@ public struct GenerationConfig: Sendable {
                 repetitionPenalty: Float = 1.0,
                 seed: UInt64? = nil,
                 stopStrings: [String] = [],
-                extraStopTokens: Set<Int32> = []) {
+                extraStopTokens: Set<Int32> = [],
+                repetitionWindow: Int = 0,
+                loopGuardRepeats: Int = 0,
+                loopGuardPenalty: Float = 1.3,
+                maxThinkingTokens: Int = 0) {
         self.maxNewTokens = maxNewTokens
         self.temperature = temperature
         self.topK = topK
@@ -32,6 +45,10 @@ public struct GenerationConfig: Sendable {
         self.seed = seed
         self.stopStrings = stopStrings
         self.extraStopTokens = extraStopTokens
+        self.repetitionWindow = repetitionWindow
+        self.loopGuardRepeats = loopGuardRepeats
+        self.loopGuardPenalty = loopGuardPenalty
+        self.maxThinkingTokens = maxThinkingTokens
     }
 
     public func validate() throws {
@@ -116,8 +133,11 @@ final class Sampler {
 
         let appliedPenalty = config.repetitionPenalty != 1.0 && !history.isEmpty
         if appliedPenalty {
+            let effectiveHistory = config.repetitionWindow > 0
+                ? Array(history.suffix(config.repetitionWindow))
+                : history
             applyRepetitionPenaltyInPlace(logits: logits,
-                                          history: history,
+                                          history: effectiveHistory,
                                           penalty: config.repetitionPenalty)
         }
 
@@ -190,6 +210,28 @@ final class Sampler {
         }
     }
 
+    /// Two-tier loop-escape penalty: strongly suppresses `cycleTokens[0]` (the exact
+    /// token that restarts the repeating suffix cycle at the current position) with
+    /// `primaryPenalty`, while applying only a gentle `secondaryPenalty` to the
+    /// remaining tokens in the cycle so valid code/JSON syntax tokens (`{`, `"`, `:`, `\n`)
+    /// are not starved.
+    func penalizeCycleInPlace(logits: MTLBuffer,
+                              cycleTokens: [Int32],
+                              primaryPenalty: Float,
+                              secondaryPenalty: Float = 1.06) {
+        guard let head = cycleTokens.first else { return }
+        if primaryPenalty > 1.0 {
+            applyRepetitionPenaltyInPlace(logits: logits,
+                                          history: [head],
+                                          penalty: primaryPenalty)
+        }
+        if cycleTokens.count > 1, secondaryPenalty > 1.0 {
+            applyRepetitionPenaltyInPlace(logits: logits,
+                                          history: Array(cycleTokens.dropFirst()),
+                                          penalty: secondaryPenalty)
+        }
+    }
+
     // MARK: - Seed
 
     /// Deterministic per-position seed when `config.seed != nil` so a fixed seed
@@ -212,5 +254,52 @@ final class Sampler {
         z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
         z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
         return z ^ (z >> 31)
+    }
+}
+
+/// Detects deterministic suffix repetition loops (`L` in `1...maxPatternLength` repeated
+/// `>= minRepeats` times consecutively at the tail of `history`) so greedy / MTP generation
+/// can execute a single-step `.logits` penalty break and immediately resume fast speculation.
+public enum RepetitionLoopDetector {
+    public static func detectLoop(in history: [Int32],
+                                  maxPatternLength: Int = 64,
+                                  minRepeats: Int = 3) -> [Int32]? {
+        guard minRepeats >= 2, maxPatternLength >= 1 else { return nil }
+        let n = history.count
+        let maxL = min(maxPatternLength, n / minRepeats)
+        guard maxL >= 1 else { return nil }
+
+        for patternLen in 1...maxL {
+            // Single-token runs require at least max(minRepeats, 4) identical tokens
+            // to avoid false-positive breaks on natural formatting runs (e.g. "   " or "...").
+            let requiredRepeats = (patternLen == 1) ? max(minRepeats, 4) : minRepeats
+            let span = patternLen * requiredRepeats
+            guard n >= span else { continue }
+
+            let baseStart = n - patternLen
+            var matches = true
+            for r in 1..<requiredRepeats {
+                let repStart = n - (r + 1) * patternLen
+                for offset in 0..<patternLen {
+                    if history[repStart + offset] != history[baseStart + offset] {
+                        matches = false
+                        break
+                    }
+                }
+                if !matches { break }
+            }
+            if matches {
+                var unique: [Int32] = []
+                unique.reserveCapacity(patternLen)
+                for offset in 0..<patternLen {
+                    let tok = history[baseStart + offset]
+                    if !unique.contains(tok) {
+                        unique.append(tok)
+                    }
+                }
+                return unique
+            }
+        }
+        return nil
     }
 }

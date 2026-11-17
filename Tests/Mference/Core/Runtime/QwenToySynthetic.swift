@@ -9,6 +9,87 @@ import Foundation
 /// Mirrors `ModelLoaderTests.writeToySynthetic` for the Gemma toy.
 enum QwenToySynthetic {
 
+    /// Writes a synthetic HuggingFace-format BF16 Qwen 3.6 MoE MTP safetensors
+    /// shard matching `ArchConfig.qwen36Toy()` and returns the temporary file URL.
+    static func writeMTPShard() throws -> URL {
+        let toy = ArchConfig.qwen36Toy()
+        let d = toy.hiddenSize
+        let moeF = toy.moeIntermediateSize
+        let sharedF = toy.intermediateSize
+        let qDim = toy.numHeads * toy.fullHeadDim
+        let kvDim = toy.numFullKVHeads * toy.fullHeadDim
+        let headDim = toy.fullHeadDim
+        let numExperts = toy.numExperts
+
+        struct ShardSpec {
+            let name: String
+            let shape: [Int]
+            let zeroNorm: Bool
+            let seed: UInt64
+        }
+
+        let specs: [ShardSpec] = [
+            ShardSpec(name: "mtp.fc.weight", shape: [d, 2 * d], zeroNorm: false, seed: 101),
+            ShardSpec(name: "mtp.pre_fc_norm_embedding.weight", shape: [d], zeroNorm: true, seed: 102),
+            ShardSpec(name: "mtp.pre_fc_norm_hidden.weight", shape: [d], zeroNorm: true, seed: 103),
+            ShardSpec(name: "mtp.norm.weight", shape: [d], zeroNorm: true, seed: 104),
+            ShardSpec(name: "mtp.layers.0.input_layernorm.weight", shape: [d], zeroNorm: true, seed: 105),
+            ShardSpec(name: "mtp.layers.0.post_attention_layernorm.weight", shape: [d], zeroNorm: true, seed: 106),
+            ShardSpec(name: "mtp.layers.0.self_attn.q_proj.weight", shape: [2 * qDim, d], zeroNorm: false, seed: 107),
+            ShardSpec(name: "mtp.layers.0.self_attn.k_proj.weight", shape: [kvDim, d], zeroNorm: false, seed: 108),
+            ShardSpec(name: "mtp.layers.0.self_attn.v_proj.weight", shape: [kvDim, d], zeroNorm: false, seed: 109),
+            ShardSpec(name: "mtp.layers.0.self_attn.o_proj.weight", shape: [d, qDim], zeroNorm: false, seed: 110),
+            ShardSpec(name: "mtp.layers.0.self_attn.q_norm.weight", shape: [headDim], zeroNorm: true, seed: 111),
+            ShardSpec(name: "mtp.layers.0.self_attn.k_norm.weight", shape: [headDim], zeroNorm: true, seed: 112),
+            ShardSpec(name: "mtp.layers.0.mlp.gate.weight", shape: [numExperts, d], zeroNorm: false, seed: 113),
+            ShardSpec(name: "mtp.layers.0.mlp.shared_expert_gate.weight", shape: [1, d], zeroNorm: false, seed: 114),
+            ShardSpec(name: "mtp.layers.0.mlp.shared_expert.gate_proj.weight", shape: [sharedF, d], zeroNorm: false, seed: 115),
+            ShardSpec(name: "mtp.layers.0.mlp.shared_expert.up_proj.weight", shape: [sharedF, d], zeroNorm: false, seed: 116),
+            ShardSpec(name: "mtp.layers.0.mlp.shared_expert.down_proj.weight", shape: [d, sharedF], zeroNorm: false, seed: 117),
+            ShardSpec(name: "mtp.layers.0.mlp.experts.gate_up_proj", shape: [numExperts, 2 * moeF, d], zeroNorm: false, seed: 118),
+            ShardSpec(name: "mtp.layers.0.mlp.experts.down_proj", shape: [numExperts, d, moeF], zeroNorm: false, seed: 119),
+        ]
+
+        var payload = Data()
+        var header: [String: Any] = [:]
+        for spec in specs {
+            let count = spec.shape.reduce(1, *)
+            let start = payload.count
+            var state = spec.seed &* 0x9E37_79B9_7F4A_7C15
+            var words = [UInt16](repeating: 0, count: count)
+            for i in 0..<count {
+                if spec.zeroNorm {
+                    words[i] = 0 // zero-centered; MTPAttachTool folds +1.0 -> 1.0
+                } else {
+                    state = state &* 6364136223846793005 &+ 1442695040888963407
+                    let signed = Float(Int64(bitPattern: state) >> 40) / Float(1 << 23)
+                    words[i] = Int4AffineEncoder.bf16Bits(signed * 0.08)
+                }
+            }
+            words.withUnsafeBytes { raw in
+                payload.append(contentsOf: raw)
+            }
+            let end = payload.count
+            header[spec.name] = [
+                "dtype": "BF16",
+                "shape": spec.shape,
+                "data_offsets": [start, end],
+            ] as [String: Any]
+        }
+
+        let headerData = try JSONSerialization.data(withJSONObject: header, options: [.sortedKeys])
+        var lenLE = UInt64(headerData.count).littleEndian
+        var fileData = Data(capacity: 8 + headerData.count + payload.count)
+        withUnsafeBytes(of: &lenLE) { fileData.append(contentsOf: $0) }
+        fileData.append(headerData)
+        fileData.append(payload)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("qwen36-mtp-shard-\(UUID().uuidString).safetensors")
+        try fileData.write(to: url)
+        return url
+    }
+
     /// Build the toy directory in a temp dir and return its URL.
     static func write() throws -> URL {
         let toy = ArchConfig.qwen36Toy()

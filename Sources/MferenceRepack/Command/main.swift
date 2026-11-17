@@ -5,6 +5,7 @@ private let usage = """
 Usage:
   MferenceRepack [--dry-run] [--model <gemma4|qwen36|qwen36original|qwen38|swiftqwen38|deepseekv4flash|inklingsmall|maple|qwen38flashnext|minicpm5|minicpm5mlx|glm53flash>] --output <model.gturbo> [--overwrite] [--resume] [--skip-mtp] [--base-url <url>]
   MferenceRepack --attach-mtp <mtp-shard.safetensors> --output <model.gturbo>
+  MferenceRepack --apply-surgery --input-gturbo <model.gturbo> [--surgery-final-norm <f>] [--surgery-qk-norm <f>] [--surgery-qk-start-ratio <f>] [--surgery-router-temp <f>] [--surgery-late-residual <f>] [--surgery-late-start-ratio <f>] [--surgery-shared-expert <f>] [--surgery-shared-expert-start-ratio <f>] [--surgery-mtp-norm <f>] [--surgery-mtp-hidden-norm <f>] [--surgery-no-coadapt-mtp]
   MferenceRepack --discard-partial --output <model.gturbo>
   MferenceRepack --verify-install --input-gturbo <model.gturbo>
   MferenceRepack --help
@@ -72,6 +73,8 @@ private struct Arguments {
     var resume = false
     var discardPartial = false
     var verifyInstall = false
+    var applySurgery = false
+    var surgeryConfig = MTPAttachTool.SurgeryConfig()
     var attachMTP: String?
     var inputGTurbo: String?
     var baseURL: URL?
@@ -81,6 +84,16 @@ private struct Arguments {
     static func parse(_ values: [String]) throws -> Arguments {
         var parsed = Arguments()
         var index = 1
+        func parseFloat(_ flag: String) throws -> Float {
+            guard index + 1 < values.count else {
+                throw ParseError.missingValue(flag)
+            }
+            guard let v = Float(values[index + 1]), v.isFinite else {
+                throw ParseError.invalidMode("\(flag) requires a finite floating-point value")
+            }
+            index += 2
+            return v
+        }
         while index < values.count {
             let flag = values[index]
             switch flag {
@@ -103,6 +116,40 @@ private struct Arguments {
                 index += 1
             case "--verify-install":
                 parsed.verifyInstall = true
+                index += 1
+            case "--apply-surgery":
+                parsed.applySurgery = true
+                index += 1
+            case "--surgery-final-norm":
+                parsed.surgeryConfig.finalNormScale = try parseFloat(flag)
+            case "--surgery-qk-norm":
+                parsed.surgeryConfig.qkNormScale = try parseFloat(flag)
+            case "--surgery-qk-start-ratio":
+                parsed.surgeryConfig.qkNormStartLayerRatio = try parseFloat(flag)
+            case "--surgery-router-temp":
+                parsed.surgeryConfig.routerTemperature = try parseFloat(flag)
+            case "--surgery-late-residual":
+                parsed.surgeryConfig.lateLayerResidualScale = try parseFloat(flag)
+            case "--surgery-late-start-ratio":
+                parsed.surgeryConfig.lateLayerStartFraction = try parseFloat(flag)
+            case "--surgery-shared-expert":
+                parsed.surgeryConfig.sharedExpertScale = try parseFloat(flag)
+            case "--surgery-shared-expert-start-ratio":
+                parsed.surgeryConfig.sharedExpertStartLayerRatio = try parseFloat(flag)
+            case "--surgery-mtp-shared-expert":
+                parsed.surgeryConfig.mtpSharedExpertScale = try parseFloat(flag)
+            case "--surgery-mtp-norm":
+                parsed.surgeryConfig.mtpNormScale = try parseFloat(flag)
+            case "--surgery-mtp-hidden-norm":
+                parsed.surgeryConfig.mtpHiddenNormScale = try parseFloat(flag)
+            case "--surgery-mtp-qk-norm":
+                parsed.surgeryConfig.mtpQKNormScale = try parseFloat(flag)
+            case "--surgery-mtp-router-temp":
+                parsed.surgeryConfig.mtpRouterTemperature = try parseFloat(flag)
+            case "--surgery-mtp-residual":
+                parsed.surgeryConfig.mtpResidualScale = try parseFloat(flag)
+            case "--surgery-no-coadapt-mtp":
+                parsed.surgeryConfig.coAdaptMTP = false
                 index += 1
             case "--attach-mtp":
                 guard index + 1 < values.count else {
@@ -167,6 +214,12 @@ private struct Arguments {
             guard parsed.inputGTurbo == nil, !parsed.overwrite, !parsed.resume,
                   !parsed.verifyInstall, !parsed.dryRun, !parsed.skipMTP else {
                 throw ParseError.invalidMode("--attach-mtp only accepts --output")
+            }
+            return parsed
+        }
+        if parsed.applySurgery {
+            guard parsed.inputGTurbo != nil || parsed.output != nil else {
+                throw ParseError.missingRequired("--input-gturbo")
             }
             return parsed
         }
@@ -246,6 +299,23 @@ private func run(_ values: [String]) async -> Int32 {
             return 0
         } catch {
             printError("attach-mtp failed: \(error)")
+            return 1
+        }
+    }
+
+    if arguments.applySurgery, let target = arguments.inputGTurbo ?? arguments.output {
+        do {
+            let result = try MTPAttachTool.applyResidentWeightSurgery(
+                gturboDirectory: target,
+                config: arguments.surgeryConfig)
+            print("Applied resident weight surgery to \(target)")
+            print("Modified norm tensors: \(result.modifiedNormTensors)")
+            print("Modified affine tensors: \(result.modifiedAffineTensors)")
+            print("Co-adapted MTP: \(result.coAdaptedMTP)")
+            print("model_weights.bin sha256: \(result.weightsSha256)")
+            return 0
+        } catch {
+            printError("apply-surgery failed: \(error)")
             return 1
         }
     }

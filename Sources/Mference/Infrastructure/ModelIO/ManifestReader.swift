@@ -847,6 +847,20 @@ public enum ManifestReader {
         return try JSONDecoder().decode(Identity.self, from: Data(contentsOf: url)).modelID
     }
 
+    /// Returns whether `manifest.json` marks the named sidecar as carried.
+    public static func peekSidecarCarried(_ name: String,
+                                          directoryURL: URL,
+                                          maxBytes: UInt64 = defaultMaxBytes) -> Bool {
+        let url = directoryURL.appendingPathComponent("manifest.json")
+        guard let size = try? metadataFileSize(url, fileName: "manifest.json"),
+              size <= maxBytes,
+              let data = try? Data(contentsOf: url) else {
+            return false
+        }
+        struct SidecarsPeek: Decodable { let sidecars: [String: ManifestSidecar]? }
+        return (try? JSONDecoder().decode(SidecarsPeek.self, from: data))?.sidecars?[name]?.carried == true
+    }
+
     /// Decode just enough of `manifest.json` to identify the model family,
     /// without arch validation. Used by `Model.load` auto-detection.
     public static func peekFamily(directoryURL: URL,

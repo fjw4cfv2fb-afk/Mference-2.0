@@ -1,6 +1,11 @@
 import CryptoKit
 import Foundation
 import Mference
+#if canImport(Darwin)
+import Darwin
+@_silgen_name("os_proc_available_memory")
+private func mference_os_proc_available_memory() -> Int
+#endif
 
 public enum ServerInferenceEvent: Equatable, Sendable {
     case content(String)
@@ -197,6 +202,8 @@ public actor ServerModelSession: ServerLoadedModel {
     private let promptCacheMode: ServerPromptCacheMode
     private let promptCacheDomain: ServerPromptCacheDomain
     private var promptCache = ServerPromptCache()
+    private var liveRunnerCacheEntryID: UUID?
+    private var cachedSnapshots: [UUID: RealForwardRunner.PrefixSnapshot] = [:]
 
     public static func load(modelDirectory: URL,
                             maxContext: Int,
@@ -231,8 +238,18 @@ public actor ServerModelSession: ServerLoadedModel {
         let context = try MetalContext()
         let streamingMode: ExpertStreamingMode = .pread(slotCount: expertCacheSlots)
         let configSlots = expertCacheSlots
-        let specActive = ProcessInfo.processInfo.environment["MFERENCE_SPEC"] == "on"
-            || ProcessInfo.processInfo.environment["MFERENCE_MTP"] == "1"
+        let env = ProcessInfo.processInfo.environment
+        let specEnv = env["MFERENCE_SPEC"]?.lowercased()
+        let mtpEnv = env["MFERENCE_MTP"]?.lowercased()
+        let pldEnv = env["MFERENCE_PLD"]?.lowercased()
+        let hasMTPSidecar = ManifestReader.peekSidecarCarried("mtp", directoryURL: modelDirectory)
+        let peekedFamily = try? ManifestReader.peekFamily(directoryURL: modelDirectory)
+        let qwen36AutoMTP = peekedFamily == .qwen36 && hasMTPSidecar
+            && specEnv != "off" && mtpEnv != "0"
+        let specActive = specEnv != "off" && (
+            specEnv == "on" || specEnv == "mtp" || specEnv == "pld"
+                || mtpEnv == "1" || pldEnv == "1" || qwen36AutoMTP
+        )
             || ProcessInfo.processInfo.environment["MFERENCE_FORCE_LOGITS_HEAD"] == "0"
         let runtime = RuntimeConfiguration(
             expertCacheSlots: configSlots,
@@ -248,6 +265,12 @@ public actor ServerModelSession: ServerLoadedModel {
                                                             context: context,
                                                             maxContext: maxContext,
                                                             runtimeConfiguration: runtime)
+        if qwen36AutoMTP,
+           env["MFERENCE_SPEC_K"] == nil,
+           env["MFERENCE_MTP_K"] == nil,
+           env["MFERENCE_SPEC_ADAPTIVE"] != "0" {
+            (forwardRuntime.producer as? RealForwardRunner)?.specAdaptiveDraftOverride = true
+        }
         let scratch = try RawCompletionScratch(context: context, vocab: model.config.vocabSize,
                                                logitSoftcap: Float(model.config.finalLogitSoftcap))
         let templateDigest = SHA256.hash(data: templateData)
@@ -316,23 +339,66 @@ public actor ServerModelSession: ServerLoadedModel {
             || request.messages.contains {
                 $0.role == .developer || $0.role == .tool || !$0.toolCalls.isEmpty
             }
-        let promptIDs: [Int32]
+        let alignedMessages = ServerIntentAligner.alignMessages(
+            request.messages,
+            tools: request.tools,
+            dialect: chatDialect)
+        let alignedRequest = ValidatedChatRequest(
+            reasoningEffort: request.reasoningEffort,
+            messages: alignedMessages,
+            tools: request.tools,
+            stream: request.stream,
+            includeUsage: request.includeUsage,
+            generationConfig: request.generationConfig,
+            maximumCompletionTokens: request.maximumCompletionTokens)
+        let promptProfile = ServerIntentAligner.classifyPromptThinkingProfile(
+            messages: alignedRequest.messages,
+            tools: alignedRequest.tools,
+            reasoningEffort: alignedRequest.reasoningEffort)
+        let encodedPromptIDs: [Int32]
         do {
-            promptIDs = try tokenizer.encodeChat(messages: request.messages, tools: request.tools,
-                                                reasoningEffort: request.reasoningEffort)
+            encodedPromptIDs = try tokenizer.encodeChat(
+                messages: alignedRequest.messages,
+                tools: alignedRequest.tools,
+                reasoningEffort: alignedRequest.reasoningEffort)
         } catch {
             throw ServerRequestError.invalid(message: String(describing: error),
                                               param: "messages", code: "invalid_chat_template")
         }
+        let promptIDs = ServerIntentAligner.applyZeroThinkFastPathIfNeeded(
+            promptIDs: encodedPromptIDs,
+            tokenizer: tokenizer,
+            profile: promptProfile)
         guard promptIDs.count < maxContext else {
             throw ServerRequestError.invalid(
                 message: "prompt exceeds the configured context",
                 param: "messages",
                 code: "context_length_exceeded")
         }
-        return PreparedGeneration(request: request,
+        return PreparedGeneration(request: alignedRequest,
                                   promptIDs: promptIDs,
                                   needsToolTemplate: needsToolTemplate)
+    }
+
+    private func parkLiveRunnerSnapshotIfNeeded(maxSlots: Int) {
+        guard maxSlots > 1,
+              let liveID = liveRunnerCacheEntryID,
+              promptCache.contains(slotID: liveID),
+              let liveEntry = promptCache.entry(for: liveID),
+              let realRunner = runner as? RealForwardRunner else {
+            return
+        }
+        if runner.continuationPosition != liveEntry.kvPosition {
+            guard (try? runner.prepareForContinuation(expectedPosition: liveEntry.kvPosition)) != nil else {
+                promptCache.removeSlot(liveID)
+                cachedSnapshots.removeValue(forKey: liveID)
+                liveRunnerCacheEntryID = nil
+                return
+            }
+        }
+        if let snapshot = realRunner.capturePrefixSnapshot() {
+            cachedSnapshots[liveID] = snapshot
+        }
     }
 
     public func generate(
@@ -342,31 +408,77 @@ public actor ServerModelSession: ServerLoadedModel {
         let request = prepared.request
         let needsToolTemplate = prepared.needsToolTemplate
         let promptIDs = prepared.promptIDs
-        let savedEntry = promptCache.entry
+        let savedCacheState = promptCache.snapshotState()
+        let savedLiveID = liveRunnerCacheEntryID
+        let savedSnapshots = cachedSnapshots
+        var matchedSlotID: UUID? = nil
         var completed = false
         defer {
             if !completed {
-                if let savedEntry,
-                   (try? runner.prepareForContinuation(expectedPosition: savedEntry.kvPosition)) != nil {
-                    promptCache.restore(savedEntry)
+                let rollbackSnap = savedLiveID.flatMap { cachedSnapshots[$0] ?? savedSnapshots[$0] }
+                promptCache.restoreState(savedCacheState)
+                cachedSnapshots = savedSnapshots
+                if let savedLiveID,
+                   let savedPos = savedCacheState.entry(for: savedLiveID)?.kvPosition {
+                    if let rollbackSnap,
+                       (runner as? RealForwardRunner)?.restorePrefixSnapshot(rollbackSnap) == true,
+                       (try? runner.prepareForContinuation(expectedPosition: savedPos)) != nil {
+                        liveRunnerCacheEntryID = savedLiveID
+                    } else if (try? runner.prepareForContinuation(expectedPosition: savedPos)) != nil {
+                        liveRunnerCacheEntryID = savedLiveID
+                    } else {
+                        promptCache.removeSlot(savedLiveID)
+                        cachedSnapshots.removeValue(forKey: savedLiveID)
+                        liveRunnerCacheEntryID = nil
+                        runner.reset()
+                    }
                 } else {
-                    promptCache.invalidate()
+                    liveRunnerCacheEntryID = nil
                     runner.reset()
                 }
             }
         }
 
+        let promptProfile = ServerIntentAligner.classifyPromptThinkingProfile(
+            messages: request.messages,
+            tools: request.tools,
+            reasoningEffort: request.reasoningEffort)
         let effectivePromptIDs: [Int32]
         let completionStart: RawCompletionStart
         if promptCacheMode == .singlePrefix {
-            switch promptCache.match(
+            let targetMaxSlots = ServerPromptCache.recommendedMaxSlots(
+                availableMemoryBytes: ServerIntentAligner.currentAvailableMemoryBytes())
+            let evictedForMemory = promptCache.setMaxSlots(
+                targetMaxSlots,
+                preferredLiveSlotID: liveRunnerCacheEntryID)
+            for id in evictedForMemory {
+                cachedSnapshots.removeValue(forKey: id)
+            }
+            let realRunner = runner as? RealForwardRunner
+            let liveID = liveRunnerCacheEntryID
+            let cacheMatch = promptCache.matchSlot(
                 domain: promptCacheDomain,
                 request: request,
                 renderedPromptIDs: promptIDs,
                 tokenizer: tokenizer,
-                rewindablePosition: { runner.rewindablePosition(atOrBefore: $0) }) {
+                canUseSlot: { slotID in
+                    slotID == liveID || (targetMaxSlots > 1 && realRunner != nil && cachedSnapshots[slotID] != nil)
+                },
+                rewindablePosition: { slotID, maxPosition in
+                    if slotID == liveID {
+                        return runner.rewindablePosition(atOrBefore: maxPosition)
+                    }
+                    guard targetMaxSlots > 1 else { return nil }
+                    return cachedSnapshots[slotID]?.rewindablePosition(atOrBefore: maxPosition)
+                })
+            switch cacheMatch {
             case .miss:
-                promptCache.invalidate()
+                parkLiveRunnerSnapshotIfNeeded(maxSlots: targetMaxSlots)
+                if targetMaxSlots <= 1 {
+                    promptCache.invalidate()
+                    cachedSnapshots.removeAll()
+                }
+                liveRunnerCacheEntryID = nil
                 effectivePromptIDs = promptIDs
                 completionStart = .reset
                 let eot = tokenizer.endOfTurnID
@@ -377,13 +489,43 @@ public actor ServerModelSession: ServerLoadedModel {
                 } else {
                     runner.setBasePrefixCheckpointPosition(nil)
                 }
-            case .hit(let effective, let cached):
-                effectivePromptIDs = effective
-                completionStart = .resume(cachedPromptTokens: cached)
-                runner.setBasePrefixCheckpointPosition(nil)
+            case .hit(let hitSlotID, let effective, let cached):
+                let entryKVPos = promptCache.entry(for: hitSlotID)?.kvPosition ?? cached
+                let isPartialBranch = cached < entryKVPos
+                var slotActivated = true
+                if hitSlotID != liveRunnerCacheEntryID {
+                    parkLiveRunnerSnapshotIfNeeded(maxSlots: targetMaxSlots)
+                    if let snap = cachedSnapshots[hitSlotID],
+                       let realRunner,
+                       realRunner.restorePrefixSnapshot(snap) {
+                        liveRunnerCacheEntryID = hitSlotID
+                    } else {
+                        slotActivated = false
+                    }
+                } else if isPartialBranch && targetMaxSlots > 1 {
+                    parkLiveRunnerSnapshotIfNeeded(maxSlots: targetMaxSlots)
+                }
+                if slotActivated {
+                    matchedSlotID = isPartialBranch ? nil : hitSlotID
+                    effectivePromptIDs = ServerIntentAligner.applyZeroThinkFastPathIfNeeded(
+                        promptIDs: effective,
+                        tokenizer: tokenizer,
+                        profile: promptProfile)
+                    completionStart = .resume(cachedPromptTokens: cached)
+                    runner.setBasePrefixCheckpointPosition(nil)
+                } else {
+                    promptCache.removeSlot(hitSlotID)
+                    cachedSnapshots.removeValue(forKey: hitSlotID)
+                    liveRunnerCacheEntryID = nil
+                    effectivePromptIDs = promptIDs
+                    completionStart = .reset
+                    runner.setBasePrefixCheckpointPosition(nil)
+                }
             }
         } else {
             promptCache.invalidate()
+            cachedSnapshots.removeAll()
+            liveRunnerCacheEntryID = nil
             effectivePromptIDs = promptIDs
             completionStart = .reset
             runner.setBasePrefixCheckpointPosition(nil)
@@ -395,14 +537,22 @@ public actor ServerModelSession: ServerLoadedModel {
                 code: "context_length_exceeded")
         }
 
-        var config = request.generationConfig
-        config.maxNewTokens = min(
-            request.maximumCompletionTokens,
-            maxContext - effectivePromptIDs.count)
-        config.stopStrings = []
-
         let startsInThinking = tokenizer.startsInThinking(
             reasoningEffort: request.reasoningEffort, promptIDs: effectivePromptIDs)
+        let config = ServerIntentAligner.tunedGenerationConfig(
+            request.generationConfig,
+            maxCompletionTokens: request.maximumCompletionTokens,
+            remainingContext: maxContext - effectivePromptIDs.count,
+            startsInThinking: startsInThinking,
+            reasoningEffort: request.reasoningEffort,
+            promptProfile: promptProfile)
+        let activeContextEstimate = effectivePromptIDs.count + config.maxNewTokens
+        let alignEnv = ProcessInfo.processInfo.environment["MFERENCE_INTENT_ALIGN"]?.lowercased()
+        let intentAlignEnabled = alignEnv != "0" && alignEnv != "off"
+        (runner as? RealForwardRunner)?.specMaxDraftSlotCapOverride = intentAlignEnabled
+            ? ServerIntentAligner.recommendedMaxSlotSupportedK(activeContextTokens: activeContextEstimate)
+            : nil
+
         let countsPayloadTokens = tokenizer.dialect == .chatml
             || tokenizer.dialect == .glm5 || tokenizer.dialect == .minicpm
         let decoder = countsPayloadTokens || needsToolTemplate || startsInThinking
@@ -412,12 +562,18 @@ public actor ServerModelSession: ServerLoadedModel {
                 startsInThought: startsInThinking,
                 toolDefinitions: request.tools)
             : nil
+        if config.maxThinkingTokens > 0 {
+            decoder?.maxThinkingTokens = config.maxThinkingTokens
+        }
         var stopMatcher = StreamingStopMatcher(stops: request.generationConfig.stopStrings)
         var content = ""
         var reasoning = ""
-        if tokenizer.usesSourceQwenTemplate(reasoningEffort: request.reasoningEffort) {
-            decoder?.onReasoning = { text in
-                reasoning += text
+        // Always capture reasoning internally for prompt-cache continuation matching,
+        // while keeping external SSE reasoning events gated on usesSourceQwenTemplate.
+        let emitReasoningEvents = tokenizer.usesSourceQwenTemplate(reasoningEffort: request.reasoningEffort)
+        decoder?.onReasoning = { text in
+            reasoning += text
+            if emitReasoningEvents {
                 onEvent(.reasoning(text))
             }
         }
@@ -519,14 +675,37 @@ public actor ServerModelSession: ServerLoadedModel {
             reason = "stop"
         }
         if promptCacheMode == .singlePrefix {
-            promptCache.publish(
+            let outcome = promptCache.publish(
                 domain: promptCacheDomain,
                 request: request,
                 content: content,
                 calls: calls,
                 result: result,
                 reasoningContent: reasoning.isEmpty ? nil : reasoning,
-                stopStringFiltered: stopMatcher.isStopped)
+                stopStringFiltered: stopMatcher.isStopped,
+                replacesSlotID: matchedSlotID)
+            for evictedID in outcome.evictedSlotIDs {
+                cachedSnapshots.removeValue(forKey: evictedID)
+            }
+            if let publishedID = outcome.publishedSlotID {
+                cachedSnapshots.removeValue(forKey: publishedID)
+                liveRunnerCacheEntryID = publishedID
+            } else {
+                liveRunnerCacheEntryID = nil
+            }
+        }
+        if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
+            let spec = (runner as? RealForwardRunner)?.mtpSpecStats
+            let specPart = spec.map {
+                let dMs = String(format: "%.1f", Double($0.draftNanos) / 1e6)
+                let vMs = String(format: "%.1f", Double($0.verifyNanos) / 1e6)
+                let aMs = String(format: "%.1f", Double($0.acceptNanos) / 1e6)
+                return " mtp_rounds=\($0.rounds) mtp_drafted=\($0.draftedTokens) mtp_accepted=\($0.acceptedTokens) mtp_emitted=\($0.emittedTokens) mtp_rollbacks=\($0.rollbacks) draft_ms=\(dMs) verify_ms=\(vMs) accept_ms=\(aMs)"
+            } ?? ""
+            let prefillStr = String(format: "%.4f", result.prefillSeconds)
+            let decodeStr = String(format: "%.4f", result.decodeSeconds)
+            let metricsLine = "[server-metrics] prefill=\(result.prefillTokens)tok/\(prefillStr)s decode=\(result.newTokens)tok/\(decodeStr)s stop=\(String(describing: result.reason))\(specPart)\n"
+            FileHandle.standardError.write(Data(metricsLine.utf8))
         }
         completed = true
         var completion = ServerCompletion(
@@ -544,7 +723,235 @@ public actor ServerModelSession: ServerLoadedModel {
             diagnostics: RuntimeDiagnostics.enabled ? RuntimeDiagnostics(
                 result: result,
                 memory: .capture(model: model, producer: runner, scratch: scratch)) : nil)
-        completion.reasoningContent = reasoning.isEmpty ? nil : reasoning
+        completion.reasoningContent = (emitReasoningEvents && !reasoning.isEmpty) ? reasoning : nil
         return completion
+    }
+}
+
+/// Aligns terse or imperfectly phrased user prompts toward direct action/code
+/// and configures server generation defaults (loop guard, sliding repetition window,
+/// bounded `<think>` token budget, zero-think fast path, and memory-pressure draft caps).
+public enum ServerIntentAligner {
+    public enum PromptThinkingProfile: Equatable, Sendable {
+        case zeroThinkFastPath
+        case standard
+        case multiPartAlgorithmic
+        case strictConstraint
+    }
+
+    public static let defaultActionSystemDirective =
+        "Complete all derivations and explicitly verify every word-count, length, and formatting constraint inside <think>. Once </think> closes, output the final answer, code, or requested format concisely without repeating intermediate scratchpad steps."
+
+    public static let conciseCodeAndActionDirective =
+        "Complete all reasoning concisely inside <think>. Once </think> closes, output the final answer or code directly with zero inline comments."
+
+    public static let conciseVisibleDerivationDirective =
+        "Give a direct 4-step solution (under 150 words total): state the simplified closed form immediately, evaluate each step on a single compact line without explaining elementary arithmetic or inverses, and end with FINAL_ANSWER."
+
+    public static func classifyPromptThinkingProfile(
+        messages: [MFTokenizer.Message],
+        tools: [MFTokenizer.FunctionDefinition] = [],
+        reasoningEffort: QwenReasoningEffort? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> PromptThinkingProfile {
+        let alignEnv = environment["MFERENCE_INTENT_ALIGN"]?.lowercased()
+        if alignEnv == "0" || alignEnv == "off" {
+            return .standard
+        }
+        if reasoningEffort == .off {
+            return .zeroThinkFastPath
+        }
+        if environment["MFERENCE_ZERO_THINK_FASTPATH"] == "1" {
+            return .zeroThinkFastPath
+        }
+        let rawUserText = messages.last(where: { $0.role == .user })?.content?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let lower = rawUserText.lowercased()
+        guard !lower.isEmpty else { return .standard }
+
+        // When the prompt explicitly asks to write the derivation in the visible output and end with FINAL_ANSWER,
+        // perform a single-pass visible derivation rather than duplicating the derivation inside <think> and visible text.
+        if tools.isEmpty && reasoningEffort == nil && lower.contains("final_answer") {
+            return .zeroThinkFastPath
+        }
+
+        let strictConstraintMarkers = [
+            "whitespace-separated words", "matching every rule", "follow every constraint",
+            "word count"
+        ]
+        if strictConstraintMarkers.contains(where: { lower.contains($0) }) {
+            return .strictConstraint
+        }
+
+        // Multi-part algorithmic/math derivations get a larger thinking budget.
+        let multiPartMarkers = [
+            "step-by-step", "step by step", "then write", "then compute", "then implement",
+            "part 1", "part 2", "prove that", "derive", "multi-step"
+        ]
+        if multiPartMarkers.contains(where: { lower.contains($0) }) {
+            return .multiPartAlgorithmic
+        }
+
+        // Simple single-step utility/transform requests bypass <think> directly onto step 1.
+        if tools.isEmpty && reasoningEffort == nil && rawUserText.count <= 120 {
+            let zeroThinkPrefixes = [
+                "convert ", "format as json:", "translate to ", "regex for ",
+                "one-liner:", "no think:", "skip thinking:"
+            ]
+            if zeroThinkPrefixes.contains(where: { lower.hasPrefix($0) }) {
+                return .zeroThinkFastPath
+            }
+        }
+        return .standard
+    }
+
+    /// Appends `</think>\n\n` directly onto `promptIDs` when `profile == .zeroThinkFastPath`
+    /// and the rendered prompt ends inside an open `<think>` block so visible tokens emit on step 1.
+    public static func applyZeroThinkFastPathIfNeeded(
+        promptIDs: [Int32],
+        tokenizer: MFTokenizer,
+        profile: PromptThinkingProfile
+    ) -> [Int32] {
+        guard profile == .zeroThinkFastPath,
+              let thinkStartID = tokenizer.thinkStartID,
+              let thinkEndID = tokenizer.thinkEndID,
+              thinkStartID >= 0, thinkEndID >= 0 else {
+            return promptIDs
+        }
+        let tailWindow = promptIDs.suffix(6)
+        guard tailWindow.contains(thinkStartID), !tailWindow.contains(thinkEndID) else {
+            return promptIDs
+        }
+        return promptIDs + [thinkEndID] + tokenizer.encode("\n\n", addBOS: false)
+    }
+
+    public static func alignMessages(_ messages: [MFTokenizer.Message],
+                                     tools: [MFTokenizer.FunctionDefinition],
+                                     dialect: ChatDialect,
+                                     environment: [String: String] = ProcessInfo.processInfo.environment) -> [MFTokenizer.Message] {
+        guard !messages.isEmpty else { return messages }
+        let envMode = environment["MFERENCE_INTENT_ALIGN"]?.lowercased()
+        guard envMode != "0" && envMode != "off" else { return messages }
+        if messages.contains(where: { $0.role == .system || $0.role == .developer }) {
+            return messages
+        }
+        if envMode == "1" || envMode == "on" || envMode == "always" {
+            return [MFTokenizer.Message(role: .system, content: defaultActionSystemDirective)] + messages
+        }
+        guard let firstUser = messages.first(where: { $0.role == .user }) else {
+            return messages
+        }
+        let firstUserText = firstUser.content?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let firstLower = firstUserText.lowercased()
+        guard dialect == .chatml,
+              tools.isEmpty,
+              !firstUserText.isEmpty else {
+            return messages
+        }
+        if firstLower.contains("final_answer") {
+            return [MFTokenizer.Message(role: .system, content: conciseVisibleDerivationDirective)] + messages
+        }
+        let firstTurnProfile = classifyPromptThinkingProfile(
+            messages: [firstUser],
+            tools: tools,
+            reasoningEffort: nil,
+            environment: environment
+        )
+        if firstTurnProfile == .strictConstraint || firstUserText.count <= 96 {
+            return [MFTokenizer.Message(role: .system, content: defaultActionSystemDirective)] + messages
+        }
+        if firstLower.contains("swift") || firstLower.contains("rust") || firstLower.contains("c++") {
+            return [MFTokenizer.Message(role: .system, content: conciseCodeAndActionDirective)] + messages
+        }
+        return messages
+    }
+
+    public static func tunedGenerationConfig(_ base: GenerationConfig,
+                                             maxCompletionTokens: Int,
+                                             remainingContext: Int,
+                                             startsInThinking: Bool,
+                                             reasoningEffort: QwenReasoningEffort?,
+                                             promptProfile: PromptThinkingProfile = .standard,
+                                             environment: [String: String] = ProcessInfo.processInfo.environment) -> GenerationConfig {
+        var config = base
+        config.maxNewTokens = max(1, min(maxCompletionTokens, remainingContext))
+        config.stopStrings = []
+        let alignEnv = environment["MFERENCE_INTENT_ALIGN"]?.lowercased()
+        if alignEnv == "0" || alignEnv == "off" {
+            return config
+        }
+        if config.loopGuardRepeats == 0 {
+            config.loopGuardRepeats = 3
+            config.loopGuardPenalty = max(config.loopGuardPenalty, 1.85)
+        }
+        if config.repetitionWindow == 0 && config.repetitionPenalty != 1.0 {
+            config.repetitionWindow = 128
+        }
+        if promptProfile == .zeroThinkFastPath {
+            config.maxThinkingTokens = 0
+            return config
+        }
+        if startsInThinking && config.maxThinkingTokens == 0 && config.maxNewTokens >= 64 {
+            if promptProfile == .multiPartAlgorithmic || promptProfile == .strictConstraint {
+                if reasoningEffort == nil && config.maxNewTokens >= 512 {
+                    // ~62.5% of maxNewTokens (320 at 512, soft-landing [284, 320]) so derivations finish inside <think>.
+                    config.maxThinkingTokens = min(768, config.maxNewTokens * 5 / 8)
+                } else {
+                    config.maxThinkingTokens = min(768, config.maxNewTokens * 4 / 5)
+                }
+            } else {
+                switch reasoningEffort {
+                case .low:
+                    config.maxThinkingTokens = min(256, config.maxNewTokens * 2 / 3)
+                case .medium:
+                    config.maxThinkingTokens = min(512, config.maxNewTokens * 5 / 8)
+                case .xhigh:
+                    config.maxThinkingTokens = min(1024, config.maxNewTokens * 3 / 4)
+                default:
+                    // Reserve at least ~56% visible headroom on tight max_tokens budgets so coding outputs complete cleanly.
+                    if config.maxNewTokens <= 768 {
+                        config.maxThinkingTokens = min(512, config.maxNewTokens * 7 / 16)
+                    } else {
+                        config.maxThinkingTokens = min(768, config.maxNewTokens * 5 / 8)
+                    }
+                }
+            }
+        }
+        return config
+    }
+
+    public static func currentAvailableMemoryBytes(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> UInt64 {
+        if let overrideMB = environment["MFERENCE_AVAILABLE_MEMORY_MB"].flatMap(UInt64.init) {
+            return overrideMB * 1024 * 1024
+        }
+        #if canImport(Darwin)
+        let avail = mference_os_proc_available_memory()
+        if avail > 0 {
+            return UInt64(avail)
+        }
+        #endif
+        return ProcessInfo.processInfo.physicalMemory / 2
+    }
+
+    /// Dynamically caps `maxSlotSupportedK` under 16 GiB unified-memory pressure or
+    /// long active context so speculative verification does not thrash Metal wired buffers.
+    public static func recommendedMaxSlotSupportedK(
+        availableMemoryBytes: UInt64 = Self.currentAvailableMemoryBytes(),
+        activeContextTokens: Int,
+        configuredSlotCap: Int = 2
+    ) -> Int {
+        let cap = max(1, min(4, configuredSlotCap))
+        let tightThreshold: UInt64 = 1_536 * 1024 * 1024    // 1.5 GiB
+        let moderateThreshold: UInt64 = 3_072 * 1024 * 1024 // 3.0 GiB
+        if availableMemoryBytes < tightThreshold || activeContextTokens >= 3072 {
+            return 1
+        }
+        if availableMemoryBytes < moderateThreshold || activeContextTokens >= 1536 {
+            return min(cap, 2)
+        }
+        return cap
     }
 }

@@ -39,6 +39,13 @@ public struct QwenToolCallParser: Sendable {
         var body = Substring(text)
         trimOuterWhitespace(&body)
 
+        if body.hasPrefix("{") {
+            return try parseJSONToolCallFallback(String(body),
+                                                 allowedTools: allowedTools,
+                                                 id: id,
+                                                 toolSchemas: toolSchemas)
+        }
+
         let name = try functionName(&body)
         guard isValidFunctionName(name) else {
             throw ToolCallParserError.malformed
@@ -87,8 +94,11 @@ public struct QwenToolCallParser: Sendable {
         }
         let name = String(body[..<close])
         body = body[body.index(after: close)...]
-        guard body.first == "\n" else { throw ToolCallParserError.malformed }
-        body.removeFirst()
+        if body.first == "\n" {
+            body.removeFirst()
+        } else if !body.hasPrefix("<parameter=") {
+            throw ToolCallParserError.malformed
+        }
         return name
     }
 
@@ -105,17 +115,38 @@ public struct QwenToolCallParser: Sendable {
             throw ToolCallParserError.malformed
         }
         body = body[body.index(after: close)...]
-        guard body.first == "\n" else { throw ToolCallParserError.malformed }
-        body.removeFirst()
-        // VALUE runs to the newline before `</parameter>`; the newline that
-        // opened it may double as that closer for an empty value.
-        guard let closeRange = body.range(of: "\n</parameter>\n")
-                ?? emptyValueCloseRange(body) else {
+        let hadLeadingNewline: Bool
+        if body.first == "\n" {
+            body.removeFirst()
+            hadLeadingNewline = true
+        } else {
+            hadLeadingNewline = false
+        }
+        // VALUE runs to `\n</parameter>\n`, or for empty values `</parameter>\n`,
+        // or under quantized formatting slips inline `</parameter>` followed by
+        // optional newline before the next `<parameter=` or `</function>`.
+        if hadLeadingNewline,
+           let closeRange = body.range(of: "\n</parameter>\n") ?? emptyValueCloseRange(body) {
+            let value = String(body[..<closeRange.lowerBound])
+            body = body[closeRange.upperBound...]
+            return (key, value)
+        }
+        guard let inlineClose = body.range(of: "</parameter>") else {
             throw ToolCallParserError.malformed
         }
-        let value = String(body[..<closeRange.lowerBound])
-        body = body[closeRange.upperBound...]
-        return (key, value)
+        var rawValue = Substring(body[..<inlineClose.lowerBound])
+        if hadLeadingNewline, rawValue.last == "\n" {
+            rawValue.removeLast()
+        }
+        var afterClose = body[inlineClose.upperBound...]
+        while afterClose.first == " " || afterClose.first == "\t" || afterClose.first == "\r" {
+            afterClose.removeFirst()
+        }
+        if afterClose.first == "\n" {
+            afterClose.removeFirst()
+        }
+        body = afterClose
+        return (key, String(rawValue))
     }
 
     /// Handles `<parameter=k>\n</parameter>\n` where the single newline both
@@ -160,14 +191,116 @@ public struct QwenToolCallParser: Sendable {
             }
             return .string(raw)
         }
-        guard let value = try? JSONDecoder().decode(JSONValue.self,
-                                                    from: Data(trimmed.utf8)) else {
-            return .string(raw)
+        if let value = try? JSONDecoder().decode(JSONValue.self,
+                                                 from: Data(trimmed.utf8)) {
+            // Quoted strings stay raw text: the template writes string arguments
+            // unquoted, so literal quotes belong to the argument itself.
+            if case .string = value { return .string(raw) }
+            return value
         }
-        // Quoted strings stay raw text: the template writes string arguments
-        // unquoted, so literal quotes belong to the argument itself.
-        if case .string = value { return .string(raw) }
-        return value
+        if "{[".contains(first),
+           let repaired = Self.repairMinorJSONSlip(trimmed),
+           !nestsBeyondLimit(repaired),
+           let value = try? JSONDecoder().decode(JSONValue.self,
+                                                 from: Data(repaired.utf8)) {
+            if case .string = value { return .string(raw) }
+            return value
+        }
+        return .string(raw)
+    }
+
+    /// Repairs minor quantized JSON slips (trailing commas before `}`/`]` or a single
+    /// missing closing delimiter at the end of a container).
+    private static func repairMinorJSONSlip(_ text: String) -> String? {
+        // 1. Remove trailing commas before `}` or `]`, e.g. `{"a": 1, }` -> `{"a": 1 }`
+        var cleaned = text.replacingOccurrences(
+            of: #",\s*([}\]])"#,
+            with: "$1",
+            options: .regularExpression)
+        if cleaned != text {
+            return cleaned
+        }
+        // 2. Balance a single unclosed trailing `{` or `[` if not inside a string literal.
+        var stack: [Character] = []
+        var inString = false
+        var escaped = false
+        for ch in cleaned {
+            if inString {
+                if escaped { escaped = false }
+                else if ch == "\\" { escaped = true }
+                else if ch == "\"" { inString = false }
+                continue
+            }
+            switch ch {
+            case "\"": inString = true
+            case "{": stack.append("}")
+            case "[": stack.append("]")
+            case "}", "]":
+                guard stack.last == ch else { return nil }
+                stack.removeLast()
+            default: break
+            }
+        }
+        guard !inString, !stack.isEmpty, stack.count <= 2 else { return nil }
+        cleaned = cleaned.replacingOccurrences(
+            of: #",\s*$"#,
+            with: "",
+            options: .regularExpression)
+        for closer in stack.reversed() {
+            cleaned.append(closer)
+        }
+        return cleaned
+    }
+
+    private func parseJSONToolCallFallback(_ text: String,
+                                           allowedTools: Set<String>,
+                                           id: String,
+                                           toolSchemas: [String: JSONValue]) throws -> ParsedToolCall {
+        guard !nestsBeyondLimit(text) else { throw ToolCallParserError.malformed }
+        let Candidate = (try? JSONDecoder().decode(JSONValue.self, from: Data(text.utf8)))
+            ?? Self.repairMinorJSONSlip(text).flatMap {
+                try? JSONDecoder().decode(JSONValue.self, from: Data($0.utf8))
+            }
+        guard case .object(let root) = Candidate,
+              case .string(let name) = root["name"],
+              isValidFunctionName(name) else {
+            throw ToolCallParserError.malformed
+        }
+        guard allowedTools.contains(name) else {
+            throw ToolCallParserError.unknownTool(name)
+        }
+        let rawArgs: [String: JSONValue]
+        if let argsField = root["arguments"] ?? root["parameters"] {
+            if case .object(let obj) = argsField {
+                rawArgs = obj
+            } else if case .string(let argStr) = argsField,
+                      !nestsBeyondLimit(argStr),
+                      case .object(let decodedObj) = try? JSONDecoder().decode(
+                        JSONValue.self, from: Data(argStr.utf8)) {
+                rawArgs = decodedObj
+            } else {
+                throw ToolCallParserError.malformed
+            }
+        } else {
+            rawArgs = [:]
+        }
+        let properties = toolSchemas[name]?.objectValue?["properties"]?.objectValue ?? [:]
+        var coerced: [String: JSONValue] = [:]
+        for (k, v) in rawArgs {
+            let declaredType = properties[k]?.objectValue?["type"]
+            if declaredType == .string("boolean"),
+               case .string(let s) = v,
+               let b = booleanLiteral(s) {
+                coerced[k] = .bool(b)
+            } else {
+                coerced[k] = v
+            }
+        }
+        let argumentsValue = JSONValue.object(coerced)
+        return ParsedToolCall(id: id,
+                              name: name,
+                              arguments: argumentsValue,
+                              argumentsJSON: try argumentsValue.encoded())
     }
 
     /// Iteratively counts container nesting, ignoring brackets inside string

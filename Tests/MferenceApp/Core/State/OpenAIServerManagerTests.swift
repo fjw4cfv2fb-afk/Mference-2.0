@@ -46,7 +46,7 @@ import Testing
     @Test func resolveModelPathFallsBackToDefaultScratch() {
         let path = OpenAIServerManager.resolveModelPath(candidate: nil)
         #expect(!path.isEmpty)
-        #expect(path.contains("qwen36.gturbo"))
+        #expect(path.contains("qwen36-mtp.gturbo") || path.contains("qwen36.gturbo"))
     }
 
     @MainActor

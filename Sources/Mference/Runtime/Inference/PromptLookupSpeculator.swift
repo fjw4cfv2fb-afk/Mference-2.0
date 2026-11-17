@@ -40,7 +40,6 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
     private var pending: [(expectInput: Int32, emit: UInt32)] = []
     private var pendingPosition = 0
     private var lastRoundAcceptedAll: Bool = true
-    private var activeSequence: [Int32]? = nil
 
     // Dynamic statistical transition tables
     private var trigramCounts: [BigramKey: [Int32: Int]] = [:]
@@ -84,7 +83,6 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
         bigramTotals.removeAll(keepingCapacity: true)
         pendingPosition = 0
         lastRoundAcceptedAll = true
-        activeSequence = nil
         stats = Stats()
     }
 
@@ -94,9 +92,6 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
         lastRoundAcceptedAll = true
         if expectedPosition < contextTokens.count {
             contextTokens.removeSubrange(expectedPosition...)
-            if expectedPosition < promptLength {
-                activeSequence = nil
-            }
             rebuildTransitions()
         }
     }
@@ -107,7 +102,6 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
             contextTokens.removeAll(keepingCapacity: true)
             contextTokens.append(contentsOf: tokens)
             promptLength = tokens.count
-            detectActiveSequence()
             rebuildTransitions()
             return
         }
@@ -132,26 +126,6 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
             let boundaryStart = max(0, contextTokens.count - 2)
             contextTokens.append(contentsOf: tail)
             updateTransitions(tokens: contextTokens[boundaryStart...])
-        }
-    }
-
-    private func detectActiveSequence() {
-        let prompt = contextTokens
-        if prompt.contains(5257) && (prompt.contains(32836) || prompt.contains(10087) || prompt.contains(16140)) {
-            activeSequence = ReasoningPriors.trainSequence
-        } else if prompt.contains(37011) || prompt.contains(6741) || prompt.contains(35792) || prompt.contains(21568) || prompt.contains(17551) {
-            activeSequence = ReasoningPriors.raceSequence
-        } else if prompt.contains(46730) || prompt.contains(24959) || prompt.contains(56470) {
-            activeSequence = ReasoningPriors.combSequence
-        } else if prompt.contains(72632) || prompt.contains(12323) {
-            activeSequence = ReasoningPriors.recurSequence
-        } else if prompt.contains(40423) || (prompt.contains(22997) && prompt.contains(9666)) {
-            activeSequence = ReasoningPriors.cubeSequence
-        } else {
-            activeSequence = nil
-        }
-        if ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1" || ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
-            print("[detectActiveSequence]: count=\(prompt.count) active=\(activeSequence != nil)")
         }
     }
 
@@ -296,62 +270,6 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
             let capped = Array(drafts.prefix(maxK))
             recordDraftStats(drafts: capped)
             return capped
-        }
-
-        // --- Tier 0: Structural Reasoning Priors (100% deterministic transitions) ---
-        if let seq = activeSequence {
-            let genIndex = position - promptLength
-            if genIndex >= 0 && genIndex < seq.count {
-                let exp = seq[genIndex]
-                let match = (bonus == exp) ||
-                            (bonus == 198 && exp == 271) ||
-                            (bonus == 271 && exp == 198) ||
-                            (bonus == 220 && (exp == 256 || exp == 257))
-                if match {
-                    let start = genIndex + 1
-                    let end = min(start + maxK, seq.count)
-                    if start < end {
-                        return emitDrafts(Array(seq[start..<end]))
-                    }
-                }
-            }
-
-            // Robust local window search around genIndex (within ±3 tokens)
-            for m in (1...4).reversed() {
-                guard L >= m else { continue }
-                let pat = history[(L - m)..<L]
-                let searchMin = max(0, genIndex - 3)
-                let searchMax = min(seq.count - m, genIndex + 3)
-                if searchMin <= searchMax {
-                    var bestMatch: Int?
-                    var minDistance = Int.max
-                    for i in searchMin...searchMax {
-                        if seq[i..<(i + m)].elementsEqual(pat) {
-                            let dist = abs(i + m - 1 - genIndex)
-                            if dist < minDistance {
-                                minDistance = dist
-                                bestMatch = i + m - 1
-                            }
-                        }
-                    }
-                    if let match = bestMatch {
-                        let start = match + 1
-                        let end = min(start + maxK, seq.count)
-                        if start < end {
-                            return emitDrafts(Array(seq[start..<end]))
-                        }
-                        break
-                    }
-                }
-            }
-        }
-
-        // Generic fallback priors for non-benchmark prompts (e.g. "Final Answer:")
-        if bonus == 18770 || bonus == 12650 {
-            return emitDrafts([21134, 25])
-        }
-        if bonus == 21134 || bonus == 15666 {
-            return emitDrafts([25])
         }
 
         // --- Tier 1: Multi-token N-gram backward search (N = 16 down to 3) in generated history & prompt ---

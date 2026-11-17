@@ -235,16 +235,43 @@ public final class OpenAIServerManager {
         proc.terminate()
     }
 
-    /// Resolves the model path, falling back to known default scratch path if needed.
+    private static func defaultRepoRoots() -> [String] {
+        let fm = FileManager.default
+        let roots = [
+            fm.currentDirectoryPath,
+            fm.homeDirectoryForCurrentUser.appendingPathComponent("Documents/Mference").path,
+        ]
+        var deduped: [String] = []
+        for root in roots where !root.isEmpty && !deduped.contains(root) {
+            deduped.append(root)
+        }
+        return deduped
+    }
+
+    /// Resolves the model path, preferring the upgraded MTP checkpoint and
+    /// falling back to the base Qwen 3.6 directory if needed.
     public static func resolveModelPath(candidate: String?) -> String {
-        if let candidate, !candidate.isEmpty, FileManager.default.fileExists(atPath: candidate) {
+        let fm = FileManager.default
+        if let candidate, !candidate.isEmpty, fm.fileExists(atPath: candidate) {
             return candidate
         }
-        let fallback = "/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo"
-        if FileManager.default.fileExists(atPath: fallback) {
-            return fallback
+        var firstMtpFallback: String?
+        for root in defaultRepoRoots() {
+            let mtpFallback = (root as NSString).appendingPathComponent("scratch/qwen36-mtp.gturbo")
+            if firstMtpFallback == nil {
+                firstMtpFallback = mtpFallback
+            }
+            if fm.fileExists(atPath: mtpFallback) {
+                return mtpFallback
+            }
         }
-        return candidate ?? fallback
+        for root in defaultRepoRoots() {
+            let fallback = (root as NSString).appendingPathComponent("scratch/qwen36.gturbo")
+            if fm.fileExists(atPath: fallback) {
+                return fallback
+            }
+        }
+        return candidate ?? firstMtpFallback ?? "scratch/qwen36-mtp.gturbo"
     }
 
     /// Probes the server health endpoint.
@@ -284,13 +311,19 @@ public final class OpenAIServerManager {
         }
 
         // 2. Local build products
-        let candidates = [
-            "/Users/vladslugin/Documents/Mference/.build/release/MferenceServer",
-            "/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceServer",
-            "/Users/vladslugin/Documents/Mference/.build/debug/MferenceServer",
-            "/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/debug/MferenceServer",
+        var candidates: [String] = []
+        for root in defaultRepoRoots() {
+            candidates.append(contentsOf: [
+                (root as NSString).appendingPathComponent(".build/release/MferenceServer"),
+                (root as NSString).appendingPathComponent(".build/arm64-apple-macosx/release/MferenceServer"),
+                (root as NSString).appendingPathComponent(".build/debug/MferenceServer"),
+                (root as NSString).appendingPathComponent(".build/arm64-apple-macosx/debug/MferenceServer"),
+            ])
+        }
+        candidates.append(contentsOf: [
             "/usr/local/bin/MferenceServer",
-        ]
+            "/opt/homebrew/bin/MferenceServer",
+        ])
         for candidate in candidates {
             if fm.isExecutableFile(atPath: candidate) {
                 return URL(fileURLWithPath: candidate)

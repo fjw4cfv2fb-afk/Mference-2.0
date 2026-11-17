@@ -226,6 +226,17 @@ actor RealInferenceSession {
                 context: context,
                 maxContext: key.maxContext,
                 runtimeConfiguration: runtimeConfiguration)
+            let env = ProcessInfo.processInfo.environment
+            let hasMTPSidecar = ManifestReader.peekSidecarCarried("mtp", directoryURL: key.directory)
+            if loadedModel.config.family == .qwen36,
+               hasMTPSidecar,
+               env["MFERENCE_SPEC"]?.lowercased() != "off",
+               env["MFERENCE_MTP"]?.lowercased() != "0",
+               env["MFERENCE_SPEC_K"] == nil,
+               env["MFERENCE_MTP_K"] == nil,
+               env["MFERENCE_SPEC_ADAPTIVE"] != "0" {
+                (loadedRuntime.producer as? RealForwardRunner)?.specAdaptiveDraftOverride = true
+            }
             let loadedScratch = try RawCompletionScratch(context: context,
                                                          vocab: loadedModel.config.vocabSize,
                                                          logitSoftcap: Float(loadedModel.config.finalLogitSoftcap))
@@ -261,11 +272,15 @@ actor RealInferenceSession {
 
     static func generationConfig(for request: AppGenerationRequest,
                                  maxNewTokens: Int? = nil) -> GenerationConfig {
-        GenerationConfig(maxNewTokens: maxNewTokens ?? request.maxNewTokens,
-                         temperature: request.temperature,
-                         topK: request.topK,
-                         topP: request.topP,
-                         repetitionPenalty: request.repetitionPenalty)
+        let alignEnv = ProcessInfo.processInfo.environment["MFERENCE_INTENT_ALIGN"]?.lowercased()
+        let intentAlignEnabled = alignEnv != "0" && alignEnv != "off"
+        return GenerationConfig(maxNewTokens: maxNewTokens ?? request.maxNewTokens,
+                                temperature: request.temperature,
+                                topK: request.topK,
+                                topP: request.topP,
+                                repetitionPenalty: request.repetitionPenalty,
+                                loopGuardRepeats: intentAlignEnabled ? 3 : 0,
+                                loopGuardPenalty: 1.85)
     }
 
     static func effectiveMaxNewTokens(requested: Int,
@@ -336,6 +351,11 @@ actor RealInferenceSession {
                     promptTokenCount: promptIds.count,
                     maxContext: requestKey.maxContext))
             runner.reset()
+            let alignEnv = ProcessInfo.processInfo.environment["MFERENCE_INTENT_ALIGN"]?.lowercased()
+            let intentAlignEnabled = alignEnv != "0" && alignEnv != "off"
+            (runner as? RealForwardRunner)?.specMaxDraftSlotCapOverride = intentAlignEnabled
+                ? (promptIds.count >= 3072 ? 1 : 2)
+                : nil
             progress.prefillStart = Date()
 
             let decoder = tokenizer.generationPromptStartsInThinking

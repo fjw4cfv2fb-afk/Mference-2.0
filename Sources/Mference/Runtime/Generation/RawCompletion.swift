@@ -193,12 +193,34 @@ public func runRawCompletion(producer: any LogitProducer,
     var generated = 0
     var reason: StopReason = .maxTokens
     var uncommittedBoundaryTokenIDs: [Int32] = []
+    let effectiveLoopGuardRepeats: Int = {
+        if config.loopGuardRepeats >= 2 { return config.loopGuardRepeats }
+        if ProcessInfo.processInfo.environment["MFERENCE_LOOP_GUARD"] == "1" { return 3 }
+        return 0
+    }()
+    let effectiveMaxThinkingTokens: Int = {
+        if config.maxThinkingTokens > 0 { return config.maxThinkingTokens }
+        if let raw = ProcessInfo.processInfo.environment["MFERENCE_MAX_THINK_TOKENS"],
+           let parsed = Int(raw), parsed > 0 {
+            return parsed
+        }
+        return 0
+    }()
+    var inThinkingSpan = tokenizer.startsInThinking(reasoningEffort: nil, promptIDs: promptIds)
+        || (tokenizer.thinkStartID != nil && promptIds.last == tokenizer.thinkStartID)
+    var thinkingTokensCount = 0
+    var thinkingHistory: [Int32] = []
+    var forcedInjectionQueue: [Int32] = []
+    var pendingLoopBreakTokens: [Int32]? = nil
 
     while true {
         try Task.checkCancellation()
 
         let tokenID: Int32
-        if generated == 0, let seed = prefillSeed {
+        if !forcedInjectionQueue.isEmpty {
+            tokenID = forcedInjectionQueue.removeFirst()
+            pendingLoopBreakTokens = nil
+        } else if generated == 0, let seed = prefillSeed {
             switch seed {
             case .greedyToken(let token):
                 tokenID = Int32(bitPattern: token)
@@ -206,6 +228,19 @@ public func runRawCompletion(producer: any LogitProducer,
                 tokenID = sampleOnce(scratch: scratch, context: context,
                                      history: history, config: config, position: generated)
             }
+        } else if let loopTokens = pendingLoopBreakTokens {
+            pendingLoopBreakTokens = nil
+            let primaryPenalty = max(config.repetitionPenalty, max(config.loopGuardPenalty, 1.85))
+            scratch.sampler.penalizeCycleInPlace(logits: scratch.logits,
+                                                 cycleTokens: loopTokens,
+                                                 primaryPenalty: primaryPenalty,
+                                                 secondaryPenalty: 1.06)
+            var breakConfig = config
+            breakConfig.temperature = 0
+            breakConfig.repetitionPenalty = 1.0
+            breakConfig.repetitionWindow = 0
+            tokenID = sampleOnce(scratch: scratch, context: context,
+                                 history: [], config: breakConfig, position: generated)
         } else if fusedGreedy {
             tokenID = Int32(bitPattern: fusedRunner!.lastGreedyToken)
         } else {
@@ -229,6 +264,46 @@ public func runRawCompletion(producer: any LogitProducer,
         }
 
         let delta = detok.push(tokenID)
+
+        if tokenID == tokenizer.thinkStartID {
+            inThinkingSpan = true
+            thinkingTokensCount = 0
+            thinkingHistory.removeAll(keepingCapacity: true)
+        } else if tokenID == tokenizer.thinkEndID {
+            inThinkingSpan = false
+            thinkingHistory.removeAll(keepingCapacity: true)
+            (producer as? RealForwardRunner)?.notifyMTPPhaseTransition(structuredCodeOrTool: false)
+        } else if inThinkingSpan {
+            thinkingTokensCount += 1
+            thinkingHistory.append(tokenID)
+            let softRatio = effectiveMaxThinkingTokens >= 300 ? 0.89 : 0.85
+            let softThinkLimit = max(1, Int((Double(effectiveMaxThinkingTokens) * softRatio).rounded(.down)))
+            let hitThinkLimit = effectiveMaxThinkingTokens > 0
+                && (thinkingTokensCount >= effectiveMaxThinkingTokens
+                    || (thinkingTokensCount >= softThinkLimit
+                        && StructuredAssistantDecoder.isThinkingBoundaryDelta(delta)))
+            let hitThinkLoop = effectiveLoopGuardRepeats >= 2
+                && thinkingTokensCount >= 24
+                && RepetitionLoopDetector.detectLoop(
+                    in: thinkingHistory,
+                    maxPatternLength: 64,
+                    minRepeats: effectiveLoopGuardRepeats) != nil
+            if (hitThinkLimit || hitThinkLoop),
+               forcedInjectionQueue.isEmpty,
+               let thinkEndID = tokenizer.thinkEndID, thinkEndID >= 0,
+               generated + 4 < config.maxNewTokens {
+                let prefixNewline = delta.hasSuffix("\n") ? [] : tokenizer.encode("\n", addBOS: false)
+                forcedInjectionQueue = prefixNewline
+                    + [thinkEndID]
+                    + tokenizer.encode("\n\n", addBOS: false)
+                inThinkingSpan = false
+                thinkingHistory.removeAll(keepingCapacity: true)
+                (producer as? RealForwardRunner)?.notifyMTPPhaseTransition(structuredCodeOrTool: false)
+            }
+        } else if tokenID == tokenizer.toolCallStartID || delta.contains("```") {
+            (producer as? RealForwardRunner)?.notifyMTPPhaseTransition(structuredCodeOrTool: true)
+        }
+
         if ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1" {
             print("[token]: id=\(tokenID), str=\(delta.debugDescription)")
         }
@@ -245,7 +320,26 @@ public func runRawCompletion(producer: any LogitProducer,
         }
 
         history.append(tokenID)
-        try await producer.produce(token: tokenID, position: position, into: scratch.logits)
+        if !forcedInjectionQueue.isEmpty {
+            // Flush any speculative drafts so the forced `</think>\n\n` tokens advance cleanly.
+            if fusedGreedy {
+                try (producer as? any ContinuableLogitProducer)?.prepareForContinuation(expectedPosition: position)
+            }
+            try await producer.produce(token: tokenID, position: position, into: scratch.logits)
+        } else if effectiveLoopGuardRepeats >= 2,
+                  let loopTokens = RepetitionLoopDetector.detectLoop(in: history, minRepeats: effectiveLoopGuardRepeats) {
+            pendingLoopBreakTokens = loopTokens
+            if fusedGreedy {
+                try (producer as? any ContinuableLogitProducer)?.prepareForContinuation(expectedPosition: position)
+                fusedRunner?.setOutputMode(.logits)
+                try await producer.produce(token: tokenID, position: position, into: scratch.logits)
+                fusedRunner?.setOutputMode(.greedyIfAvailable)
+            } else {
+                try await producer.produce(token: tokenID, position: position, into: scratch.logits)
+            }
+        } else {
+            try await producer.produce(token: tokenID, position: position, into: scratch.logits)
+        }
         position += 1
         uncommittedBoundaryTokenIDs.removeAll(keepingCapacity: true)
     }

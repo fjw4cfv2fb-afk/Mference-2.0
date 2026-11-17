@@ -4,7 +4,9 @@ set -euo pipefail
 # Mference Model Weight Patch & Rollback Utility
 # Safe, zero-risk APFS copy-on-write harness for weight-space programming and steering patches.
 
-MODEL_DIR="${MODEL_DIR:-/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+MODEL_DIR="${MODEL_DIR:-${REPO_ROOT}/scratch/qwen36.gturbo}"
 BACKUP_DIR="${MODEL_DIR}/.backups"
 GOLDEN_DIR="${BACKUP_DIR}/golden"
 

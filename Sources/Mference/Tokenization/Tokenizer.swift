@@ -310,11 +310,14 @@ public struct MFTokenizer: @unchecked Sendable {
         let toolResponseEnd = try id("</tool_response>")
         let thinkStart = try id("<think>")
         let thinkEnd = try id("</think>")
-        // Maple and Qwen 3.8 chat templates end the generation prompt inside
-        // a live `<think>` block and stop on `<|im_end|>`; the eos ==
-        // end-of-turn identity is what `generationPromptStartsInThinking`
-        // keys off. A nil family keeps the Qwen 3.6 (non-thinking) behavior.
+        // Maple, Qwen 3.8, and Qwen 3.6 (unless MFERENCE_QWEN36_THINKING=0) end
+        // the generation prompt inside a live `<think>` block and stop on
+        // `<|im_end|>`; the eos == end-of-turn identity is what
+        // `generationPromptStartsInThinking` keys off. A nil family keeps the
+        // non-thinking ChatML fixture behavior.
+        let qwen36ThinkingOff = ProcessInfo.processInfo.environment["MFERENCE_QWEN36_THINKING"] == "0"
         let startsInThinking = family == .maple || family == .qwen38
+            || (family == .qwen36 && !qwen36ThinkingOff)
         return ResolvedSpecialTokens(
             bosID: endOfText,
             bosPrefixID: nil,
@@ -839,7 +842,7 @@ public struct MFTokenizer: @unchecked Sendable {
                 ? ["enable_thinking": reasoningEffort != .off,
                    "reasoning_effort": (reasoningEffort ?? .xhigh).rawValue,
                    "preserve_thinking": true]
-                : ["enable_thinking": false,
+                : ["enable_thinking": !isBaseQwen38 && generationPromptStartsInThinking,
                    "preserve_thinking": true]
         ).map(Int32.init)
     }

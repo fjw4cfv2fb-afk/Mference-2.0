@@ -46,7 +46,8 @@ def parse_tensor_index(bin_path):
 
 
 def main():
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo"
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    model_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(repo_root, "scratch/qwen36.gturbo")
     manifest_path = os.path.join(model_dir, "manifest.json")
     weights_path = os.path.join(model_dir, "model_weights.bin")
     experts_dir = os.path.join(model_dir, "packed_experts")

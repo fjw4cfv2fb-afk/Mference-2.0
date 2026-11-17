@@ -2,11 +2,12 @@
   <img src="docs/assets/mference-app-icon.png" alt="Mference app icon" width="160">
 </p>
 
-<h1 align="center">Mference</h1>
+<h1 align="center">Mference 2.0</h1>
 
 <p align="center">
   <strong>Frontier models on Apple Silicon — even when the weights exceed RAM</strong><br>
-  A native Swift + Metal runtime for pinned checkpoints, with bounded-memory streaming and measured ports.
+  A native Swift + Metal runtime for pinned checkpoints, with bounded-memory streaming, Qwen 3.6 MTP + hybrid PLD speculation, and lossless resident weight surgery.<br>
+  <em>Forked from <a href="https://github.com/NeelM0906/Mference">NeelM0906/Mference</a>, derived from <a href="https://github.com/drumih/turbo-fieldfare">TurboFieldfare</a>.</em>
 </p>
 
 <p align="center">
@@ -18,6 +19,8 @@
 
 <p align="center">
   <a href="#try-it">Quick start</a> ·
+  <a href="MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md"><strong>MTP, Weight Surgery & Full Architecture</strong></a> ·
+  <a href="integrations/deepseek-harness/README.md"><strong>DeepSeek Harness Profile</strong></a> ·
   <a href="docs/RELEASE_SUPPORT.md">Checkpoint choices & limits</a> ·
   <a href="docs/OPENAI_SERVER.md">Local server</a> ·
   <a href="docs/OPEN_WEBUI.md">The UI</a> ·
@@ -27,6 +30,8 @@
   <a href="docs/FAMILY_GATE.md">Add a model family</a> ·
   <a href="#acknowledgments">Acknowledgments</a>
 </p>
+
+> **Deep-Dive Guide:** See **[`MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md`](MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md)** for full technical documentation of the Qwen 3.6 MTP sidecar & hybrid PLD speculation stack (v5), lossless resident weight surgery, runtime/cache upgrades, and the complete Mference program architecture, plus **[`integrations/deepseek-harness/README.md`](integrations/deepseek-harness/README.md)** for the tuned DeepSeek Harness desktop profile.
 
 <p align="center">
   <strong>Qwen3.8-Flash-Next, a 180B-parameter MoE: 24–210 prompt tok/s and 18.2–21.0 decode tok/s resident on M3 Ultra</strong><br>
@@ -120,10 +125,10 @@ compile-time baseline, and manifest contract. New families merge through the
 ## Try it
 
 Download a versioned source bundle, provenance manifest and checksums from
-[GitHub Releases](https://github.com/NeelM0906/Mference/releases). The
+upstream [GitHub Releases](https://github.com/NeelM0906/Mference/releases). The
 [0.1.0 release gate](docs/RELEASE_GATE_0.1.0.md) records the exact source commit,
 extracted-source checks and limitations. A tagged release is a reproducible
-baseline; cloning the default branch below gets the latest development source.
+baseline; cloning the default branch below gets this Mference 2.0 fork.
 
 This is a **source release for Apple Silicon Macs**, not a signed Mac app or
 a bundle of model weights. You need macOS 15+, Swift 6.1+ (Xcode 16.3+ or
@@ -132,8 +137,8 @@ if needed, for example with `brew install uv` if you already use Homebrew.
 The CLI/server do not need Python or `uv`.
 
 ```bash
-git clone https://github.com/NeelM0906/Mference.git
-cd Mference
+git clone https://github.com/fjw4cfv2fb-afk/Mference-2.0.git
+cd Mference-2.0
 ./mference-ui.sh doctor          # checks prerequisites without downloading or changing settings
 swift build -c release
 ./mference-ui.sh install gemma4    # streams and repacks the pinned checkpoint (~14 GB)
@@ -421,10 +426,12 @@ engine are in [System design](docs/SYSTEM_DESIGN.md) and the
 
 ## Acknowledgments
 
-Mference is heavily inspired by — and its foundation is derived from —
+**Mference 2.0** builds directly upon **[Mference](https://github.com/NeelM0906/Mference)**
+by [NeelM0906](https://github.com/NeelM0906), which itself is heavily inspired by
+— and its foundation derived from —
 **[TurboFieldfare](https://github.com/drumih/turbo-fieldfare)** by Andrey
-Mikhaylov, which pioneered running Gemma 4 26B in ~2 GB on Apple Silicon and
-documented over a hundred experiments behind its design. Those derived
+Mikhaylov (which pioneered running Gemma 4 26B in ~2 GB on Apple Silicon and
+documented over a hundred experiments behind its design). Those derived
 portions are licensed under the [Apache License 2.0](LICENSE-APACHE); see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details. New Mference
 code is [MIT-licensed](LICENSE).

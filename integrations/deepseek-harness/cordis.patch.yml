@@ -1,0 +1,196 @@
+# Your patch layer for this dsh profile, applied after every bundle layer:
+# a top-level YAML array of loader patch entries (id-targeted config
+# overrides, disables, and insert lists; `!!js` expressions allowed).
+- id: ui-settings-account
+  name: "@deepseek-ai/dsh-client-ui-settings-account"
+  config:
+    version: 1
+    step: done
+    purpose: null
+    process: standard
+    completion: skipped
+    usage: compact
+    developerTools: false
+- id: ui-chat
+  name: "@deepseek-ai/dsh-client-ui-chat"
+  config:
+    transcriptView: standard
+    performanceUsage: compact
+- id: ui-settings
+  name: "@deepseek-ai/dsh-client-ui-settings"
+  config:
+    enabled: false
+- id: session-title-llm
+  name: "@deepseek-ai/dsh-session-title-first-prompt-llm"
+  disabled: true
+- id: spill-policy
+  name: "@deepseek-ai/dsh-spill-policy"
+  config:
+    maxInlineTokens: 1200
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      edge0:
+        apiKeyEnv: EDGE0_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8000/v1
+        models:
+          - id: edge0-35b
+            name: edge0-35b
+      local:
+        displayName: Apple FMs
+        apiKeyEnv: LOCAL_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:1976/v1
+        models:
+          - id: system
+            name: system
+          - id: pcc
+            name: pcc
+      mference:
+        displayName: Mference
+        apiKeyEnv: MFERENCE_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:8080/v1
+        defaultContextWindow: 32768
+        defaultMaxTokens: 16384
+        timeoutMs: 600000
+        streamIdleTimeoutMs: 600000
+        models:
+          - id: qwen3.6-35b-a3b
+            name: qwen3.6-35b-a3b
+            contextWindow: 32768
+            maxTokens: 16384
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: mference
+    model: qwen3.6-35b-a3b
+- id: preset-standard
+  name: "@deepseek-ai/dsh-agent-preset"
+  config:
+    id: standard
+    order: 1
+    plugins:
+      - id: persona
+        name: "@deepseek-ai/dsh-persona"
+        config:
+          complete: true
+          includeRuntimeContext: false
+          prefix: |-
+            You are a fast, concise coding and system assistant powered by {{model}} on macOS (zsh), home directory `$HOME`.
+            Rules for speed and accuracy:
+            - The default workspace (`$HOME/Documents/deepseek-harness/default-workspace`) is an empty scratch directory. Do NOT search it when looking for user files or folders.
+            - `glob` is case-sensitive and scans hidden/Library folders. For finding folders or case-insensitive searches across `~/Desktop`, `~/Documents`, or `~/Downloads`, use `bash` (`find ~/Desktop ~/Documents ~/Downloads -maxdepth 3 -iname "*..." 2>/dev/null` or `ls -la`) in a single command.
+            - When analyzing a folder, `cd` into it first so output paths are short relative `./...` paths, and run ONE `find . -maxdepth 3` command excluding hidden/dependency/build noise (`-not -path "*/.*/*" -not -path "*/node_modules/*" -not -path "*/.venv/*" -not -path "*/venv/*" -not -path "*/__pycache__/*" -not -path "*/build/*" -not -path "*/dist/*" -not -path "*/xcuserdata/*" -not -name ".DS_Store" -not -name "*.pyc" | head -n 100`). NEVER run redundant `find` calls (`wc -l`, `sort`, repeated `head`) on a folder you already listed.
+            - For folder overviews, infer project structure from directory/file names first; only `read` small README/entry files with `limit: 60` if needed, and NEVER read large agent-spec or lock files (`AGENTS.md`, `CLAUDE.md`, `package-lock.json`, `*.pbxproj`) unless explicitly requested.
+            - Keep `<think>` reasoning to 1-2 short sentences maximum.
+            - Keep final answers compact: use a short bullet list of findings with no preamble, no filler, and no lengthy descriptions unless explicitly asked.
+      - id: agent-instructions
+        name: "@deepseek-ai/dsh-agent-instructions"
+        config:
+          maxBytes: 16384
+      - id: time-context
+        name: "@deepseek-ai/dsh-time-context"
+      - id: tool-bash
+        name: "@deepseek-ai/dsh-tool-bash"
+        disabled: !!js process.platform === 'win32'
+      - id: tool-pwsh
+        name: "@deepseek-ai/dsh-tool-pwsh"
+        disabled: !!js process.platform !== 'win32'
+      - id: tool-fs
+        name: "@deepseek-ai/dsh-tool-fs"
+        config:
+          applyPatch: false
+          readLimit: 120
+          readMaxLineLength: 500
+          readMaxBytes: 6144
+      - id: tool-fs-search
+        name: "@deepseek-ai/dsh-tool-fs-search"
+        config:
+          sampleOverCapGlobResults: false
+          globMaxResults: 50
+          grepMaxMatches: 50
+          stderrMaxBytes: 1024
+          timeoutMs: 10000
+      - id: tool-jobs
+        name: "@deepseek-ai/dsh-tool-jobs"
+        disabled: true
+      - id: tool-schedule
+        name: "@deepseek-ai/dsh-tool-schedule"
+        disabled: true
+      - id: skill-filesystem
+        name: "@deepseek-ai/dsh-skill-filesystem"
+        disabled: true
+      - id: tool-skill
+        name: "@deepseek-ai/dsh-tool-skill"
+        disabled: true
+      - id: command-goal
+        name: "@deepseek-ai/dsh-command-goal"
+        disabled: true
+      - id: tool-goal
+        name: "@deepseek-ai/dsh-tool-goal"
+        disabled: true
+      - id: planning
+        name: cordis:group
+        group: true
+        isolate:
+          planMode: true
+        config:
+          - id: plan-mode
+            name: "@deepseek-ai/dsh-plan-mode"
+            config:
+              section: |
+                You are in plan mode. Stay in plan mode until the user approves your plan through exit_plan_mode or switches the session mode.
+      - id: compaction
+        name: cordis:group
+        group: true
+        isolate:
+          compaction: true
+          toolResultPruner: true
+        config:
+          - id: compaction-basic
+            name: "@deepseek-ai/dsh-compaction-basic"
+          - id: command-compact
+            name: "@deepseek-ai/dsh-command-compact"
+          - id: tool-result-pruner
+            name: "@deepseek-ai/dsh-compaction-tool-result-pruner"
+            config:
+              thresholdChars: 2048
+              headChars: 1200
+              tailChars: 400
+      - id: delegation
+        name: cordis:group
+        group: true
+        disabled: true
+        isolate:
+          workflowEngine: true
+        config: []
+      - id: tool-ask-user
+        name: "@deepseek-ai/dsh-tool-ask-user"
+      - id: tool-todo
+        name: "@deepseek-ai/dsh-tool-todo"
+        config:
+          allowParallelInProgress: true
+      - id: tool-web
+        name: "@deepseek-ai/dsh-tool-web"
+        disabled: true
+        config:
+          fetch: true
+          searchTimeoutMs: 60000
+      - id: present
+        name: "@deepseek-ai/dsh-tool-present"
+        disabled: true
+      - id: tool-plugin-manager
+        name: "@deepseek-ai/dsh-plugin-manager/tools"
+        disabled: true
+      - id: tool-plugin-market
+        name: "@deepseek-ai/dsh-plugin-market/tools"
+        disabled: true
+- id: ui-theme
+  name: "@deepseek-ai/dsh-client-ui-theme"
+  config:
+    fontSize: 22
+    codeFontSize: 16
+    terminalFontSize: 20

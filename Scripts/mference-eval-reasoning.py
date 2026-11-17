@@ -12,12 +12,13 @@ import subprocess
 import sys
 import tempfile
 
-default_bin = "/Users/vladslugin/Documents/Mference/.build/out/Products/Release/MferenceCLI"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+default_bin = os.path.join(REPO_ROOT, ".build/out/Products/Release/MferenceCLI")
 if not os.path.exists(default_bin):
-    default_bin = "/Users/vladslugin/Documents/Mference/.build/arm64-apple-macosx/release/MferenceCLI"
+    default_bin = os.path.join(REPO_ROOT, ".build/arm64-apple-macosx/release/MferenceCLI")
 CLI_BIN = os.environ.get("CLI_BIN", default_bin)
-MODEL_DIR = os.environ.get("MODEL_DIR", "/Users/vladslugin/Documents/Mference/scratch/test_qwen36.gturbo")
-DEFAULT_OUT_FILE = "/Users/vladslugin/Documents/Mference/benchmarks/baseline-reasoning-accuracy.json"
+MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(REPO_ROOT, "scratch/test_qwen36.gturbo"))
+DEFAULT_OUT_FILE = os.path.join(REPO_ROOT, "benchmarks/baseline-reasoning-accuracy.json")
 
 PROBLEMS = [
     {

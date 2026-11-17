@@ -39,7 +39,7 @@ final class MoE {
     static let routedBlobSlots = 10
 
     /// Top-k widths the routed INT4 expert-compute path implements.
-    static let routedComputeWidths: Set<UInt32> = [6, 8, 10]
+    static let routedComputeWidths: Set<UInt32> = [4, 6, 8, 10]
 
     /// The widest expert count the router path accepts. Bounded by the one-SIMD
     /// selection kernels' lane arrays (`kRouterWideMaxPerLane` = 16 over 32
@@ -48,9 +48,8 @@ final class MoE {
     static let maxRouterExperts: UInt32 = 512
 
     /// Top-k widths the router selection kernels implement. 8 is Gemma 4 /
-    /// Qwen 3.6; 10 is Flash-Next. (DeepSeek V4's 6 goes through its own
-    /// sqrtsoftplus kernels in `MoEDeepseekV4`.)
-    static let routerTopKWidths: Set<UInt32> = [8, 10]
+    /// Qwen 3.6; 4/6 are MTP draft pruning widths; 10 is Flash-Next.
+    static let routerTopKWidths: Set<UInt32> = [4, 6, 8, 10]
 
     private let realDecodeD: UInt32
     private let realDecodeF: UInt32
@@ -59,6 +58,10 @@ final class MoE {
 
     private let routerGemvPSO: MTLComputePipelineState
     private let routerGemvSpecializedPSO: MTLComputePipelineState
+    private let routerSelectK4PSO: MTLComputePipelineState
+    private let routerSelectK4SpecializedPSO: MTLComputePipelineState
+    private let routerSelectK6PSO: MTLComputePipelineState
+    private let routerSelectK6SpecializedPSO: MTLComputePipelineState
     private let routerSelectK8PSO: MTLComputePipelineState
     private let routerSelectK8SpecializedPSO: MTLComputePipelineState
     private let routerSelectK10PSO: MTLComputePipelineState
@@ -138,6 +141,14 @@ final class MoE {
             maxTotalThreadsPerThreadgroup: 512)
         // One-SIMD parallel selection; bit-identical to the serial
         // `router_topk_select_k8` reference kernel (see RouterTopKParityTests).
+        self.routerSelectK4PSO = try context.pipeline("router_topk_select_k4_par")
+        self.routerSelectK4SpecializedPSO = try context.pipeline(
+            "router_topk_select_k4_par",
+            constants: routerConstants)
+        self.routerSelectK6PSO = try context.pipeline("router_topk_select_k6_par")
+        self.routerSelectK6SpecializedPSO = try context.pipeline(
+            "router_topk_select_k6_par",
+            constants: routerConstants)
         self.routerSelectK8PSO = try context.pipeline("router_topk_select_k8_par")
         self.routerSelectK8SpecializedPSO = try context.pipeline(
             "router_topk_select_k8_par",
@@ -246,6 +257,12 @@ final class MoE {
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             let selectPSO: MTLComputePipelineState
             switch topK {
+            case 4:
+                selectPSO = useSpecialized
+                    ? routerSelectK4SpecializedPSO : routerSelectK4PSO
+            case 6:
+                selectPSO = useSpecialized
+                    ? routerSelectK6SpecializedPSO : routerSelectK6PSO
             case 10:
                 selectPSO = useSpecialized
                     ? routerSelectK10SpecializedPSO : routerSelectK10PSO
@@ -612,7 +629,7 @@ final class MoE {
                                  d: UInt32,
                                  f: UInt32,
                                  topK: UInt32) {
-        precondition(topK == UInt32(Self.maxStreamedExperts))
+        precondition(Self.routedComputeWidths.contains(topK))
         var offsets = routedOffsets
         var dimension = d
         var intermediate = f
@@ -640,21 +657,40 @@ final class MoE {
 
         encoder.memoryBarrier(scope: .buffers)
 
-        encoder.setComputePipelineState(
-            specialized ? phase2SlotmapSpecializedPSO : phase2SlotmapPSO)
-        encoder.setBuffer(slab, offset: slabOffset, index: 0)
-        encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 1)
-        encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
-        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
-        encoder.setBuffer(acts, offset: actsOffset, index: 4)
-        encoder.setBuffer(routingWeights, offset: routingWeightsOffset, index: 5)
-        encoder.setBuffer(residual, offset: residualOffset, index: 6)
-        encoder.setBuffer(y, offset: yOffset, index: 7)
-        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
-        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 9)
-        encoder.dispatchThreadgroups(
-            MTLSize(width: Int(d), height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        if topK == 8 {
+            encoder.setComputePipelineState(
+                specialized ? phase2SlotmapSpecializedPSO : phase2SlotmapPSO)
+            encoder.setBuffer(slab, offset: slabOffset, index: 0)
+            encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 1)
+            encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
+            encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+            encoder.setBuffer(acts, offset: actsOffset, index: 4)
+            encoder.setBuffer(routingWeights, offset: routingWeightsOffset, index: 5)
+            encoder.setBuffer(residual, offset: residualOffset, index: 6)
+            encoder.setBuffer(y, offset: yOffset, index: 7)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
+            encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 9)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: Int(d), height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        } else {
+            encoder.setComputePipelineState(
+                specialized ? phase2SlotmapWideSpecializedPSO : phase2SlotmapWidePSO)
+            encoder.setBuffer(slab, offset: slabOffset, index: 0)
+            encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 1)
+            encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
+            encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+            encoder.setBuffer(acts, offset: actsOffset, index: 4)
+            encoder.setBuffer(routingWeights, offset: routingWeightsOffset, index: 5)
+            encoder.setBuffer(residual, offset: residualOffset, index: 6)
+            encoder.setBuffer(y, offset: yOffset, index: 7)
+            encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 8)
+            encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 9)
+            encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 10)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: Int(d), height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: Int(topK) * 32, height: 1, depth: 1))
+        }
 
         encoder.memoryBarrier(scope: .buffers)
 

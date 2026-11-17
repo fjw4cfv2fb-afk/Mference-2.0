@@ -369,6 +369,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         get { speculator }
         set { speculator = newValue }
     }
+    /// Per-instance draft count override for tests (supersedes MFERENCE_SPEC_K).
+    public var specDraftCountOverride: Int? = nil
+    /// Per-instance adaptive draft depth toggle (supersedes MFERENCE_SPEC_ADAPTIVE).
+    public var specAdaptiveDraftOverride: Bool? = nil
+    /// Optional dynamic cap on adaptive draft depth `K` (e.g. under memory pressure or long context).
+    public var specMaxDraftSlotCapOverride: Int? = nil
+
+    public func notifyMTPPhaseTransition(structuredCodeOrTool: Bool) {
+        guard let qwen36Spec = speculator as? Qwen36MTPSpeculator else { return }
+        qwen36Spec.notifyPhaseTransition(structuredCodeOrTool ? .structuredCodeOrTool : .visibleProse)
+    }
+    /// Base trunk KV position and valid GDN rollback slot count held in `verifyStateArena`.
+    private var verifyArenaRoundBase: Int = -1
+    private var verifyArenaCaptured: Int = 0
     struct LayerPrefillQKVViews {
         let inputNorm: TensorView
         let postAttention: TensorView
@@ -426,6 +440,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private static let rdadviseAdaptiveSlowCallNanos: UInt64 = 1_000_000
     private static let prefillRoutedTileSchedulerConfig = PrefillRoutedTileSchedulerConfig(maxPendingDepth: 1, tileExperts: 16)
     private static let decodeRoutedTileSchedulerConfig = PrefillRoutedTileSchedulerConfig()
+    private static let prefillTailWarmEnabled = ProcessInfo.processInfo.environment["MFERENCE_PREFILL_TAIL_WARM"] != "0"
 
     /// Per-layer `router.scale * D^-0.5` pre-folded into one BF16 buffer
     /// allocation per layer. ~168 KB total at 30 layers × 2816 BF16 — bounded
@@ -1093,35 +1108,53 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         if model.config.family == .qwen36 {
-            let specEnv = ProcessInfo.processInfo.environment["MFERENCE_SPEC"]?.lowercased()
-            let mtpEnv = ProcessInfo.processInfo.environment["MFERENCE_MTP"]?.lowercased()
-            let pldEnv = ProcessInfo.processInfo.environment["MFERENCE_PLD"]?.lowercased()
-
-            if specEnv == "off" {
-                self.speculator = nil
-            } else if specEnv == "mtp" || mtpEnv == "1" {
-                do {
-                    self.speculator = try Qwen36MTPSpeculator.probe(model: model,
-                                                                    context: ctx,
-                                                                    config: cfg,
-                                                                    maxContext: maxContext)
-                    if self.speculator != nil && ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
-                        print("[mtp probe]: Qwen 3.6 MTP speculator probed and armed successfully!")
-                    }
-                } catch {
-                    print("[mtp probe error]: \(error)")
-                }
-                if self.speculator == nil {
-                    self.speculator = PromptLookupSpeculator(maxContext: maxContext)
-                }
-            } else {
-                // Default to Prompt-Lookup Speculator (PLD / Markov)
-                self.speculator = PromptLookupSpeculator(maxContext: maxContext)
-                if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
-                    print("[spec probe]: Prompt-Lookup Speculator (PLD/N-gram) enabled by default (maxContext=\(maxContext))")
-                }
+            do {
+                self.speculator = try Self.probeQwen36Speculator(
+                    model: model,
+                    context: ctx,
+                    config: cfg,
+                    maxContext: maxContext)
+            } catch {
+                print("[mtp probe error]: \(error)")
             }
         }
+    }
+
+    static func probeQwen36Speculator(
+        model: Model,
+        context: MetalContext,
+        config: ArchConfig,
+        maxContext: Int,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> (any SpeculativeDrafter)? {
+        let specEnv = environment["MFERENCE_SPEC"]?.lowercased()
+        let mtpEnv = environment["MFERENCE_MTP"]?.lowercased()
+        let pldEnv = environment["MFERENCE_PLD"]?.lowercased()
+        let logPhases = environment["MFERENCE_PHASES"] == "1"
+
+        if specEnv == "off" {
+            return nil
+        }
+        if specEnv == "pld" || (specEnv == nil && pldEnv == "1" && mtpEnv != "1") {
+            let pld = PromptLookupSpeculator(maxContext: maxContext)
+            if logPhases {
+                print("[spec probe]: Prompt-Lookup Speculator (PLD) enabled explicitly (maxContext=\(maxContext))")
+            }
+            return pld
+        }
+        guard mtpEnv != "0" else {
+            return nil
+        }
+        let mtp = try Qwen36MTPSpeculator.probe(model: model,
+                                               context: context,
+                                               config: config,
+                                               maxContext: maxContext)
+        if mtp != nil && logPhases {
+            print("[mtp probe]: Qwen 3.6 MTP speculator probed and armed successfully!")
+        } else if mtp == nil && (specEnv == "mtp" || mtpEnv == "1") && logPhases {
+            print("[mtp probe]: Qwen 3.6 MTP requested, but checkpoint carries no MTP sidecar.")
+        }
+        return mtp
     }
 
     public func reset() {
@@ -1130,6 +1163,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         gdnState?.reset()
         gdnSnapshots.removeAll()
         pinnedGDNCheckpointPosition = nil
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
         dsv4State?.reset()
         // Short-conv history dies with the KV cache, and ONLY with it:
         // `prepareForContinuation` retains both, so a resumed conversation
@@ -1141,6 +1176,146 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             memset(state.mlp.contents(), 0, state.mlp.length)
         }
         resetTransientState()
+    }
+
+    public struct PrefixSnapshot: @unchecked Sendable {
+        public let position: Int
+        fileprivate let kLayers: [Data?]
+        fileprivate let vLayers: [Data?]
+        fileprivate let gdnSnapshot: GDNStateManager.Snapshot?
+        fileprivate let gdnSnapshots: [Int: GDNStateManager.Snapshot]
+        fileprivate let pinnedGDNCheckpointPosition: Int?
+        fileprivate let historyBasePosition: Int
+        fileprivate let tokenHistory: [Int32]
+
+        public func rewindablePosition(atOrBefore maxPosition: Int) -> Int? {
+            guard gdnSnapshot != nil else { return min(maxPosition, position) }
+            if maxPosition >= position {
+                return position
+            }
+            return gdnSnapshots.keys.filter { $0 <= maxPosition }.max()
+        }
+    }
+
+    /// Captures linear KV and GDN recurrent state for multi-slot prompt caching
+    /// when a live session switches to another cached conversation. Returns nil
+    /// for ring-wrapped SWA or paged/DSV4/Inkling layouts.
+    public func capturePrefixSnapshot() -> PrefixSnapshot? {
+        guard (try? prefillChunkState.requireClean(operation: "capturePrefixSnapshot")) != nil,
+              dsv4State == nil,
+              inklingConvStates.isEmpty,
+              let kv,
+              kv.position > 0 else {
+            return nil
+        }
+        let pos = kv.position
+        var kLayers = [Data?]()
+        var vLayers = [Data?]()
+        kLayers.reserveCapacity(cfg.numLayers)
+        vLayers.reserveCapacity(cfg.numLayers)
+        for layer in 0..<cfg.numLayers {
+            let kView = kv.keyView(layer: layer, validTokenCount: pos)
+            let vView = kv.valueView(layer: layer, validTokenCount: pos)
+            if kView.stride == 0 {
+                guard gdnState?.isLinear(layer: layer) == true else {
+                    return nil
+                }
+                kLayers.append(nil)
+                vLayers.append(nil)
+                continue
+            }
+            let bytesNeeded = pos * kView.stride
+            guard kView.startSlot == 0,
+                  vView.startSlot == 0,
+                  kView.offset == 0,
+                  vView.offset == 0,
+                  bytesNeeded <= kView.buffer.length,
+                  bytesNeeded <= vView.buffer.length else {
+                return nil
+            }
+            kLayers.append(Data(bytes: kView.buffer.contents(), count: bytesNeeded))
+            vLayers.append(Data(bytes: vView.buffer.contents(), count: bytesNeeded))
+        }
+        let gdnSnap = gdnState?.makeSnapshot()
+        var minimalGDNSnapshots: [Int: GDNStateManager.Snapshot] = [:]
+        if let pinnedPos = pinnedGDNCheckpointPosition,
+           pinnedPos <= pos,
+           let pinnedSnap = gdnSnapshots[pinnedPos] {
+            minimalGDNSnapshots[pinnedPos] = pinnedSnap
+        }
+        let history = (speculator as? Qwen36MTPSpeculator)?.capturedTokenHistory ?? (basePosition: 0, tokens: [])
+        return PrefixSnapshot(
+            position: pos,
+            kLayers: kLayers,
+            vLayers: vLayers,
+            gdnSnapshot: gdnSnap,
+            gdnSnapshots: minimalGDNSnapshots,
+            pinnedGDNCheckpointPosition: pinnedGDNCheckpointPosition,
+            historyBasePosition: history.basePosition,
+            tokenHistory: history.tokens)
+    }
+
+    @discardableResult
+    public func restorePrefixSnapshot(_ snapshot: PrefixSnapshot) -> Bool {
+        guard (try? prefillChunkState.requireClean(operation: "restorePrefixSnapshot")) != nil,
+              dsv4State == nil,
+              inklingConvStates.isEmpty,
+              let kv,
+              snapshot.position > 0,
+              snapshot.position <= maxContext,
+              snapshot.kLayers.count == cfg.numLayers,
+              snapshot.vLayers.count == cfg.numLayers else {
+            return false
+        }
+        for layer in 0..<cfg.numLayers {
+            let kView = kv.keyView(layer: layer, validTokenCount: snapshot.position)
+            let vView = kv.valueView(layer: layer, validTokenCount: snapshot.position)
+            if kView.stride == 0 {
+                guard snapshot.kLayers[layer] == nil,
+                      snapshot.vLayers[layer] == nil,
+                      gdnState?.isLinear(layer: layer) == true else {
+                    return false
+                }
+                continue
+            }
+            guard let kData = snapshot.kLayers[layer],
+                  let vData = snapshot.vLayers[layer],
+                  kView.startSlot == 0,
+                  vView.startSlot == 0,
+                  kView.offset == 0,
+                  vView.offset == 0,
+                  kData.count == snapshot.position * kView.stride,
+                  vData.count == snapshot.position * vView.stride,
+                  kData.count <= kView.buffer.length,
+                  vData.count <= vView.buffer.length else {
+                return false
+            }
+        }
+        if let gdnState {
+            guard let gdnSnap = snapshot.gdnSnapshot else { return false }
+            gdnState.restore(gdnSnap)
+        }
+        kv.reset()
+        for layer in 0..<cfg.numLayers {
+            guard let kData = snapshot.kLayers[layer],
+                  let vData = snapshot.vLayers[layer] else { continue }
+            let kView = kv.keyView(layer: layer, validTokenCount: 0)
+            let vView = kv.valueView(layer: layer, validTokenCount: 0)
+            kData.copyBytes(to: kView.buffer.contents().assumingMemoryBound(to: UInt8.self), count: kData.count)
+            vData.copyBytes(to: vView.buffer.contents().assumingMemoryBound(to: UInt8.self), count: vData.count)
+        }
+        kv.advance(by: snapshot.position)
+        gdnSnapshots = snapshot.gdnSnapshots
+        pinnedGDNCheckpointPosition = snapshot.pinnedGDNCheckpointPosition
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
+        if let mtp = speculator as? Qwen36MTPSpeculator {
+            mtp.restoreTokenHistory(basePosition: snapshot.historyBasePosition, tokens: snapshot.tokenHistory)
+        } else {
+            speculator?.reset()
+        }
+        resetTransientState()
+        return true
     }
 
     public var continuationPosition: Int {
@@ -1156,7 +1331,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if let kvPos = kv?.position, maxPosition >= kvPos {
             return kvPos
         }
-        return gdnSnapshots.keys.filter { $0 <= maxPosition }.max()
+        var best = gdnSnapshots.keys.filter { $0 <= maxPosition }.max()
+        if verifyArenaRoundBase >= 0, verifyArenaCaptured > 0 {
+            let lo = verifyArenaRoundBase + 1
+            let hi = min(maxPosition, verifyArenaRoundBase + verifyArenaCaptured)
+            if lo <= hi {
+                best = max(best ?? hi, hi)
+            }
+        }
+        return best
     }
 
     public func recordContinuationCheckpoint() {
@@ -1193,17 +1376,25 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         if kv.position > expectedPosition {
             if let gdnState {
-                guard let snapshot = gdnSnapshots[expectedPosition] else {
-                    throw PrefillError.prefillCursorMismatch(
-                        "continuation rewind to \(expectedPosition) missing GDN state snapshot")
+                if let snapshot = gdnSnapshots[expectedPosition] {
+                    gdnState.restore(snapshot)
+                } else {
+                    let slot = expectedPosition - 1 - verifyArenaRoundBase
+                    if verifyArenaRoundBase >= 0, slot >= 0, slot < verifyArenaCaptured {
+                        try restoreGDNFromVerifyArena(slot: slot)
+                    } else {
+                        throw PrefillError.prefillCursorMismatch(
+                            "continuation rewind to \(expectedPosition) missing GDN state snapshot")
+                    }
                 }
-                gdnState.restore(snapshot)
             }
             kv.rewind(to: expectedPosition)
             for key in gdnSnapshots.keys where key > expectedPosition && key != pinnedGDNCheckpointPosition {
                 gdnSnapshots.removeValue(forKey: key)
             }
         }
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
         resetTransientState()
     }
 
@@ -1627,7 +1818,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
     }
 
-    private func restoreGDNFromVerifyArena(slot: Int) throws {
+    private func restoreGDNFromVerifyArena(slot: Int, wait: Bool = true) throws {
         guard let gdnState, let verifyStateArena, let verifyTailArena else { return }
         guard let cb = ctx.queue.makeCommandBuffer() else {
             throw ModelError.residentBufferWrapFailed
@@ -1665,14 +1856,19 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             blit.endEncoding()
         }
         cb.commit()
-        waitForCompletion(cb)
+        if wait {
+            waitForCompletion(cb)
+        }
     }
 
     private func runVerifyRound(token: Int32, position: Int, draftCount: Int = 1) async throws {
         guard let speculator, useFusedGreedyHead else { return }
+        let boundedCount = min(4, max(1, draftCount))
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
 
         // 1. Draft K candidate tokens from speculator
-        let drafts = try speculator.draft(bonus: token, position: position, count: draftCount)
+        let drafts = try speculator.draft(bonus: token, position: position, count: boundedCount)
         guard !drafts.isEmpty else {
             try await produceToken(token: token, position: position, into: greedyTokenBuf,
                                    emitHead: true, outputMode: .greedyIfAvailable)
@@ -1696,6 +1892,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             isVerifyPass: true)
         let verifyNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - verifyStart
 
+        verifyArenaRoundBase = position
+        verifyArenaCaptured = min(verifyTokens.count - 1, 4)
+
         var accepted = 0
         while accepted < drafts.count, accepted < targets.count - 1,
               targets[accepted] == UInt32(bitPattern: drafts[accepted]) {
@@ -1707,27 +1906,38 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             print("[verify timing]: tokens=\(verifyTokens.count) verify=\(String(format: "%.2f", Double(verifyNanos)/1e6))ms accepted=\(accepted) drafts=\(drafts) targets=\(targets)")
         }
 
+        let mtp = speculator as? Qwen36MTPSpeculator
+
         // 5. Rollback if any draft rejected
         if accepted < drafts.count {
             kv?.rewind(to: position + accepted + 1)
-            try restoreGDNFromVerifyArena(slot: accepted)
+            try restoreGDNFromVerifyArena(slot: accepted, wait: mtp == nil)
+            verifyArenaCaptured = min(accepted + 1, 4)
         }
 
-        // 6. Synchronize last accepted token's hidden state into MTP speculator if applicable
-        if let mtp = speculator as? Qwen36MTPSpeculator {
-            let D = UInt32(cfg.hiddenSize)
-            let eps: Float = 1e-6
-            if let normCB = ctx.queue.makeCommandBuffer() {
-                self.rms.encodeBF16W(commandBuffer: normCB,
-                                     x: scratch.hidden,
-                                     xOffset: accepted * Int(D) * MemoryLayout<Float16>.stride,
-                                     weight: model.finalNorm.buffer,
-                                     weightOffset: Int(model.finalNorm.offset),
-                                     out: mtp.lastHiddenBuf,
-                                     d: D, eps: eps)
+        // 6. Synchronize accepted target hidden states + KV into MTP speculator.
+        if let mtp {
+            let wroteVerifyNormed = ProcessInfo.processInfo.environment["MFERENCE_USE_MULTIX"] != "0"
+                && verifyTokens.count <= LMHeadGreedyMultiX.maxTokens
+            if !wroteVerifyNormed {
+                guard let normCB = ctx.queue.makeCommandBuffer() else {
+                    throw ModelError.residentBufferWrapFailed
+                }
+                prefillRMS.encodeBF16W(commandBuffer: normCB,
+                                       x: scratch.hidden,
+                                       weight: model.finalNorm.buffer,
+                                       weightOffset: Int(model.finalNorm.offset),
+                                       out: verifyNormedHidden,
+                                       t: UInt32(accepted + 1),
+                                       d: UInt32(cfg.hiddenSize),
+                                       eps: 1e-6)
                 normCB.commit()
-                waitForCompletion(normCB)
             }
+            try mtp.commitAcceptPass(bonus: token,
+                                     emitted: emitted,
+                                     position: position,
+                                     targetNormedHidden: verifyNormedHidden,
+                                     acceptedCount: accepted)
         }
 
         // 7. Update stats and queue pending tokens
@@ -1744,8 +1954,37 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 return
             }
             if speculator.canRunRound(position: position) {
-                let draftK = ProcessInfo.processInfo.environment["MFERENCE_SPEC_K"].flatMap(Int.init)
-                    ?? ProcessInfo.processInfo.environment["MFERENCE_MTP_K"].flatMap(Int.init) ?? 2
+                let draftK: Int
+                if let explicitOverride = specDraftCountOverride {
+                    draftK = min(4, max(1, explicitOverride))
+                } else if let qwen36Spec = speculator as? Qwen36MTPSpeculator {
+                    if let adaptiveOverride = specAdaptiveDraftOverride {
+                        qwen36Spec.adaptiveDraftEnabled = adaptiveOverride
+                    }
+                    if qwen36Spec.adaptiveDraftEnabled {
+                        var slotCap: Int
+                        if cfg.topKExperts > 0, let slots = model.routedExpertCacheSlotCount(layer: 0) {
+                            let rawCap = max(1, (slots / cfg.topKExperts) - 1)
+                            // Cap adaptive draft depth at K = 2 unless expertCacheSlots >= 48 so
+                            // 4-token MoE verify does not amplify expert-cache streaming latency.
+                            slotCap = slots >= 48 ? min(3, rawCap) : min(2, rawCap)
+                        } else {
+                            slotCap = 2
+                        }
+                        if let dynamicCap = specMaxDraftSlotCapOverride {
+                            slotCap = max(1, min(slotCap, dynamicCap))
+                        }
+                        draftK = qwen36Spec.recommendedDraftCount(maxSlotSupportedK: slotCap)
+                    } else {
+                        let rawK = ProcessInfo.processInfo.environment["MFERENCE_SPEC_K"].flatMap(Int.init)
+                            ?? ProcessInfo.processInfo.environment["MFERENCE_MTP_K"].flatMap(Int.init) ?? 2
+                        draftK = min(4, max(1, rawK))
+                    }
+                } else {
+                    let rawK = ProcessInfo.processInfo.environment["MFERENCE_SPEC_K"].flatMap(Int.init)
+                        ?? ProcessInfo.processInfo.environment["MFERENCE_MTP_K"].flatMap(Int.init) ?? 2
+                    draftK = min(4, max(1, rawK))
+                }
                 do {
                     try await runVerifyRound(token: token, position: position, draftCount: draftK)
                     return
@@ -1755,6 +1994,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     }
                 }
             }
+        }
+        if let kvPos = kv?.position, kvPos > position {
+            try prepareForContinuation(expectedPosition: position)
         }
         try await produceToken(token: token,
                                position: position,
@@ -2764,6 +3006,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
             var verifySlotMapArmed = false
             var verifySlotMapBinding: (slab: MTLBuffer, table: MTLBuffer, slotStride: Int)?
+            var routerSignal: UInt64? = nil
+            // Slot-map verify executes all `t` tokens in parallel inside a single
+            // cache fill, which requires holding up to `t * topKExperts` unique
+            // experts simultaneously; smaller caches use the tiled MoE path below.
             if isVerifyPass,
                t <= LMHeadGreedyMultiX.maxTokens,
                slotMapEnabled,
@@ -2771,6 +3017,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                !cfg.ffnSandwichNorms,
                model.config.family == .qwen36,
                cfg.topKExperts == MoE.maxStreamedExperts,
+               (model.routedExpertCacheSlotCount(layer: L) ?? Int.max) >= t * cfg.topKExperts,
                let binding = try? model.routedSlotMapBinding(layer: L) {
                 verifySlotMapArmed = true
                 verifySlotMapBinding = binding
@@ -2787,12 +3034,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          numExperts: UInt32(cfg.numExperts),
                                          topK: UInt32(cfg.topKExperts),
                                          queryCount: UInt32(t))
+                // Signal the router event right after slot lookup so the CPU can wake,
+                // check hit/miss, plan slots and pread missing experts while the GPU
+                // executes the shared expert MLP in parallel.
+                routerSignal = encodeRouterSignal(cb)
             }
-
-            // Signal the router event right after slot lookup so the CPU can wake,
-            // check hit/miss, plan slots and pread missing experts while the GPU
-            // executes the shared expert MLP in parallel.
-            let routerSignal = encodeRouterSignal(cb)
 
             let sharedProj = sharedExpertProjections[L]
             var sharedCB: MTLCommandBuffer?
@@ -2900,7 +3146,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
 
                 guard let binding = verifySlotMapBinding else { continue }
-                waitForCompletion(cb)
 
                 let tPlanStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 // Gather ALL unique routed experts required across all tokens in this verify step
@@ -3085,15 +3330,37 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         routeIDs.append(min(idPtr[i], UInt32(cfg.numExperts - 1)))
                         routeWeights.append(weightPtr[i])
                     }
-                    var promptLayerExperts = [Int]()
-                    promptLayerExperts.reserveCapacity(routeCount)
-                    for i in 0..<routeCount {
-                        let e = min(Int(idPtr[i]), cfg.numExperts - 1)
-                        if !promptLayerExperts.contains(e) {
-                            promptLayerExperts.append(e)
+                    var lastTokenExperts = [Int]()
+                    var nearTailExperts = [Int]()
+                    let tailWarmActive = writeFinalHead && !isVerifyPass && Self.prefillTailWarmEnabled
+                    if tailWarmActive {
+                        lastTokenExperts.reserveCapacity(cfg.topKExperts)
+                        nearTailExperts.reserveCapacity(min(t, 3) * cfg.topKExperts)
+                        let tailStartRow = max(0, t - 3)
+                        for row in stride(from: t - 1, through: tailStartRow, by: -1) {
+                            let rowBase = row * cfg.topKExperts
+                            for k in 0..<cfg.topKExperts {
+                                let e = min(Int(idPtr[rowBase + k]), cfg.numExperts - 1)
+                                if row == t - 1 && !lastTokenExperts.contains(e) {
+                                    lastTokenExperts.append(e)
+                                }
+                                if !nearTailExperts.contains(e) {
+                                    nearTailExperts.append(e)
+                                }
+                            }
                         }
+                        recordRoutedExperts(lastTokenExperts, layer: L)
+                    } else {
+                        var promptLayerExperts = [Int]()
+                        promptLayerExperts.reserveCapacity(routeCount)
+                        for i in 0..<routeCount {
+                            let e = min(Int(idPtr[i]), cfg.numExperts - 1)
+                            if !promptLayerExperts.contains(e) {
+                                promptLayerExperts.append(e)
+                            }
+                        }
+                        recordRoutedExperts(promptLayerExperts, layer: L)
                     }
-                    recordRoutedExperts(promptLayerExperts, layer: L)
                     let pairs = PrefillRouter.makeTokenExpertPairs(indices: routeIDs,
                                                                    weights: routeWeights,
                                                                    queryCount: t,
@@ -3112,13 +3379,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         schedulerConfig = requestedScheduler
                         routeTileExpertCount = schedulerConfig.tileExperts
                     }
+                    var sortKeys = model.routedExpertPhysicalOffsets(layer: L)
+                    if tailWarmActive && t > 1 && model.routedExpertCacheSlotCount(layer: L) != nil {
+                        for e in nearTailExperts where e < sortKeys.count {
+                            sortKeys[e] |= (1 << 61)
+                        }
+                        for e in lastTokenExperts where e < sortKeys.count {
+                            sortKeys[e] |= (1 << 62)
+                        }
+                    }
                     let routes = try PrefillMoEGrouping.groupTokenExpertPairs(
                         pairs,
                         queryCount: t,
                         topK: cfg.topKExperts,
                         numExperts: cfg.numExperts,
                         tileExpertCount: routeTileExpertCount,
-                        expertSortKeys: model.routedExpertPhysicalOffsets(layer: L))
+                        expertSortKeys: sortKeys)
 
                     let metadata = try prefillGroupedMoE.makeStreamedMetadataBuffers(
                         device: ctx.device,
@@ -3263,6 +3539,11 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     while !pendingTiles.isEmpty {
                         try drainOldestPendingTile()
                     }
+                    if tailWarmActive,
+                       !nearTailExperts.isEmpty,
+                       let streamer = try? model.routedExpertStreamer(layer: L) {
+                        streamer.noteAllHitUse(experts: nearTailExperts)
+                    }
                     guard let tailCB = ctx.queue.makeCommandBuffer() else {
                         throw ModelError.residentBufferWrapFailed
                     }
@@ -3393,23 +3674,49 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 guard let finalCB = ctx.queue.makeCommandBuffer() else {
                     throw ModelError.residentBufferWrapFailed
                 }
+                let mtpNoVerify = !isVerifyPass ? (speculator as? Qwen36MTPSpeculator) : nil
+                if let mtp = mtpNoVerify {
+                    self.rms.encodeBF16W(commandBuffer: finalCB,
+                                         x: scratch.hidden,
+                                         xOffset: (t - 1) * D * MemoryLayout<Float16>.stride,
+                                         weight: finalNorm.buffer,
+                                         weightOffset: Int(finalNorm.offset),
+                                         out: mtp.lastHiddenBuf,
+                                         d: UInt32(D), eps: eps)
+                }
                 if outputMode == .greedyIfAvailable, useFusedGreedyHead {
-                    fusionHead.encodeGreedyDecode(
-                        commandBuffer: finalCB,
-                        hidden: scratch.hidden,
-                        hiddenOffset: (t - 1) * D * MemoryLayout<Float16>.stride,
-                        normWeight: finalNorm.buffer,
-                        normOffset: Int(finalNorm.offset),
-                        weights: lm.buffer,
-                        weightsOffset: Int(lm.offset),
-                        scales: lm.buffer,
-                        scalesOffset: Int(lm.scaleOffset),
-                        biases: lm.buffer,
-                        biasesOffset: Int(lm.biasOffset),
-                        outToken: greedyTokenBuf,
-                        d: UInt32(D),
-                        vocab: UInt32(cfg.vocabSize),
-                        rmsEps: eps)
+                    if let mtp = mtpNoVerify {
+                        fusionHead.encodeGreedyFromNormed(
+                            commandBuffer: finalCB,
+                            normedHidden: mtp.lastHiddenBuf,
+                            normedOffset: 0,
+                            weights: lm.buffer,
+                            weightsOffset: Int(lm.offset),
+                            scales: lm.buffer,
+                            scalesOffset: Int(lm.scaleOffset),
+                            biases: lm.buffer,
+                            biasesOffset: Int(lm.biasOffset),
+                            outToken: greedyTokenBuf,
+                            d: UInt32(D),
+                            vocab: UInt32(cfg.vocabSize))
+                    } else {
+                        fusionHead.encodeGreedyDecode(
+                            commandBuffer: finalCB,
+                            hidden: scratch.hidden,
+                            hiddenOffset: (t - 1) * D * MemoryLayout<Float16>.stride,
+                            normWeight: finalNorm.buffer,
+                            normOffset: Int(finalNorm.offset),
+                            weights: lm.buffer,
+                            weightsOffset: Int(lm.offset),
+                            scales: lm.buffer,
+                            scalesOffset: Int(lm.scaleOffset),
+                            biases: lm.buffer,
+                            biasesOffset: Int(lm.biasOffset),
+                            outToken: greedyTokenBuf,
+                            d: UInt32(D),
+                            vocab: UInt32(cfg.vocabSize),
+                            rmsEps: eps)
+                    }
                 } else {
                     prefillFinalRowHead.encodeLogits(commandBuffer: finalCB,
                                                      hiddenBlock: scratch.hidden,
@@ -3437,21 +3744,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
                 }
             }
-            if let mtp = speculator as? Qwen36MTPSpeculator, !isVerifyPass {
-                if let normCB = ctx.queue.makeCommandBuffer() {
-                    self.rms.encodeBF16W(commandBuffer: normCB,
-                                         x: scratch.hidden,
-                                         xOffset: (t - 1) * D * MemoryLayout<Float16>.stride,
-                                         weight: finalNorm.buffer,
-                                         weightOffset: Int(finalNorm.offset),
-                                         out: mtp.lastHiddenBuf,
-                                         d: UInt32(D), eps: eps)
-                    normCB.commit()
-                    waitForCompletion(normCB)
-                }
-            }
         }
 
+        if !isVerifyPass {
+            verifyArenaRoundBase = -1
+            verifyArenaCaptured = 0
+        }
         kv?.advance(by: tokens.count)
         let chunkEndPosition = startPosition + tokens.count
         if let pRows = interiorCheckpointRows {
@@ -3501,6 +3799,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             return
         }
         let D    = UInt32(cfg.hiddenSize)
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
         let FmoE = UInt32(cfg.moeIntermediateSize)
         let eps: Float = 1e-6
         let embedOutScale = cfg.embeddingScaledBySqrtHidden

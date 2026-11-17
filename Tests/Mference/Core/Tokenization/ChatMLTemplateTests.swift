@@ -64,8 +64,27 @@ struct ChatMLTemplateTests {
         ])
         #expect(prompt == "<|im_start|>user\nHi<|im_end|>\n"
             + "<|im_start|>assistant\n<think>\n")
-        // A family-neutral load of the same fixture keeps Qwen 3.6 behavior.
+        // A family-neutral load of the same fixture keeps non-thinking fixture behavior.
         #expect(!tok.generationPromptStartsInThinking)
+    }
+
+    @Test("qwen36 family opens thinking by default for chat and tool templates")
+    func qwen36StartsInThinking() async throws {
+        let tokenizer = try await MFTokenizer.load(from: Self.fixtureFolder(),
+                                                   family: .qwen36)
+        #expect(tokenizer.dialect == .chatml)
+        #expect(tokenizer.generationPromptStartsInThinking)
+        #expect(tokenizer.eosID == tokenizer.endOfTurnID)
+        let chatPrompt = try tokenizer.applyChatTemplate([
+            Message(role: .user, content: "Hi"),
+        ])
+        #expect(chatPrompt == "<|im_start|>user\nHi<|im_end|>\n"
+            + "<|im_start|>assistant\n<think>\n")
+        let toolIDs = try tokenizer.encodeToolChat(
+            messages: [Message(role: .user, content: "Weather?")],
+            tools: [])
+        let toolPrompt = tokenizer.decode(toolIDs, skipSpecialTokens: false)
+        #expect(toolPrompt.hasSuffix("<|im_start|>assistant\n<think>\n"))
     }
 
     @Test("Encode never prepends a BOS")

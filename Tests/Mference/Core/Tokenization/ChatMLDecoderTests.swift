@@ -162,4 +162,52 @@ struct ChatMLDecoderTests {
             _ = try d.finish()
         }
     }
+
+    @Test("Consecutive duplicate tool calls are deduplicated and truncated complete calls recover at finish")
+    func deduplicatesConsecutiveToolCallsAndRecoversTruncatedCloseTag() throws {
+        let d = decoder()
+        let callText = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+        let events1 = try feed(callText, into: d)
+        let events2 = try feed(callText, into: d)
+        #expect(events1.count == 1)
+        #expect(events2.isEmpty)
+
+        // Now feed a different city without the final `</tool_call>` token and verify `finish()` recovers it.
+        _ = try feed("<tool_call>\n<function=get_weather>\n<parameter=city>\nTokyo\n</parameter>\n</function>\n", into: d)
+        let recovered = try d.finish()
+        #expect(recovered == [.toolCall(ParsedToolCall(
+            id: "call_fixed",
+            name: "get_weather",
+            arguments: .object(["city": .string("Tokyo")]),
+            argumentsJSON: #"{"city":"Tokyo"}"#))])
+    }
+
+    @Test("Thinking budget flags shouldExitThinking until thinkEndID arrives")
+    func thinkingBudgetFlagsExit() throws {
+        let d = StructuredAssistantDecoder(tokenizer: tok, allowedTools: ["get_weather"], startsInThought: true)
+        d.maxThinkingTokens = 3
+        _ = try feed("one two three four", into: d)
+        #expect(d.shouldExitThinking)
+        _ = try feed("</think>Answer", into: d)
+        #expect(!d.shouldExitThinking)
+    }
+
+    @Test("Clause-aware soft landing triggers between 85% and 100% on sentence or line boundary")
+    func clauseAwareSoftLandingTriggersOnBoundary() throws {
+        #expect(StructuredAssistantDecoder.isThinkingBoundaryDelta("done.\n"))
+        #expect(StructuredAssistantDecoder.isThinkingBoundaryDelta("complete."))
+        #expect(!StructuredAssistantDecoder.isThinkingBoundaryDelta("1."))
+        #expect(!StructuredAssistantDecoder.isThinkingBoundaryDelta("mid-clause"))
+
+        let d = StructuredAssistantDecoder(tokenizer: tok, allowedTools: ["get_weather"], startsInThought: true)
+        d.maxThinkingTokens = 10
+        // At 9 tokens (90% >= 85% soft threshold = 8), a mid-clause token does NOT trigger exit yet,
+        // whereas a sentence-ending token `.` or `\n` triggers soft landing immediately before 10.
+        for i in 1...8 {
+            _ = try d.consume(tokenID: Int32(10 + i), delta: "word ")
+        }
+        #expect(!d.shouldExitThinking)
+        _ = try d.consume(tokenID: 19, delta: "done.")
+        #expect(d.shouldExitThinking)
+    }
 }

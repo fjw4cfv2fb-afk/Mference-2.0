@@ -43,8 +43,9 @@ def dequant_int4_affine_row(packed_bytes: bytes, scale_words: list, bias_words: 
     return out_bf16
 
 def main():
-    model_dir = sys.argv[1] if len(sys.argv) > 1 else "/Users/vladslugin/Documents/Mference/scratch/qwen36.gturbo"
-    out_shard = sys.argv[2] if len(sys.argv) > 2 else "/Users/vladslugin/Documents/Mference/scratch/qwen36_layer39_harvested_mtp.safetensors"
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    model_dir = sys.argv[1] if len(sys.argv) > 1 else os.path.join(repo_root, "scratch/qwen36.gturbo")
+    out_shard = sys.argv[2] if len(sys.argv) > 2 else os.path.join(repo_root, "scratch/qwen36_layer39_harvested_mtp.safetensors")
     
     weights_path = os.path.join(model_dir, "model_weights.bin")
     if not os.path.exists(weights_path):

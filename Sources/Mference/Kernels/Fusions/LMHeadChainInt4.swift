@@ -48,7 +48,7 @@ final class LMHeadChainInt4 {
                   options: .storageModePrivate),
               let rowSummariesBuffer = context.device.makeBuffer(
                   length: summaryLength,
-                  options: .storageModePrivate) else {
+                  options: .storageModeShared) else {
             throw MetalError.noDevice
         }
         self.xNormedBuffer = xNormedBuffer
@@ -79,8 +79,6 @@ final class LMHeadChainInt4 {
         precondition(weightsOffset % 2 == 0,
                      "lm_head_greedy_int4_rows_chunk_raw needs a 2-aligned weightsOffset")
 
-        let rowGroups = (Int(vocab) + Self.rowsPerThreadgroup - 1)
-            / Self.rowsPerThreadgroup
         rms.encodeBF16W(commandBuffer: commandBuffer,
                         x: hidden,
                         xOffset: hiddenOffset,
@@ -90,10 +88,51 @@ final class LMHeadChainInt4 {
                         d: d,
                         eps: rmsEps)
 
+        encodeGreedyFromNormed(commandBuffer: commandBuffer,
+                               normedHidden: xNormedBuffer,
+                               normedOffset: 0,
+                               weights: weights,
+                               weightsOffset: weightsOffset,
+                               scales: scales,
+                               scalesOffset: scalesOffset,
+                               biases: biases,
+                               biasesOffset: biasesOffset,
+                               outToken: outToken,
+                               d: d,
+                               vocab: vocab)
+    }
+
+    /// Runs the INT4 greedy LM-head projection and argmax reduction directly on
+    /// an already-RMSNorm'd hidden state, avoiding a duplicate RMSNorm pass when
+    /// the caller has already computed the normalized vector (e.g. MTP draft/seed).
+    func encodeGreedyFromNormed(commandBuffer: MTLCommandBuffer,
+                                normedHidden: MTLBuffer,
+                                normedOffset: Int = 0,
+                                weights: MTLBuffer,
+                                weightsOffset: Int = 0,
+                                scales: MTLBuffer,
+                                scalesOffset: Int = 0,
+                                biases: MTLBuffer,
+                                biasesOffset: Int = 0,
+                                outToken: MTLBuffer,
+                                d: UInt32,
+                                vocab: UInt32) {
+        precondition(Int(d) <= maxD, "d=\(d) exceeds wrapper maxD=\(maxD)")
+        precondition(Int(vocab) <= maxVocab,
+                     "vocab=\(vocab) exceeds wrapper maxVocab=\(maxVocab)")
+        precondition(Int(d) % Quantization.groupSize == 0,
+                     "d must be a multiple of \(Quantization.groupSize)")
+        precondition(normedOffset >= 0, "normedOffset must be non-negative")
+        precondition(weightsOffset % 2 == 0,
+                     "lm_head_greedy_int4_rows_chunk_raw needs a 2-aligned weightsOffset")
+
+        let rowGroups = (Int(vocab) + Self.rowsPerThreadgroup - 1)
+            / Self.rowsPerThreadgroup
+
         if let encoder = commandBuffer.makeComputeCommandEncoder() {
             let specialized = d == specializedD && vocab == specializedVocab
             encoder.setComputePipelineState(specialized ? rowGreedySpecialized : rowGreedy)
-            encoder.setBuffer(xNormedBuffer, offset: 0, index: 0)
+            encoder.setBuffer(normedHidden, offset: normedOffset, index: 0)
             encoder.setBuffer(weights, offset: weightsOffset, index: 1)
             encoder.setBuffer(scales, offset: scalesOffset, index: 2)
             encoder.setBuffer(biases, offset: biasesOffset, index: 3)
@@ -110,19 +149,24 @@ final class LMHeadChainInt4 {
             encoder.dispatchThreadgroups(
                 MTLSize(width: rowGroups, height: 1, depth: 1),
                 threadsPerThreadgroup: threadgroupSize)
-            encoder.endEncoding()
-        }
 
-        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.memoryBarrier(scope: .buffers)
+
             encoder.setComputePipelineState(rowReducer)
             encoder.setBuffer(rowSummariesBuffer, offset: 0, index: 0)
             encoder.setBuffer(outToken, offset: 0, index: 1)
             var rowGroupCount = UInt32(rowGroups)
             encoder.setBytes(&rowGroupCount, length: MemoryLayout<UInt32>.size, index: 2)
 
-            let threadgroupSize = MTLSize(width: 256, height: 1, depth: 1)
-            encoder.dispatchThreads(threadgroupSize, threadsPerThreadgroup: threadgroupSize)
+            let reduceTGSize = MTLSize(width: 256, height: 1, depth: 1)
+            encoder.dispatchThreads(reduceTGSize, threadsPerThreadgroup: reduceTGSize)
             encoder.endEncoding()
         }
+    }
+
+    /// Top-1 minus top-2 logit margin from the most recently completed greedy
+    /// reduction (`lm_head_greedy_int4_rows_reduce` writes this into `summaries[0]`).
+    var lastTop1Margin: Float {
+        rowSummariesBuffer.contents().assumingMemoryBound(to: Float.self)[0]
     }
 }

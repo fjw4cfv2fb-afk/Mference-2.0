@@ -82,16 +82,21 @@ def configure(base, token, item, dry_run):
     if entry:
         meta = dict(entry.get("meta") or {})
         capabilities = dict(meta.get("capabilities") or {})
-        if capabilities.get("builtin_tools") is False:
-            return "already off"
+        params = dict(entry.get("params") or {})
+        needs_tools = capabilities.get("builtin_tools") is not False
+        needs_temp = "temperature" not in params
+        if not needs_tools and not needs_temp:
+            return "already configured"
         capabilities["builtin_tools"] = False
         meta["capabilities"] = capabilities
+        if needs_temp:
+            params["temperature"] = 0.0
         form = {
             "id": model_id,
             "base_model_id": entry.get("base_model_id"),
             "name": entry.get("name") or name,
             "meta": meta,
-            "params": entry.get("params") or {},
+            "params": params,
             "is_active": entry.get("is_active", True),
         }
         if not dry_run:
@@ -102,7 +107,7 @@ def configure(base, token, item, dry_run):
         "base_model_id": None,
         "name": name,
         "meta": {"capabilities": {"builtin_tools": False}},
-        "params": {},
+        "params": {"temperature": 0.0},
         "is_active": True,
     }
     if not dry_run:
@@ -137,8 +142,8 @@ def main():
             print(f"[configure-models] {item['id']}: FAILED {error.code} {detail}", file=sys.stderr)
             failures += 1
             continue
-        verb = "would be " + outcome.replace("already off", "left as is") if args.dry_run else outcome
-        print(f"[configure-models] {item['id']}: builtin tools off ({verb})", file=sys.stderr)
+        verb = "would be " + outcome.replace("already configured", "left as is") if args.dry_run else outcome
+        print(f"[configure-models] {item['id']}: builtin tools off & temp=0 ({verb})", file=sys.stderr)
     return 1 if failures else 0
 
 

@@ -43,6 +43,30 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
     private var dsmlText: String?
     private var emittedCalls = 0
     private var failed = false
+    /// Optional ceiling on `<think>` tokens before flagging `shouldExitThinking`.
+    public var maxThinkingTokens: Int? = nil
+    /// Flagged when `<think>` hits `maxThinkingTokens` or enters a repeating token loop.
+    public private(set) var shouldExitThinking: Bool = false
+    /// Suppresses identical back-to-back tool calls (`name` + `arguments`) within a single turn.
+    public var deduplicateConsecutiveToolCalls: Bool = true
+    private var lastEmittedCallSignature: (name: String, arguments: JSONValue)? = nil
+    private var thoughtTokenHistory: [Int32] = []
+
+    /// Returns true when `delta` ends at a natural sentence or clause boundary (`.`, `!`, `?`, `;`,
+    /// optionally followed by whitespace/newlines) so `<think>` soft-landing (`85%...100%` of
+    /// `maxThinkingTokens`) closes on a complete sentence rather than mid-clause or mid-list.
+    public static func isThinkingBoundaryDelta(_ delta: String) -> Bool {
+        let trimmed = delta.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let last = trimmed.last else { return false }
+        if last == "." {
+            let prefix = trimmed.dropLast()
+            if !prefix.isEmpty && prefix.allSatisfy(\.isNumber) {
+                return false
+            }
+            return true
+        }
+        return last == "!" || last == "?" || last == ";"
+    }
 
     public convenience init(tokenizer: MFTokenizer,
                             allowedTools: Set<String>,
@@ -199,13 +223,35 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
         if toolTokens == nil {
             if tokenID == tokenizer.thinkStartID {
                 channel = .thought
+                shouldExitThinking = false
+                thoughtTokenHistory.removeAll(keepingCapacity: true)
                 return []
             }
             if tokenID == tokenizer.thinkEndID {
                 channel = .visible
+                shouldExitThinking = false
+                thoughtTokenHistory.removeAll(keepingCapacity: true)
                 return []
             }
             if channel == .thought {
+                if tokenID >= 0 {
+                    thoughtTokenHistory.append(tokenID)
+                    if let limit = maxThinkingTokens, limit > 0 {
+                        let softLimit = max(1, Int((Double(limit) * 0.85).rounded(.down)))
+                        if payloadCounts.reasoning >= limit
+                            || (payloadCounts.reasoning >= softLimit && Self.isThinkingBoundaryDelta(delta)) {
+                            shouldExitThinking = true
+                        }
+                    }
+                    if !shouldExitThinking,
+                       thoughtTokenHistory.count >= 24,
+                       RepetitionLoopDetector.detectLoop(
+                        in: thoughtTokenHistory,
+                        maxPatternLength: 64,
+                        minRepeats: 3) != nil {
+                        shouldExitThinking = true
+                    }
+                }
                 if !delta.isEmpty { onReasoning?(delta) }
                 return []
             }
@@ -227,8 +273,7 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
             let text = tokenizer.decode(tokens, skipSpecialTokens: false)
             do {
                 let call = try parseChatMLToolCall(text)
-                emittedCalls += 1
-                return [.toolCall(call)]
+                return recordAndFilterToolCall(call)
             } catch {
                 failed = true
                 throw error
@@ -242,6 +287,9 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
             }
             toolTokens = tokens
             return []
+        }
+        if !delta.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            lastEmittedCallSignature = nil
         }
         return delta.isEmpty ? [] : [.content(delta)]
     }
@@ -469,12 +517,36 @@ public final class StructuredAssistantDecoder: @unchecked Sendable {
         return [.content(visible)]
     }
 
+    private func recordAndFilterToolCall(_ call: ParsedToolCall) -> [StructuredAssistantEvent] {
+        emittedCalls += 1
+        if deduplicateConsecutiveToolCalls,
+           let prev = lastEmittedCallSignature,
+           prev.name == call.name && prev.arguments == call.arguments {
+            return []
+        }
+        lastEmittedCallSignature = (call.name, call.arguments)
+        return [.toolCall(call)]
+    }
+
     /// End of stream: releases any withheld plain-text tail and validates
     /// that no tool-call block was left unclosed. Emitting the returned
     /// events is required for byte-faithful output — dropping them
     /// truncates a reply that ends in a DSML-open prefix.
     public func finish() throws -> [StructuredAssistantEvent] {
-        let released = drain()
+        var released = drain()
+        // If generation truncated right after completing a `<function=...>...</function>`
+        // body inside `<tool_call>` before emitting the final `</tool_call>` token,
+        // recover the completed call; otherwise fail closed as malformed.
+        if !failed, tokenizer.dialect == .chatml, let tokens = toolTokens, !tokens.isEmpty {
+            let text = tokenizer.decode(tokens, skipSpecialTokens: false)
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasSuffix("</function>") || (trimmed.hasPrefix("{") && trimmed.hasSuffix("}")) {
+                if let recovered = try? parseChatMLToolCall(text) {
+                    toolTokens = nil
+                    released += recordAndFilterToolCall(recovered)
+                }
+            }
+        }
         guard !failed, toolTokens == nil, dsmlText == nil else {
             throw ToolCallParserError.malformed
         }

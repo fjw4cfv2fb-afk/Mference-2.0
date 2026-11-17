@@ -27,6 +27,68 @@ public enum MTPAttachTool {
         public let rewroteWeightsFile: Bool
     }
 
+    /// Surgical scaling parameters applied losslessly to BF16 norms and INT4/INT8
+    /// affine group scales/biases in `model_weights.bin`, with optional automatic
+    /// co-adaptation of `mtp.norm.weight` and the MTP draft block's internal attention
+    /// norms (`mtp.*q_norm*`, `mtp.*k_norm*`), router (`mtp.*mlp.gate.weight`), and
+    /// output/down projections (`mtp.*o_proj.weight`, `mtp.*down_proj.weight`).
+    public struct SurgeryConfig: Sendable {
+        public var finalNormScale: Float
+        public var qkNormScale: Float
+        public var qkNormStartLayerRatio: Float
+        public var routerTemperature: Float
+        public var lateLayerResidualScale: Float
+        public var lateLayerStartFraction: Float
+        public var sharedExpertScale: Float
+        public var sharedExpertStartLayerRatio: Float
+        public var mtpNormScale: Float
+        public var mtpHiddenNormScale: Float
+        public var mtpQKNormScale: Float?
+        public var mtpRouterTemperature: Float?
+        public var mtpResidualScale: Float?
+        public var mtpSharedExpertScale: Float?
+        public var coAdaptMTP: Bool
+
+        public init(finalNormScale: Float = 1.0,
+                    qkNormScale: Float = 1.0,
+                    qkNormStartLayerRatio: Float = 0.5,
+                    routerTemperature: Float = 1.0,
+                    lateLayerResidualScale: Float = 1.0,
+                    lateLayerStartFraction: Float = 0.75,
+                    sharedExpertScale: Float = 1.0,
+                    sharedExpertStartLayerRatio: Float = 0.5,
+                    mtpNormScale: Float = 1.0,
+                    mtpHiddenNormScale: Float = 1.0,
+                    mtpQKNormScale: Float? = nil,
+                    mtpRouterTemperature: Float? = nil,
+                    mtpResidualScale: Float? = nil,
+                    mtpSharedExpertScale: Float? = nil,
+                    coAdaptMTP: Bool = true) {
+            self.finalNormScale = finalNormScale
+            self.qkNormScale = qkNormScale
+            self.qkNormStartLayerRatio = qkNormStartLayerRatio
+            self.routerTemperature = routerTemperature
+            self.lateLayerResidualScale = lateLayerResidualScale
+            self.lateLayerStartFraction = lateLayerStartFraction
+            self.sharedExpertScale = sharedExpertScale
+            self.sharedExpertStartLayerRatio = sharedExpertStartLayerRatio
+            self.mtpNormScale = mtpNormScale
+            self.mtpHiddenNormScale = mtpHiddenNormScale
+            self.mtpQKNormScale = mtpQKNormScale
+            self.mtpRouterTemperature = mtpRouterTemperature
+            self.mtpResidualScale = mtpResidualScale
+            self.mtpSharedExpertScale = mtpSharedExpertScale
+            self.coAdaptMTP = coAdaptMTP
+        }
+    }
+
+    public struct SurgeryResult: Sendable {
+        public let modifiedNormTensors: Int
+        public let modifiedAffineTensors: Int
+        public let coAdaptedMTP: Bool
+        public let weightsSha256: String
+    }
+
     private static let headerBytes = 24
     private static let entryBytes = 72
     private static let pageBytes: UInt64 = 16_384
@@ -47,7 +109,16 @@ public enum MTPAttachTool {
         let name: String            // without the "mtp." prefix
         let rows: Int
         let cols: Int?              // nil => BF16 norm vector of `rows` elements
+        let bits: Int               // 4 or 8 when cols != nil
         let addOne: Bool            // zero-centered norm -> full form
+
+        init(name: String, rows: Int, cols: Int?, bits: Int = 4, addOne: Bool) {
+            self.name = name
+            self.rows = rows
+            self.cols = cols
+            self.bits = bits
+            self.addOne = addOne
+        }
     }
 
     public static func run(gturboDirectory: String, shardPath: String) throws -> Result {
@@ -63,7 +134,10 @@ public enum MTPAttachTool {
               let arch = manifestRoot["arch"] as? [String: Any],
               let family = arch["family"] as? String, (family == "qwen38" || family == "qwen36"),
               let d = arch["hiddenSize"] as? Int,
-              let f = (arch["moeIntermediateSize"] as? Int) ?? (arch["ffnIntermediate"] as? Int),
+              let f = family == "qwen36"
+                ? (arch["moeIntermediateSize"] as? Int)
+                : (arch["ffnIntermediate"] as? Int),
+              d > 0, f > 0,
               let numHeads = arch["numHeads"] as? Int,
               let numKVHeads = (arch["numFullKVHeads"] as? Int) ?? (arch["numKVHeads"] as? Int),
               let headDim = (arch["fullHeadDim"] as? Int) ?? (arch["headDim"] as? Int) else {
@@ -92,7 +166,21 @@ public enum MTPAttachTool {
 
         let qDim = numHeads * headDim
         let kvDim = numKVHeads * headDim
-        let expected: [ExpectedTensor] = [
+        let isMoE = (family == "qwen36")
+        let moeF = isMoE ? f : 0
+        let sharedF = isMoE
+            ? ((arch["sharedExpertIntermediateSize"] as? Int).flatMap { $0 > 0 ? $0 : nil } ?? moeF)
+            : 0
+        let numExperts = isMoE ? ((arch["numExperts"] as? Int) ?? 0) : 0
+        if isMoE {
+            guard numExperts > 0, moeF > 0, moeF % 64 == 0,
+                  sharedF > 0, sharedF % 64 == 0, d % 64 == 0 else {
+                throw RepackError.configurationInvalid(
+                    detail: "\(manifestPath) has invalid Qwen 3.6 MoE MTP dimensions")
+            }
+        }
+
+        var expected: [ExpectedTensor] = [
             ExpectedTensor(name: "fc.weight", rows: d, cols: 2 * d, addOne: false),
             ExpectedTensor(name: "pre_fc_norm_embedding.weight", rows: d, cols: nil, addOne: true),
             ExpectedTensor(name: "pre_fc_norm_hidden.weight", rows: d, cols: nil, addOne: true),
@@ -105,10 +193,23 @@ public enum MTPAttachTool {
             ExpectedTensor(name: "layers.0.self_attn.o_proj.weight", rows: d, cols: qDim, addOne: false),
             ExpectedTensor(name: "layers.0.self_attn.q_norm.weight", rows: headDim, cols: nil, addOne: true),
             ExpectedTensor(name: "layers.0.self_attn.k_norm.weight", rows: headDim, cols: nil, addOne: true),
-            ExpectedTensor(name: "layers.0.mlp.gate_proj.weight", rows: f, cols: d, addOne: false),
-            ExpectedTensor(name: "layers.0.mlp.up_proj.weight", rows: f, cols: d, addOne: false),
-            ExpectedTensor(name: "layers.0.mlp.down_proj.weight", rows: d, cols: f, addOne: false),
         ]
+        if isMoE {
+            // Router and scalar gate match trunk precision (INT8 g64); shared expert uses INT4 g64.
+            expected.append(contentsOf: [
+                ExpectedTensor(name: "layers.0.mlp.gate.weight", rows: numExperts, cols: d, bits: 8, addOne: false),
+                ExpectedTensor(name: "layers.0.mlp.shared_expert_gate.weight", rows: 1, cols: d, bits: 8, addOne: false),
+                ExpectedTensor(name: "layers.0.mlp.shared_expert.gate_proj.weight", rows: sharedF, cols: d, addOne: false),
+                ExpectedTensor(name: "layers.0.mlp.shared_expert.up_proj.weight", rows: sharedF, cols: d, addOne: false),
+                ExpectedTensor(name: "layers.0.mlp.shared_expert.down_proj.weight", rows: d, cols: sharedF, addOne: false),
+            ])
+        } else {
+            expected.append(contentsOf: [
+                ExpectedTensor(name: "layers.0.mlp.gate_proj.weight", rows: f, cols: d, addOne: false),
+                ExpectedTensor(name: "layers.0.mlp.up_proj.weight", rows: f, cols: d, addOne: false),
+                ExpectedTensor(name: "layers.0.mlp.down_proj.weight", rows: d, cols: f, addOne: false),
+            ])
+        }
 
         // -- Existing resident index.
         let weightsFd = try Posix.openExistingRW(weightsPath)
@@ -153,11 +254,43 @@ public enum MTPAttachTool {
             byName[t.name] = t
         }
 
+        // Validate routed MoE expert tensors before mutating any installed files.
+        let routedExperts: (gateUp: SourceTensor, down: SourceTensor)?
+        if isMoE {
+            let gateUpName = "mtp.layers.0.mlp.experts.gate_up_proj"
+            let downName = "mtp.layers.0.mlp.experts.down_proj"
+            guard let gateUp = byName[gateUpName] else {
+                throw RepackError.missingTensor(name: gateUpName)
+            }
+            guard let down = byName[downName] else {
+                throw RepackError.missingTensor(name: downName)
+            }
+            guard gateUp.dtype == .bf16 else {
+                throw RepackError.dtypeMismatch(name: gateUpName,
+                    detail: "expected BF16, got \(gateUp.dtype)")
+            }
+            guard down.dtype == .bf16 else {
+                throw RepackError.dtypeMismatch(name: downName,
+                    detail: "expected BF16, got \(down.dtype)")
+            }
+            guard gateUp.shape == [UInt64(numExperts), UInt64(2 * moeF), UInt64(d)] else {
+                throw RepackError.shapeMismatch(name: gateUpName,
+                    detail: "expected [\(numExperts), \(2 * moeF), \(d)], got \(gateUp.shape)")
+            }
+            guard down.shape == [UInt64(numExperts), UInt64(d), UInt64(moeF)] else {
+                throw RepackError.shapeMismatch(name: downName,
+                    detail: "expected [\(numExperts), \(d), \(moeF)], got \(down.shape)")
+            }
+            routedExperts = (gateUp, down)
+        } else {
+            routedExperts = nil
+        }
+
         // -- Quantize / convert into an appended-payload staging file plan.
         // Payload is written straight after the current file end; entries are
         // built against absolute offsets in the (possibly shifted) new file.
         var appended = Data()
-        appended.reserveCapacity(1 << 20)
+        appended.reserveCapacity(isMoE ? (64 << 20) : (1 << 20))
         var newEntries: [RawIndexEntry] = []
         let payloadBase = oldFileSize
 
@@ -175,55 +308,21 @@ public enum MTPAttachTool {
                     throw RepackError.shapeMismatch(name: fullName,
                         detail: "expected [\(spec.rows), \(cols)], got \(tensor.shape)")
                 }
-                guard cols % Int4AffineEncoder.groupSize == 0 else {
+                guard spec.bits == 4 || spec.bits == 8,
+                      cols % Int4AffineEncoder.groupSize == 0 else {
                     throw RepackError.shapeMismatch(name: fullName,
-                        detail: "cols \(cols) not a multiple of \(Int4AffineEncoder.groupSize)")
+                        detail: "cols \(cols) not a multiple of \(Int4AffineEncoder.groupSize) or invalid bits \(spec.bits)")
                 }
-                let weightOffset = payloadBase + UInt64(appended.count)
-                var scales = [UInt16]()
-                var biases = [UInt16]()
+                let (weightOffset, scaleOffset, biasOffset) = try appendQuantizedBF16Matrix(
+                    shardFd: shardFd, shardPath: shardPath,
+                    sourceOffset: tensor.absoluteOffset,
+                    rows: spec.rows, cols: cols, bits: spec.bits,
+                    payloadBase: payloadBase, into: &appended)
                 let groups = cols / Int4AffineEncoder.groupSize
-                scales.reserveCapacity(spec.rows * groups)
-                biases.reserveCapacity(spec.rows * groups)
-                // Row-batched: read BF16 rows, widen, quantize, append.
-                let batchRows = max(1, (8 << 20) / (cols * 2))
-                var floats = [Float](repeating: 0, count: batchRows * cols)
-                var raw = [UInt16](repeating: 0, count: batchRows * cols)
-                var row = 0
-                while row < spec.rows {
-                    let take = min(batchRows, spec.rows - row)
-                    let byteCount = take * cols * 2
-                    try raw.withUnsafeMutableBytes {
-                        try Posix.preadAll(fd: shardFd, path: shardPath,
-                                           buf: $0.baseAddress!, count: byteCount,
-                                           offset: tensor.absoluteOffset
-                                               + UInt64(row * cols * 2))
-                    }
-                    for i in 0..<(take * cols) {
-                        floats[i] = Float(bitPattern: UInt32(raw[i]) << 16)
-                    }
-                    let encoded = floats.withUnsafeBufferPointer {
-                        Int4AffineEncoder.encodeTensor(
-                            UnsafeBufferPointer(rebasing: $0.prefix(take * cols)),
-                            rowLength: cols)
-                    }
-                    appended.append(contentsOf: encoded.packed)
-                    scales.append(contentsOf: encoded.scales)
-                    biases.append(contentsOf: encoded.biases)
-                    row += take
-                }
-                let scaleOffset = payloadBase + UInt64(appended.count)
-                scales.withUnsafeBufferPointer {
-                    appended.append(UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self))
-                }
-                let biasOffset = payloadBase + UInt64(appended.count)
-                biases.withUnsafeBufferPointer {
-                    appended.append(UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self))
-                }
                 newEntries.append(RawIndexEntry(
                     name: fullName, dtype: 0,
                     fileOffset: weightOffset,
-                    sizeBytes: UInt64(spec.rows * cols / 2),
+                    sizeBytes: UInt64(spec.rows * cols * spec.bits / 8),
                     shape: (UInt32(spec.rows), UInt32(cols), 0, 0),
                     scaleOffset: scaleOffset,
                     scaleSize: UInt64(spec.rows * groups * 2),
@@ -258,6 +357,20 @@ public enum MTPAttachTool {
                     scaleOffset: 0, scaleSize: 0,
                     biasOffset: 0, biasSize: 0))
             }
+        }
+
+        // Write packed_experts_mtp/layer_00.bin (if MoE) before rewriting model_weights.bin.
+        var routedExpertPoolInfo: (size: UInt64, sha256: String, expertStride: UInt64)?
+        if let routedExperts {
+            routedExpertPoolInfo = try writeQwen36MTPRoutedExperts(
+                gturboDirectory: gturboDirectory,
+                shardFd: shardFd,
+                shardPath: shardPath,
+                gateUp: routedExperts.gateUp,
+                down: routedExperts.down,
+                numExperts: numExperts,
+                hidden: d,
+                intermediate: moeF)
         }
 
         // -- New index image.
@@ -336,6 +449,29 @@ public enum MTPAttachTool {
             throw RepackError.configurationInvalid(detail: "manifest.json has no files map")
         }
         files["model_weights.bin"] = ["size": Int(newSize), "sha256": sha]
+        if let poolInfo = routedExpertPoolInfo {
+            files["packed_experts_mtp/layer_00.bin"] = [
+                "size": Int(poolInfo.size),
+                "sha256": poolInfo.sha256,
+            ]
+            var sidecars = manifestRoot["sidecars"] as? [String: Any] ?? [:]
+            sidecars["mtp"] = [
+                "carried": true,
+                "tensorCount": newEntries.count + 2,
+            ]
+            manifestRoot["sidecars"] = sidecars
+
+            var pools = manifestRoot["auxiliaryExpertPools"] as? [[String: Any]] ?? []
+            pools.removeAll { ($0["name"] as? String) == "mtp" }
+            pools.append([
+                "name": "mtp",
+                "directory": "packed_experts_mtp",
+                "expertsPerLayer": numExperts,
+                "expertStride": Int(poolInfo.expertStride),
+                "layers": [["layer": 0, "file": "layer_00.bin"]],
+            ])
+            manifestRoot["auxiliaryExpertPools"] = pools
+        }
         manifestRoot["files"] = files
         let newManifest = try JSONSerialization.data(
             withJSONObject: manifestRoot,
@@ -364,6 +500,389 @@ public enum MTPAttachTool {
                       appendedBytes: UInt64(appended.count),
                       weightsFileBytes: newSize,
                       rewroteWeightsFile: rewrote)
+    }
+
+    /// Applies lossless resident weight surgery directly to `model_weights.bin`
+    /// (modifying BF16 norm vectors and INT4/INT8 group scales/biases without re-quantizing
+    /// nibble payloads), co-adapts `mtp.pre_fc_norm_hidden.weight` when `config.coAdaptMTP`
+    /// is enabled, and refreshes `manifest.json` + `verified-install.json`.
+    public static func applyResidentWeightSurgery(
+        gturboDirectory: String,
+        config: SurgeryConfig
+    ) throws -> SurgeryResult {
+        guard config.routerTemperature > 0, config.finalNormScale > 0 else {
+            throw RepackError.configurationInvalid(
+                detail: "routerTemperature and finalNormScale must be positive")
+        }
+        let weightsPath = (gturboDirectory as NSString)
+            .appendingPathComponent("model_weights.bin")
+        let manifestPath = (gturboDirectory as NSString)
+            .appendingPathComponent("manifest.json")
+
+        let manifestData = try Posix.readBoundedData(manifestPath, maximumBytes: 8 << 20)
+        guard var manifestRoot = try JSONSerialization
+                .jsonObject(with: manifestData) as? [String: Any],
+              let arch = manifestRoot["arch"] as? [String: Any],
+              var files = manifestRoot["files"] as? [String: Any] else {
+            throw RepackError.configurationInvalid(
+                detail: "\(manifestPath) is not a valid .gturbo manifest")
+        }
+        let numLayers = (arch["numLayers"] as? Int) ?? 0
+        let qkStartLayer = Int(Float(max(0, numLayers)) * max(0.0, min(1.0, config.qkNormStartLayerRatio)))
+        let lateStartLayer = Int(Float(max(0, numLayers)) * max(0.0, min(1.0, config.lateLayerStartFraction)))
+        let sharedStartLayer = Int(Float(max(0, numLayers)) * max(0.0, min(1.0, config.sharedExpertStartLayerRatio)))
+        let routerScale = 1.0 / config.routerTemperature
+        let mtpQKNormScale = config.mtpQKNormScale ?? (config.coAdaptMTP ? config.qkNormScale : 1.0)
+        let mtpRouterTemp = config.mtpRouterTemperature ?? (config.coAdaptMTP ? config.routerTemperature : 1.0)
+        guard mtpRouterTemp > 0 else {
+            throw RepackError.configurationInvalid(detail: "mtpRouterTemperature must be positive")
+        }
+        let mtpRouterScale = 1.0 / mtpRouterTemp
+        let mtpResidualScale = config.mtpResidualScale ?? (config.coAdaptMTP ? config.lateLayerResidualScale : 1.0)
+        let mtpSharedExpertScale = config.mtpSharedExpertScale ?? (config.coAdaptMTP ? config.sharedExpertScale : 1.0)
+
+        let weightsFd = try Posix.openExistingRW(weightsPath)
+        defer { close(weightsFd) }
+        let fileSize = try Posix.fileSize(fd: weightsFd, path: weightsPath)
+        let (_, _, entries) = try readIndex(fd: weightsFd, path: weightsPath)
+
+        func scaleBF16Region(offset: UInt64, byteCount: UInt64, factor: Float) throws {
+            guard factor != 1.0, byteCount > 0, byteCount % 2 == 0 else { return }
+            let count = Int(byteCount / 2)
+            var words = [UInt16](repeating: 0, count: count)
+            try words.withUnsafeMutableBytes {
+                try Posix.preadAll(fd: weightsFd, path: weightsPath,
+                                   buf: $0.baseAddress!, count: Int(byteCount), offset: offset)
+            }
+            for i in 0..<count {
+                let v = Float(bitPattern: UInt32(words[i]) << 16) * factor
+                words[i] = Int4AffineEncoder.bf16Bits(v)
+            }
+            try words.withUnsafeBytes {
+                try Posix.pwriteAll(fd: weightsFd, path: weightsPath,
+                                    buf: $0.baseAddress!, count: Int(byteCount), offset: offset)
+            }
+        }
+
+        var modifiedNorms = 0
+        var modifiedAffine = 0
+        var didCoAdaptMTP = false
+
+        for entry in entries {
+            let isMtpLayer = entry.name.hasPrefix("mtp.")
+            if entry.dtype == 1 {
+                // BF16 norm vector
+                if entry.name == "final_norm.weight"
+                    || entry.name == "model.norm.weight"
+                    || entry.name == "language_model.model.norm.weight"
+                    || entry.name.hasSuffix(".model.norm.weight") {
+                    if config.finalNormScale != 1.0 {
+                        try scaleBF16Region(offset: entry.fileOffset,
+                                            byteCount: entry.sizeBytes,
+                                            factor: config.finalNormScale)
+                        modifiedNorms += 1
+                    }
+                } else if entry.name == "mtp.pre_fc_norm_hidden.weight" {
+                    // RMSNorm(alpha * h) == RMSNorm(h), so pre_fc_norm_hidden is already invariant
+                    // to uniform final_norm scaling; only apply explicit mtpHiddenNormScale calibration.
+                    if config.mtpHiddenNormScale != 1.0 {
+                        try scaleBF16Region(offset: entry.fileOffset,
+                                            byteCount: entry.sizeBytes,
+                                            factor: config.mtpHiddenNormScale)
+                        modifiedNorms += 1
+                    }
+                } else if entry.name == "mtp.norm.weight" {
+                    // Synchronize mtp.norm.weight with finalNormScale when coAdaptMTP is enabled
+                    // so the MTP head's logit sharpness entering the shared lm_head matches the trunk.
+                    let effectiveMtpNormScale = config.coAdaptMTP
+                        ? (config.finalNormScale * config.mtpNormScale)
+                        : config.mtpNormScale
+                    if effectiveMtpNormScale != 1.0 {
+                        try scaleBF16Region(offset: entry.fileOffset,
+                                            byteCount: entry.sizeBytes,
+                                            factor: effectiveMtpNormScale)
+                        modifiedNorms += 1
+                        if config.coAdaptMTP && config.finalNormScale != 1.0 {
+                            didCoAdaptMTP = true
+                        }
+                    }
+                } else if entry.name.hasSuffix(".q_norm.weight") || entry.name.hasSuffix(".k_norm.weight") {
+                    if isMtpLayer {
+                        if mtpQKNormScale != 1.0 {
+                            try scaleBF16Region(offset: entry.fileOffset,
+                                                byteCount: entry.sizeBytes,
+                                                factor: mtpQKNormScale)
+                            modifiedNorms += 1
+                            didCoAdaptMTP = true
+                        }
+                    } else if config.qkNormScale != 1.0 {
+                        let inTargetRange: Bool
+                        if let layerIdx = parseLayerIndex(from: entry.name) {
+                            inTargetRange = layerIdx >= qkStartLayer
+                        } else {
+                            inTargetRange = true
+                        }
+                        if inTargetRange {
+                            try scaleBF16Region(offset: entry.fileOffset,
+                                                byteCount: entry.sizeBytes,
+                                                factor: config.qkNormScale)
+                            modifiedNorms += 1
+                        }
+                    }
+                }
+            } else if entry.dtype == 0, entry.scaleSize > 0, entry.biasSize > 0 {
+                // Affine quantized projection: scale both scale and bias BF16 tables in place.
+                if entry.name.hasSuffix(".mlp.gate.weight") {
+                    if isMtpLayer {
+                        if mtpRouterScale != 1.0 {
+                            try scaleBF16Region(offset: entry.scaleOffset,
+                                                byteCount: entry.scaleSize,
+                                                factor: mtpRouterScale)
+                            try scaleBF16Region(offset: entry.biasOffset,
+                                                byteCount: entry.biasSize,
+                                                factor: mtpRouterScale)
+                            modifiedAffine += 1
+                            didCoAdaptMTP = true
+                        }
+                    } else if routerScale != 1.0 {
+                        let inTargetRange: Bool
+                        if let layerIdx = parseLayerIndex(from: entry.name) {
+                            inTargetRange = layerIdx >= lateStartLayer
+                        } else {
+                            inTargetRange = true
+                        }
+                        if inTargetRange {
+                            try scaleBF16Region(offset: entry.scaleOffset,
+                                                byteCount: entry.scaleSize,
+                                                factor: routerScale)
+                            try scaleBF16Region(offset: entry.biasOffset,
+                                                byteCount: entry.biasSize,
+                                                factor: routerScale)
+                            modifiedAffine += 1
+                        }
+                    }
+                } else if entry.name.hasSuffix(".shared_expert.down_proj.weight") {
+                    if isMtpLayer {
+                        if mtpSharedExpertScale != 1.0 {
+                            try scaleBF16Region(offset: entry.scaleOffset,
+                                                byteCount: entry.scaleSize,
+                                                factor: mtpSharedExpertScale)
+                            try scaleBF16Region(offset: entry.biasOffset,
+                                                byteCount: entry.biasSize,
+                                                factor: mtpSharedExpertScale)
+                            modifiedAffine += 1
+                            didCoAdaptMTP = true
+                        }
+                    } else if config.sharedExpertScale != 1.0,
+                              let layerIdx = parseLayerIndex(from: entry.name),
+                              layerIdx >= sharedStartLayer {
+                        try scaleBF16Region(offset: entry.scaleOffset,
+                                            byteCount: entry.scaleSize,
+                                            factor: config.sharedExpertScale)
+                        try scaleBF16Region(offset: entry.biasOffset,
+                                            byteCount: entry.biasSize,
+                                            factor: config.sharedExpertScale)
+                        modifiedAffine += 1
+                    }
+                } else if entry.name.hasSuffix(".self_attn.o_proj.weight")
+                            || entry.name.hasSuffix(".attn.o_proj.weight")
+                            || entry.name.hasSuffix(".mlp.down_proj.weight") {
+                    if isMtpLayer {
+                        if mtpResidualScale != 1.0 {
+                            try scaleBF16Region(offset: entry.scaleOffset,
+                                                byteCount: entry.scaleSize,
+                                                factor: mtpResidualScale)
+                            try scaleBF16Region(offset: entry.biasOffset,
+                                                byteCount: entry.biasSize,
+                                                factor: mtpResidualScale)
+                            modifiedAffine += 1
+                            didCoAdaptMTP = true
+                        }
+                    } else if config.lateLayerResidualScale != 1.0,
+                              let layerIdx = parseLayerIndex(from: entry.name),
+                              layerIdx >= lateStartLayer {
+                        try scaleBF16Region(offset: entry.scaleOffset,
+                                            byteCount: entry.scaleSize,
+                                            factor: config.lateLayerResidualScale)
+                        try scaleBF16Region(offset: entry.biasOffset,
+                                            byteCount: entry.biasSize,
+                                            factor: config.lateLayerResidualScale)
+                        modifiedAffine += 1
+                    }
+                }
+            }
+        }
+
+        try Posix.fsync(weightsFd, path: weightsPath)
+        let sha = try Sha256Stream.hashFile(path: weightsPath, tileBytes: 8 << 20)
+        files["model_weights.bin"] = ["size": Int(fileSize), "sha256": sha]
+        manifestRoot["files"] = files
+        let newManifest = try JSONSerialization.data(
+            withJSONObject: manifestRoot,
+            options: [.sortedKeys, .withoutEscapingSlashes])
+        try Posix.atomicWrite(newManifest, to: manifestPath, durableIn: gturboDirectory)
+
+        let receiptPath = (gturboDirectory as NSString)
+            .appendingPathComponent("verified-install.json")
+        try? FileManager.default.removeItem(atPath: receiptPath)
+        _ = try? VerifiedInstallTool.run(
+            options: VerifyInstallOptions(inputGTurbo: gturboDirectory))
+
+        return SurgeryResult(modifiedNormTensors: modifiedNorms,
+                             modifiedAffineTensors: modifiedAffine,
+                             coAdaptedMTP: didCoAdaptMTP,
+                             weightsSha256: sha)
+    }
+
+    private static func parseLayerIndex(from tensorName: String) -> Int? {
+        guard !tensorName.hasPrefix("mtp.") else { return nil }
+        guard let range = tensorName.range(of: "layers.") else { return nil }
+        let suffix = tensorName[range.upperBound...]
+        guard let dot = suffix.firstIndex(of: ".") else { return nil }
+        return Int(suffix[..<dot])
+    }
+
+    // MARK: - Quantization and auxiliary MoE pool helpers
+
+    private static func appendQuantizedBF16Matrix(
+        shardFd: Int32,
+        shardPath: String,
+        sourceOffset: UInt64,
+        rows: Int,
+        cols: Int,
+        bits: Int,
+        payloadBase: UInt64,
+        into dst: inout Data
+    ) throws -> (weightOffset: UInt64, scaleOffset: UInt64, biasOffset: UInt64) {
+        let weightOffset = payloadBase + UInt64(dst.count)
+        let groups = cols / Int4AffineEncoder.groupSize
+        var scales = [UInt16]()
+        var biases = [UInt16]()
+        scales.reserveCapacity(rows * groups)
+        biases.reserveCapacity(rows * groups)
+
+        let batchRows = min(rows, max(1, (8 << 20) / (cols * 2)))
+        var floats = [Float](repeating: 0, count: batchRows * cols)
+        var raw = [UInt16](repeating: 0, count: batchRows * cols)
+        var row = 0
+        while row < rows {
+            let take = min(batchRows, rows - row)
+            let byteCount = take * cols * 2
+            try raw.withUnsafeMutableBytes {
+                try Posix.preadAll(fd: shardFd, path: shardPath,
+                                   buf: $0.baseAddress!, count: byteCount,
+                                   offset: sourceOffset + UInt64(row * cols * 2))
+            }
+            for i in 0..<(take * cols) {
+                floats[i] = Float(bitPattern: UInt32(raw[i]) << 16)
+            }
+            floats.withUnsafeBufferPointer { buf in
+                let slice = UnsafeBufferPointer(rebasing: buf.prefix(take * cols))
+                if bits == 8 {
+                    let encoded = Int8AffineEncoder.encodeTensor(slice, rowLength: cols)
+                    dst.append(contentsOf: encoded.packed)
+                    scales.append(contentsOf: encoded.scales)
+                    biases.append(contentsOf: encoded.biases)
+                } else {
+                    let encoded = Int4AffineEncoder.encodeTensor(slice, rowLength: cols)
+                    dst.append(contentsOf: encoded.packed)
+                    scales.append(contentsOf: encoded.scales)
+                    biases.append(contentsOf: encoded.biases)
+                }
+            }
+            row += take
+        }
+
+        let scaleOffset = payloadBase + UInt64(dst.count)
+        scales.withUnsafeBufferPointer {
+            dst.append(UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self))
+        }
+        let biasOffset = payloadBase + UInt64(dst.count)
+        biases.withUnsafeBufferPointer {
+            dst.append(UnsafeRawBufferPointer($0).bindMemory(to: UInt8.self))
+        }
+        return (weightOffset, scaleOffset, biasOffset)
+    }
+
+    private static func writeQwen36MTPRoutedExperts(
+        gturboDirectory: String,
+        shardFd: Int32,
+        shardPath: String,
+        gateUp: SourceTensor,
+        down: SourceTensor,
+        numExperts: Int,
+        hidden: Int,
+        intermediate: Int
+    ) throws -> (size: UInt64, sha256: String, expertStride: UInt64) {
+        let groupsD = hidden / Int4AffineEncoder.groupSize
+        let groupsF = intermediate / Int4AffineEncoder.groupSize
+        let gateBytes = intermediate * hidden / 2 + 2 * intermediate * groupsD * 2
+        let downBytes = hidden * intermediate / 2 + 2 * hidden * groupsF * 2
+        let rawBlobBytes = UInt64(2 * gateBytes + downBytes)
+        let pageSize = UInt64(getpagesize())
+        let expertStride = ((rawBlobBytes + pageSize - 1) / pageSize) * pageSize
+
+        let auxDir = (gturboDirectory as NSString).appendingPathComponent("packed_experts_mtp")
+        try FileManager.default.createDirectory(atPath: auxDir, withIntermediateDirectories: true)
+        let finalPath = (auxDir as NSString).appendingPathComponent("layer_00.bin")
+        let totalSize = UInt64(numExperts) * expertStride
+        if let existingSize = (try? FileManager.default.attributesOfItem(atPath: finalPath)[.size] as? NSNumber)?.uint64Value,
+           existingSize == totalSize {
+            let sha = try Sha256Stream.hashFile(path: finalPath, tileBytes: 8 << 20)
+            return (totalSize, sha, expertStride)
+        }
+        let tmpPath = finalPath + ".mtp-attach.tmp"
+        try? FileManager.default.removeItem(atPath: tmpPath)
+
+        do {
+            let outFd = try Posix.openCreateRW(tmpPath)
+            defer { close(outFd) }
+
+            let halfSourceBytes = UInt64(intermediate * hidden * 2)
+            let gateUpExpertStride = 2 * halfSourceBytes
+            let downExpertStride = UInt64(hidden * intermediate * 2)
+            var blob = Data(capacity: Int(expertStride))
+
+            for expert in 0..<numExperts {
+                blob.removeAll(keepingCapacity: true)
+                let gateOffset = gateUp.absoluteOffset + UInt64(expert) * gateUpExpertStride
+                let upOffset = gateOffset + halfSourceBytes
+                let downOffset = down.absoluteOffset + UInt64(expert) * downExpertStride
+
+                _ = try appendQuantizedBF16Matrix(
+                    shardFd: shardFd, shardPath: shardPath,
+                    sourceOffset: gateOffset,
+                    rows: intermediate, cols: hidden, bits: 4,
+                    payloadBase: 0, into: &blob)
+                _ = try appendQuantizedBF16Matrix(
+                    shardFd: shardFd, shardPath: shardPath,
+                    sourceOffset: upOffset,
+                    rows: intermediate, cols: hidden, bits: 4,
+                    payloadBase: 0, into: &blob)
+                _ = try appendQuantizedBF16Matrix(
+                    shardFd: shardFd, shardPath: shardPath,
+                    sourceOffset: downOffset,
+                    rows: hidden, cols: intermediate, bits: 4,
+                    payloadBase: 0, into: &blob)
+
+                if blob.count < Int(expertStride) {
+                    blob.append(Data(count: Int(expertStride) - blob.count))
+                }
+                let fileOffset = UInt64(expert) * expertStride
+                try blob.withUnsafeBytes {
+                    try Posix.pwriteAll(fd: outFd, path: tmpPath,
+                                        buf: $0.baseAddress!, count: blob.count,
+                                        offset: fileOffset)
+                }
+            }
+            try Posix.fsync(outFd, path: tmpPath)
+        } catch {
+            try? FileManager.default.removeItem(atPath: tmpPath)
+            throw error
+        }
+        try Posix.rename(from: tmpPath, to: finalPath)
+        let sha = try Sha256Stream.hashFile(path: finalPath, tileBytes: 8 << 20)
+        return (totalSize, sha, expertStride)
     }
 
     // MARK: - Index encode/decode
