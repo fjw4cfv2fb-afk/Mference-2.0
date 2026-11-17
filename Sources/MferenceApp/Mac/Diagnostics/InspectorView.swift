@@ -5,10 +5,13 @@ import SwiftUI
 
 struct InspectorView: View {
     @Bindable var model: AppModel
+    @State private var copiedFieldID: String?
+    @State private var portInput: String = ""
 
     var body: some View {
         Form {
             modelSection
+            openAIServerSection
             memorySection
             generationSection
             runtimeSection
@@ -19,29 +22,63 @@ struct InspectorView: View {
         .background(Color.black)
         .tint(MferenceMacTheme.accentColor)
         .accentColor(MferenceMacTheme.accentColor)
+        .onAppear {
+            portInput = String(model.openAIServer.port)
+        }
+        .onChange(of: model.openAIServer.port) { _, newValue in
+            let text = String(newValue)
+            if portInput != text {
+                portInput = text
+            }
+        }
+        .task(id: copiedFieldID) {
+            guard let id = copiedFieldID else { return }
+            try? await Task.sleep(for: .seconds(1.2))
+            guard !Task.isCancelled, copiedFieldID == id else { return }
+            copiedFieldID = nil
+        }
+    }
+
+    private func copyToPasteboard(_ value: String, fieldID: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+        copiedFieldID = fieldID
+    }
+
+    private func copyableValueRow(
+        _ title: String,
+        value: String,
+        fieldID: String,
+        monospaced: Bool = true
+    ) -> some View {
+        LabeledContent(title) {
+            HStack(spacing: 6) {
+                Text(value)
+                    .font(monospaced ? .caption.monospaced() : .caption)
+                    .truncationMode(.middle)
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .help(value)
+                Button {
+                    copyToPasteboard(value, fieldID: fieldID)
+                } label: {
+                    Label(
+                        copiedFieldID == fieldID ? "Copied" : "Copy \(title)",
+                        systemImage: copiedFieldID == fieldID ? "checkmark.circle.fill" : "doc.on.doc"
+                    )
+                    .labelStyle(.iconOnly)
+                    .foregroundStyle(copiedFieldID == fieldID ? MferenceMacTheme.accentColor : Color.secondary)
+                }
+                .buttonStyle(.borderless)
+                .help(copiedFieldID == fieldID ? "Copied \(title)" : "Copy \(title)")
+            }
+        }
     }
 
     private var modelSection: some View {
         Section("Model") {
-            LabeledContent("Path") {
-                HStack(spacing: 6) {
-                    Text(model.modelPathText)
-                        .font(.caption)
-                        .truncationMode(.middle)
-                        .lineLimit(1)
-                        .foregroundStyle(.secondary)
-                        .help(model.modelPathText)
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(model.modelPathText, forType: .string)
-                    } label: {
-                        Label("Copy model path", systemImage: "doc.on.doc")
-                            .labelStyle(.iconOnly)
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Copy model path")
-                }
-            }
+            copyableValueRow("Path", value: model.modelPathText, fieldID: "modelPath", monospaced: false)
             Button("Choose Model Folder…") {
                 ModelLocationPicker.choose(for: model)
             }
@@ -49,44 +86,6 @@ struct InspectorView: View {
             if model.canUnloadModel {
                 Button("Unload Model", action: model.unloadModel)
             }
-            Divider()
-            LabeledContent("OpenAI Server") {
-                HStack(spacing: 4) {
-                    Circle()
-                        .fill(model.openAIServer.isRunning ? Color.blue : (model.openAIServer.isStarting ? Color.orange : Color.secondary))
-                        .frame(width: 8, height: 8)
-                    Text(model.openAIServer.statusDescription)
-                        .font(.caption)
-                }
-            }
-            if model.openAIServer.isRunning {
-                LabeledContent("Endpoint") {
-                    Text(model.openAIServer.serverURLString)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                }
-            }
-            Button(model.openAIServer.isRunning ? "Stop OpenAI Server" : "Start OpenAI Server") {
-                model.toggleOpenAIServer()
-            }
-            .disabled(model.openAIServer.isStarting)
-            .help(model.openAIServer.latestCommandPreview)
-            Button {
-                model.openAIServer.expertCacheSlots = model.runtimeOptions.expertCacheSlots
-                model.openAIServer.maxContext = model.maxContextTokens
-                let cmd = model.openAIServer.fullCommandString(
-                    modelPath: model.modelPathText,
-                    maxContext: model.maxContextTokens,
-                    expertCacheSlots: model.runtimeOptions.expertCacheSlots
-                )
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(cmd, forType: .string)
-            } label: {
-                Label("Copy Server Command", systemImage: "terminal")
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .help("Copy exact CLI command: \(model.openAIServer.fullCommandString(modelPath: model.modelPathText, maxContext: model.maxContextTokens, expertCacheSlots: model.runtimeOptions.expertCacheSlots))")
             Divider()
             LabeledContent("State") {
                 Text(model.presentation.label)
@@ -114,6 +113,80 @@ struct InspectorView: View {
             }
         }
         .disabled(model.isRunning || model.isInstallingModel)
+    }
+
+    private var openAIServerSection: some View {
+        Section("OpenAI API Server") {
+            LabeledContent("Status") {
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(model.openAIServer.isRunning ? Color.blue : (model.openAIServer.isStarting ? Color.orange : Color.secondary))
+                        .frame(width: 8, height: 8)
+                    Text(model.openAIServer.statusDescription)
+                        .font(.caption)
+                }
+            }
+            copyableValueRow("Base URL", value: model.openAIServer.openAIBaseURLString, fieldID: "baseURL")
+            copyableValueRow("Model ID", value: model.openAIServer.modelId, fieldID: "modelID")
+            LabeledContent("Port") {
+                TextField("8080", text: $portInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospacedDigit())
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 72)
+                    .disabled(model.openAIServer.isRunning || model.openAIServer.isStarting)
+                    .onChange(of: portInput) { _, newValue in
+                        let digits = newValue.filter(\.isNumber)
+                        if digits != newValue {
+                            portInput = digits
+                        }
+                        if let parsed = Int(digits), OpenAIServerManager.validPortRange.contains(parsed) {
+                            model.openAIServer.port = parsed
+                        }
+                    }
+                    .onSubmit {
+                        let parsed = Int(portInput) ?? model.openAIServer.port
+                        let clamped = OpenAIServerManager.clampPort(parsed)
+                        model.openAIServer.port = clamped
+                        portInput = String(clamped)
+                    }
+            }
+            Button(model.openAIServer.isRunning ? "Stop OpenAI Server" : "Start OpenAI Server") {
+                if !model.openAIServer.isRunning && !model.openAIServer.isStarting {
+                    let parsed = Int(portInput) ?? model.openAIServer.port
+                    let clamped = OpenAIServerManager.clampPort(parsed)
+                    model.openAIServer.port = clamped
+                    portInput = String(clamped)
+                }
+                model.toggleOpenAIServer()
+            }
+            .disabled(model.openAIServer.isStarting)
+            .help(model.openAIServer.latestCommandPreview)
+            Button {
+                model.openAIServer.expertCacheSlots = model.runtimeOptions.expertCacheSlots
+                model.openAIServer.maxContext = model.maxContextTokens
+                let cmd = model.openAIServer.fullCommandString(
+                    modelPath: model.modelPathText,
+                    maxContext: model.maxContextTokens,
+                    expertCacheSlots: model.runtimeOptions.expertCacheSlots
+                )
+                copyToPasteboard(cmd, fieldID: "serverCommand")
+            } label: {
+                Label(
+                    copiedFieldID == "serverCommand" ? "Copied Server Command" : "Copy Server Command",
+                    systemImage: copiedFieldID == "serverCommand" ? "checkmark.circle.fill" : "terminal"
+                )
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .help("Copy exact CLI command: \(model.openAIServer.fullCommandString(modelPath: model.modelPathText, maxContext: model.maxContextTokens, expertCacheSlots: model.runtimeOptions.expertCacheSlots))")
+            if let error = model.openAIServer.lastError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+        }
     }
 
     private var memorySection: some View {

@@ -217,7 +217,7 @@ struct OutputPaneView: View {
                     Circle()
                         .fill(Color.blue)
                         .frame(width: 8, height: 8)
-                    Text("Stop Server (:8080)")
+                    Text("Stop Server (:\(model.openAIServer.port))")
                 }
             }
             .buttonStyle(.bordered)
@@ -232,7 +232,7 @@ struct OutputPaneView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.large)
-            .help("Start OpenAI-compatible API server on port 8080 with: \(model.openAIServer.latestCommandPreview)")
+            .help("Start OpenAI-compatible API server on port \(model.openAIServer.port) with: \(model.openAIServer.latestCommandPreview)")
         }
     }
 

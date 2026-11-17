@@ -55,6 +55,8 @@ public final class OpenAIServerManager {
         stopSync()
     }
 
+    public static let validPortRange = 1...65535
+
     public var isRunning: Bool {
         status.isRunning
     }
@@ -65,6 +67,14 @@ public final class OpenAIServerManager {
 
     public var serverURLString: String {
         "http://127.0.0.1:\(port)"
+    }
+
+    public var openAIBaseURLString: String {
+        "http://127.0.0.1:\(port)/v1"
+    }
+
+    public static func clampPort(_ candidate: Int) -> Int {
+        min(max(candidate, validPortRange.lowerBound), validPortRange.upperBound)
     }
 
     public var statusDescription: String {
@@ -111,6 +121,7 @@ public final class OpenAIServerManager {
         // Give caller a chance to unload internal model or coordinate state
         onBeforeStart?()
 
+        port = Self.clampPort(port)
         status = .starting(port: port)
         lastError = nil
 

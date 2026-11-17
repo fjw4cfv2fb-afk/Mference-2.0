@@ -17,6 +17,19 @@ import Testing
         #expect(manager.expertCacheSlots == 48)
         #expect(manager.verifyMode == "trusted-receipt")
         #expect(manager.serverURLString == "http://127.0.0.1:8080")
+        #expect(manager.openAIBaseURLString == "http://127.0.0.1:8080/v1")
+    }
+
+    @MainActor
+    @Test func openAIBaseURLAndPortUpdatesEndpointStrings() {
+        let manager = OpenAIServerManager()
+        manager.port = 8090
+        #expect(manager.serverURLString == "http://127.0.0.1:8090")
+        #expect(manager.openAIBaseURLString == "http://127.0.0.1:8090/v1")
+        #expect(manager.latestCommandPreview.contains("--port 8090"))
+        #expect(OpenAIServerManager.clampPort(0) == 1)
+        #expect(OpenAIServerManager.clampPort(70000) == 65535)
+        #expect(OpenAIServerManager.clampPort(18080) == 18080)
     }
 
     @MainActor
