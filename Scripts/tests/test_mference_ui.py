@@ -54,6 +54,14 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("--scratch-path /tmp/mference-test-build", result.stdout)
         self.assertIn("--resume", result.stdout)
 
+    def test_install_qwen36_mtp_dry_run_does_not_download(self):
+        result = self.run_launcher("--build-path", "/tmp/mference-test-build", "install", "qwen36-mtp", "--resume", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MferenceRepack --model qwen36", result.stdout)
+        self.assertIn("--attach-mtp", result.stdout)
+        self.assertIn("--apply-surgery", result.stdout)
+        self.assertIn("--resume", result.stdout)
+
     def test_isolated_data_and_doctor_dry_run(self):
         result = self.run_launcher("--data-dir", "/tmp/mference-test-data", "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)

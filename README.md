@@ -33,6 +33,24 @@
 
 > **Deep-Dive Guide:** See **[`MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md`](MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md)** for full technical documentation of the Qwen 3.6 MTP sidecar & hybrid PLD speculation stack (v5), lossless resident weight surgery, runtime/cache upgrades, and the complete Mference program architecture, plus **[`integrations/deepseek-harness/README.md`](integrations/deepseek-harness/README.md)** for the tuned DeepSeek Harness desktop profile.
 
+## What's New in Mference 2.0
+
+**Mference 2.0** extends upstream [NeelM0906/Mference](https://github.com/NeelM0906/Mference) (originally derived from [TurboFieldfare](https://github.com/drumih/turbo-fieldfare)) with a full speculative, surgical, and agentic-workflow stack for **Qwen 3.6 35B-A3B** on Apple Silicon:
+
+- **Native 19-Tensor MTP Draft Sidecar & Hybrid PLD Speculation (`v5`):**
+  - Attaches the 19-tensor [`guru87/Qwen3.6-35B-A3B-MTP`](https://huggingface.co/guru87/Qwen3.6-35B-A3B-MTP) draft layer (`MTPAttachTool`) and runs it natively on Metal (`Qwen36MTPSpeculator`) with a 4-slot Gated-DeltaNet rollback arena (`RealForwardRunner`).
+  - Combines **phase-aware adaptive `K`**, **lossless draft expert top-K pruning** (`moe.metal`), **EVICT logit-margin truncation** (`logit.metal` / `LMHeadChainInt4`), **zero-cost Prompt Lookup Decoding (PLD)** for verbatim code/tool-call spans, and **prefill-tail expert cache warm start**.
+- **Lossless Resident Weight Surgery (`MferenceRepack --apply-surgery`):**
+  - Calibrates `BF16` norms and `BF16` per-group affine `scale`/`bias` tables in `model_weights.bin` in place — **zero nibble re-quantization** — with automatic MTP block co-adaptation (`coAdaptMTP`).
+- **Agentic Reliability, Alignment & Multi-Slot Prefix Caching (`v5`):**
+  - `RepetitionLoopDetector`, clause-aware soft-landing `<think>`, `ServerIntentAligner` (`.zeroThinkFastPath` + 16 GiB RAM-aware `K` caps), hardened `QwenToolCallParser`/`StructuredAssistantDecoder`, and a **2-slot memory-bounded LRU `ServerPromptCache`** with `PrefixSnapshot` KV + GDN state switching across interleaved conversations.
+- **Tuned DeepSeek Harness Integration ([`integrations/deepseek-harness/`](integrations/deepseek-harness/README.md)):**
+  - Ships [`cordis.patch.yml`](integrations/deepseek-harness/cordis.patch.yml) with `600000` ms `timeoutMs`/`streamIdleTimeoutMs`, `32768` context / `16384` max output tokens, compact tool-spill/pruner limits, and fast macOS agentic rules.
+- **Measured Impact on Qwen 3.6 35B-A3B** ([`Scripts/eval_aa_scorecard.py`](Scripts/eval_aa_scorecard.py), [`benchmarks/aa-scorecard-v2.json`](benchmarks/aa-scorecard-v2.json), 32 expert slots, `--max-new 512`, `--temperature 0`):
+  - **Pass@1 Intelligence:** `25.0% (2/8)` baseline → **`100.0% (8/8)`** upgraded
+  - **MTP Acceptance & Efficiency:** `79.1%` → **`83.1%`** acceptance, **`-69.5%`** average `<think>` token waste (`413.4` → `126.1`)
+  - **Agentic (`A1`/`A2`) `v5` Speedup (matched-load control → `v5`):** `A1` decode **`+8.6%`** (`13.19 → 14.33 tok/s`, MTP `83.3%`), `A2` decode **`+7.6%`** (`14.09 → 15.16 tok/s`, MTP `88.5%`)
+
 <p align="center">
   <strong>Qwen3.8-Flash-Next, a 180B-parameter MoE: 24–210 prompt tok/s and 18.2–21.0 decode tok/s resident on M3 Ultra</strong><br>
   <strong>Qwen 3.6 on a 24 GB M5: 23.5–29.3 tok/s decode · on a 256 GB M3 Ultra: 36.1–42.2 tok/s</strong><br>
@@ -141,9 +159,18 @@ git clone https://github.com/fjw4cfv2fb-afk/Mference-2.0.git
 cd Mference-2.0
 ./mference-ui.sh doctor          # checks prerequisites without downloading or changing settings
 swift build -c release
-./mference-ui.sh install gemma4    # streams and repacks the pinned checkpoint (~14 GB)
-./mference-ui.sh                   # starts the server and the UI, opens http://127.0.0.1:3000
+
+# Option 1 (Mference 2.0 default): Install Qwen 3.6 + guru87 MTP sidecar + lossless weight surgery
+./mference-ui.sh install qwen36-mtp   # (or: ./Scripts/install-qwen36-mtp.sh)
+./mference-ui.sh                      # starts MferenceServer + Open WebUI at http://127.0.0.1:3000
+
+# Option 2: Install any upstream base checkpoint (e.g., gemma4 ~14 GB)
+./mference-ui.sh install gemma4
 ```
+
+> **Note:** Running `./mference-ui.sh install qwen36` installs only the unmodified base `mlx-community/Qwen3.6-35B-A3B-4bit` checkpoint. Use **`./mference-ui.sh install qwen36-mtp`** (or [`Scripts/install-qwen36-mtp.sh`](Scripts/install-qwen36-mtp.sh)) to download the verified `guru87/Qwen3.6-35B-A3B-MTP` shard, attach it, and apply the exact Mference 2.0 weight surgery profile automatically.
+>
+> **DeepSeek Harness users:** Copy [`integrations/deepseek-harness/cordis.patch.yml`](integrations/deepseek-harness/cordis.patch.yml) to `~/.dsh/profiles/desktop/cordis.patch.yml` (see [`integrations/deepseek-harness/README.md`](integrations/deepseek-harness/README.md)).
 
 First use is not instant: the build, pinned UI dependency installation, model
 download and integrity verification take time. Gemma's install is about 14 GB;
@@ -168,8 +195,8 @@ processes bind to loopback only and Open WebUI runs with authentication off,
 so do not expose either port. Details, model switching cost, and
 troubleshooting are in [docs/OPEN_WEBUI.md](docs/OPEN_WEBUI.md).
 
-Install more families the same way (`./mference-ui.sh install qwen36`,
-`maple`, `qwen38`, `deepseekv4flash`, `inklingsmall`, `qwen38flashnext`,
+Install more families the same way (`./mference-ui.sh install qwen36-mtp`,
+`qwen36`, `maple`, `qwen38`, `deepseekv4flash`, `inklingsmall`, `qwen38flashnext`,
 `minicpm5`, `glm53flash`),
 and they appear in the model picker. `./mference-ui.sh models` shows what the
 server would expose without loading anything.
@@ -181,12 +208,15 @@ model-level validation is required before treating it as a recommended replaceme
 From the command line, without the UI:
 
 ```bash
-# Install a model (streams and repacks; never materializes the full checkpoint)
+# Install Qwen 3.6 + MTP sidecar + lossless weight surgery (recommended Mference 2.0 setup)
+./Scripts/install-qwen36-mtp.sh
+
+# Or install an unmodified base checkpoint directly
 swift run -c release MferenceRepack --model qwen36 --output scratch/qwen36.gturbo
 
 # Generate
 swift run -c release MferenceCLI \
-  --model scratch/qwen36.gturbo \
+  --model scratch/qwen36-mtp.gturbo \
   --prompt "The capital of France is" \
   --max-new 64
 ```
@@ -321,11 +351,14 @@ another compatibility entry in a generic loader.
 
 | Product | Purpose |
 | --- | --- |
-| `Mference` | Swift library containing the runtime and Metal kernels |
+| `Mference` | Swift library containing the runtime, MTP/PLD speculators, and Metal kernels |
 | `MferenceCLI` | Command-line instruction chat and raw completion |
-| `MferenceServer` | OpenAI-compatible Chat Completions server and the engine behind the UI; loopback by default or a Tailnet address with `--bind tailnet`; `--library` lists every installed model and swaps in-process |
-| `mference-ui.sh` | Launcher: installs Open WebUI on first run, starts the server in library mode, opens the UI; `install <family>` and `models` subcommands |
-| `MferenceRepack` | Streaming model installer, quantize-in-flight repacker, and install verifier |
+| `MferenceServer` | OpenAI-compatible Chat Completions server (`127.0.0.1:8080`, `--bind tailnet`, `--library`) with `ServerIntentAligner` and 2-slot LRU `ServerPromptCache` |
+| `MferenceRepack` | Streaming model installer, quantize-in-flight repacker, `--attach-mtp`, `--apply-surgery`, and `--verify-install` |
+| `MferenceMac` (`Mference.app`) | Native SwiftUI macOS chat app + bundled OpenAI server toggle |
+| `mference-ui.sh` | Launcher: installs Open WebUI on first run, starts `MferenceServer`, opens the UI; supports `install qwen36-mtp`, `install <family>`, and `models` |
+| `Scripts/install-qwen36-mtp.sh` | One-command installer for Qwen 3.6 + verified `guru87` MTP shard + lossless resident weight surgery |
+| `integrations/deepseek-harness/` | DeepSeek Harness `cordis.patch.yml` profile (`timeoutMs: 600000`, `maxTokens: 16384`, agentic prompt/spill rules) |
 
 The Swift package builds four products; `mference-ui.sh` is the supported
 launcher that composes the server with Open WebUI.
@@ -436,10 +469,12 @@ portions are licensed under the [Apache License 2.0](LICENSE-APACHE); see
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details. New Mference
 code is [MIT-licensed](LICENSE).
 
-Model weights remain subject to their own terms: the
+Model weights and sidecars remain subject to their own terms: the
 [Gemma 4 license](https://ai.google.dev/gemma/apache_2), the
 [Qwen license](https://huggingface.co/Qwen/Qwen3.6-35B-A3B/blob/main/LICENSE)
-for Qwen 3.6, Qwen 3.8, and Qwen3.8-Flash-Next, and each pinned repository's
+for Qwen 3.6, Qwen 3.8, and Qwen3.8-Flash-Next (plus
+[`guru87/Qwen3.6-35B-A3B-MTP`](https://huggingface.co/guru87/Qwen3.6-35B-A3B-MTP)
+for the Qwen 3.6 MTP shard), and each pinned repository's
 own terms for DeepSeek-V4-Flash and Inkling-Small. MiniCPM5-2B is
 [Apache-2.0](https://github.com/OpenBMB/MiniCPM/blob/main/LICENSE) from
 OpenBMB. Maple's pinned checkpoint

@@ -353,6 +353,14 @@ cmd_doctor() {
 }
 
 cmd_install() {
+  if [[ "$install_family" == "qwen36-mtp" ]]; then
+    local helper="$repository_root/Scripts/install-qwen36-mtp.sh"
+    [[ -x "$helper" ]] || fail "missing executable installer at $helper"
+    local helper_args=(--build-path "$build_path")
+    if [[ "$dry_run" -eq 1 ]]; then helper_args+=(--dry-run); fi
+    if [[ ${#repack_arguments[@]} -gt 0 ]]; then helper_args+=("${repack_arguments[@]}"); fi
+    exec "$helper" "${helper_args[@]}"
+  fi
   local output="scratch/$install_family.gturbo"
   # bash 3.2 is what /usr/bin/env bash is on macOS, and there `"${empty[@]}"`
   # is an unbound-variable error under `set -u`, so every pass-through
