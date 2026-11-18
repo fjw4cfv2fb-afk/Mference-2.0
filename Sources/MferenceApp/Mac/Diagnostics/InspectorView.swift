@@ -343,7 +343,7 @@ private struct OpenAIServerInspectorSection: View {
 
     @ViewBuilder
     private var networkAndIdentityControls: some View {
-        ExplainedSetting(explanation: "TCP port clients connect to (`http://<host>:<port>/v1`). Change this if port 8080 is already taken.") {
+        ExplainedSetting(explanation: "Local TCP port (`http://127.0.0.1:<port>/v1`). Change this if port 8080 is already taken.") {
             LabeledContent("Port") {
                 TextField("8080", text: $portInput)
                     .textFieldStyle(.roundedBorder)
@@ -365,19 +365,6 @@ private struct OpenAIServerInspectorSection: View {
                         server.port = clamped
                         portInput = String(clamped)
                     }
-            }
-        }
-
-        ExplainedSetting(explanation: "Loopback restricts the API to this Mac (127.0.0.1). Tailnet binds your Tailscale IPv4 so your other devices can reach it (requires Tailscale running).") {
-            LabeledContent("Bind") {
-                Picker("Bind", selection: $server.bindMode) {
-                    ForEach(OpenAIServerBindMode.allCases) { mode in
-                        Text(mode.label).tag(mode.rawValue)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
             }
         }
 
@@ -478,38 +465,10 @@ private struct OpenAIServerInspectorSection: View {
             }
         }
 
-        ExplainedSetting(explanation: "Auto runs the 19-tensor MTP drafter + zero-cost n-gram PLD at temp=0 for faster multi-token decode with identical greedy output. Off falls back to 1 token/step.") {
-            LabeledContent("Speculation") {
-                Picker("Speculation", selection: $server.specMode) {
-                    ForEach(OpenAIServerSpecMode.allCases) { mode in
-                        Text(mode.label).tag(mode)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
-            }
-        }
-
-        ExplainedSetting(explanation: "Dynamically tunes draft depth K (1–3) by acceptance rate, thinking/code phase, and free RAM. Off locks a fixed draft depth.") {
-            Toggle("Adaptive K", isOn: $server.adaptiveDrafting)
+        ExplainedSetting(explanation: "Runs the fastest v5 speculative profile (19-tensor MTP + hybrid PLD, Top-6 draft routing, EVICT margin truncation, capped at K <= 2 so extra draft tokens never trigger MoE verify slowdowns; lossless at temp=0). Off falls back to 1 token/step.") {
+            Toggle("MTP Speculation", isOn: $server.speculationEnabled)
                 .toggleStyle(.switch)
                 .tint(MferenceMacTheme.accentColor)
-                .disabled(server.specMode == .off)
-        }
-
-        ExplainedSetting(explanation: "Experts routed inside the MTP draft step (4 = fastest draft, 6 = balanced, 8 = highest acceptance). Lossless: verification always uses full top-8.") {
-            LabeledContent("MTP Draft Top-K") {
-                Picker("MTP Draft Top-K", selection: $server.mtpTopK) {
-                    ForEach(OpenAIServerSettings.allowedMTPTopK, id: \.self) { k in
-                        Text("Top-\(k)").tag(k)
-                    }
-                }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
-                .disabled(server.specMode != .auto)
-            }
         }
 
         ExplainedSetting(explanation: "Enables repetition loop guards, proportional <think> limits, zero-think fast path on short prompts, and 16 GiB RAM K-caps. Off runs raw unguided generation.") {

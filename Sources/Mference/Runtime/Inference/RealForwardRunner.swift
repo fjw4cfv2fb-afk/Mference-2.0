@@ -1965,9 +1965,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         var slotCap: Int
                         if cfg.topKExperts > 0, let slots = model.routedExpertCacheSlotCount(layer: 0) {
                             let rawCap = max(1, (slots / cfg.topKExperts) - 1)
-                            // Cap adaptive draft depth at K = 2 unless expertCacheSlots >= 48 so
-                            // 4-token MoE verify does not amplify expert-cache streaming latency.
-                            slotCap = slots >= 48 ? min(3, rawCap) : min(2, rawCap)
+                            // Cap adaptive draft depth at K = 2 so 4-token MoE verify does not
+                            // amplify expert-cache streaming latency.
+                            slotCap = min(2, rawCap)
                         } else {
                             slotCap = 2
                         }
