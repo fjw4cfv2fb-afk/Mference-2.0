@@ -153,7 +153,8 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         }
     }
 
-    /// The descriptor the app products select at launch. Defaults to Gemma 4.
+    /// The descriptor the app products select at launch. Defaults to Qwen 3.6
+    /// (`qwen36-mtp.gturbo` when present, else `qwen36.gturbo`).
     /// `MFERENCE_MODEL` in the environment wins; otherwise the persisted
     /// `Mference model` preference applies, so GUI launches without an
     /// environment can select another supported family.
@@ -162,12 +163,13 @@ public struct AppModelInstallDescriptor: Equatable, Sendable {
         let preferenceValue = UserDefaults(suiteName: "Mference")?
             .string(forKey: "model")
         switch environmentValue ?? preferenceValue {
+        case "gemma4": return .default
         case "qwen36": return .qwen36
         case "qwen38": return .qwen38
         case "deepseekv4flash", "dsv4": return .deepseekV4Flash
         case "inklingsmall", "inkling": return .inklingSmall
         case "maple": return .maple
-        default: return .default
+        default: return .qwen36
         }
     }
 }

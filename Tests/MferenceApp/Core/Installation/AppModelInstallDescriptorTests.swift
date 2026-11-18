@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 import Mference
 @testable import MferenceAppCore
@@ -28,6 +29,13 @@ import Mference
             #expect(AppModelInstallDescriptor.descriptor(for: family) == descriptor)
             #expect(descriptor.family == family)
             #expect(descriptor.installDirectoryName.hasSuffix(".gturbo"))
+        }
+    }
+
+    @Test func selectedDefaultsToQwen36WhenUnset() {
+        if ProcessInfo.processInfo.environment["MFERENCE_MODEL"] == nil,
+           UserDefaults(suiteName: "Mference")?.string(forKey: "model") == nil {
+            #expect(AppModelInstallDescriptor.selected == .qwen36)
         }
     }
 }

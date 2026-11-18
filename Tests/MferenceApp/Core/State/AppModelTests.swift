@@ -4,22 +4,26 @@ import Testing
 
 @Suite struct AppModelTests {
     @MainActor
-    @Test func defaultsUseSampledRequest() throws {
+    @Test func defaultsEnableGreedyMTPWith32KContextAnd48Slots() throws {
         let model = AppModel()
         model.modelPathText = FileManager.default.temporaryDirectory.path
         model.promptText = "go"
 
         let request = try model.makeRequest()
-        #expect(request.temperature == 0.2)
+        #expect(request.temperature == 0)
         #expect(request.topK == 64)
         #expect(request.topP == 0.95)
-        #expect(request.maxNewTokens == 4_096)
+        #expect(request.maxNewTokens == 32_768)
+        #expect(request.maxContextTokens == 32_768)
         #expect(request.repetitionPenalty == 1)
-        #expect(!request.isPureGreedy)
-        #expect(request.runtimeOptions.expertCacheSlots == 16)
+        #expect(request.isPureGreedy)
+        #expect(request.runtimeOptions.expertCacheSlots == 48)
         #expect(request.runtimeOptions.expertCachePolicy == .lfu)
         #expect(request.runtimeOptions.rdadvisePolicy == .off)
         #expect(request.runtimeOptions.prefillEnabled)
+
+        model.temperature = 0.2
+        #expect(try !model.makeRequest().isPureGreedy)
     }
 
     @MainActor

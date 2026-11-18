@@ -83,6 +83,7 @@ Defined in [`Package.swift`](Package.swift):
 - **`MferenceServerCore` / `MferenceServer`** — SwiftNIO OpenAI-compatible HTTP/SSE server (`HTTPServer`, `ServerIntentAligner`, 2-slot LRU `ServerPromptCache`, `ServerModelDiscovery`).
 - **`MferenceCLICore` / `MferenceCLI`** — Terminal chat and raw-completion executable.
 - **`MferenceAppCore` / `MferenceDecodeProtocol` / `MferenceDecodeService` / `MferenceMacPresentation` / `MferenceMac`** — Native SwiftUI macOS app isolating model execution inside `MferenceDecodeService` over length-framed IPC (`OpenAIServerManager` also manages the local server process).
+- **`Scripts/install-qwen36-mtp.sh` / `Scripts/build-app.sh`** — One-command Qwen 3.6 + MTP + weight surgery installer and signed `~/Applications/Mference.app` desktop bundle packager.
 - **`integrations/deepseek-harness/`** — DeepSeek Harness profile patch (`cordis.patch.yml`) configuring the `mference` provider (`timeoutMs: 600000`, `streamIdleTimeoutMs: 600000`, `defaultContextWindow: 32768`, `defaultMaxTokens: 16384`), bounded tool output/pruning (`spill-policy`, `tool-fs`, `tool-result-pruner`), and fast macOS `persona` rules.
 
 ### Core Mechanisms
@@ -135,6 +136,9 @@ swift build -c release
 
 # Launch MferenceServer + Open WebUI at http://127.0.0.1:3000
 ./mference-ui.sh
+
+# Optional: package the native macOS desktop app at ~/Applications/Mference.app
+./Scripts/build-app.sh
 ```
 
 > **Important:** `./mference-ui.sh install qwen36` installs only the unmodified base [`mlx-community/Qwen3.6-35B-A3B-4bit`](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit) checkpoint without MTP or weight surgery. Use **`./mference-ui.sh install qwen36-mtp`** (or [`Scripts/install-qwen36-mtp.sh`](Scripts/install-qwen36-mtp.sh)) to get the complete Mference 2.0 setup (resumable with `--resume`).

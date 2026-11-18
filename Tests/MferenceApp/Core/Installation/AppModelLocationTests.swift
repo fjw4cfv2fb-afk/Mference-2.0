@@ -68,4 +68,35 @@ import Testing
             fileExists: { _ in false })
         #expect(result.path == "/support/Mference/gemma4.gturbo")
     }
+
+    @Test func qwen36PrefersUpgradedMTPDirectoryWhenPresent() {
+        let files: Set<String> = [
+            "/repo/Package.swift",
+            "/repo/Sources/MferenceApp/Mac",
+            "/repo/scratch/qwen36-mtp.gturbo/manifest.json",
+        ]
+        let result = AppModelLocation.resolve(
+            explicitURL: nil,
+            executableURL: nil,
+            currentDirectoryURL: URL(fileURLWithPath: "/repo"),
+            applicationSupportURL: URL(fileURLWithPath: "/support"),
+            fileExists: files.contains,
+            installDirectoryName: AppModelInstallDescriptor.qwen36.installDirectoryName)
+        #expect(result.path == "/repo/scratch/qwen36-mtp.gturbo")
+    }
+
+    @Test func standaloneAppFindsDocumentsScratchQwen36MTP() {
+        let files: Set<String> = [
+            "/docs-repo/scratch/qwen36-mtp.gturbo/manifest.json",
+        ]
+        let result = AppModelLocation.resolve(
+            explicitURL: nil,
+            executableURL: URL(fileURLWithPath: "/Users/test/Applications/Mference.app/Contents/MacOS/MferenceMac"),
+            currentDirectoryURL: URL(fileURLWithPath: "/"),
+            applicationSupportURL: URL(fileURLWithPath: "/support"),
+            fileExists: files.contains,
+            installDirectoryName: AppModelInstallDescriptor.qwen36.installDirectoryName,
+            documentsRepoURL: URL(fileURLWithPath: "/docs-repo"))
+        #expect(result.path == "/docs-repo/scratch/qwen36-mtp.gturbo")
+    }
 }

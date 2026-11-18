@@ -21,6 +21,8 @@ public enum AppModelLocation {
             in: .userDomainMask,
             appropriateFor: nil,
             create: false)) ?? fileManager.homeDirectoryForCurrentUser
+        let documentsRepo = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/Mference", isDirectory: true)
         return resolve(
             explicitURL: preferredURL(userDefaults: userDefaults),
             executableURL: Bundle.main.executableURL,
@@ -28,7 +30,8 @@ public enum AppModelLocation {
                                      isDirectory: true),
             applicationSupportURL: applicationSupport,
             fileExists: fileManager.fileExists(atPath:),
-            installDirectoryName: descriptor.installDirectoryName)
+            installDirectoryName: descriptor.installDirectoryName,
+            documentsRepoURL: documentsRepo)
     }
 
     private static func preferredURL(userDefaults: UserDefaults) -> URL? {
@@ -39,6 +42,35 @@ public enum AppModelLocation {
         return URL(fileURLWithPath: path, isDirectory: true)
     }
 
+    private static func preferredModelDirectory(
+        in container: URL,
+        installDirectoryName: String,
+        fileExists: (String) -> Bool
+    ) -> URL {
+        if installDirectoryName == "qwen36.gturbo" {
+            let mtpURL = container.appendingPathComponent("qwen36-mtp.gturbo", isDirectory: true)
+            let mtpManifest = mtpURL.appendingPathComponent("manifest.json").path
+            if fileExists(mtpManifest) || fileExists(mtpURL.path) {
+                return mtpURL.standardizedFileURL
+            }
+        }
+        return container.appendingPathComponent(installDirectoryName, isDirectory: true)
+            .standardizedFileURL
+    }
+
+    private static func existingModelDirectory(
+        in container: URL,
+        installDirectoryName: String,
+        fileExists: (String) -> Bool
+    ) -> URL? {
+        let candidate = preferredModelDirectory(
+            in: container,
+            installDirectoryName: installDirectoryName,
+            fileExists: fileExists)
+        let manifest = candidate.appendingPathComponent("manifest.json").path
+        return fileExists(manifest) ? candidate : nil
+    }
+
     // The default mirrors `AppModelInstallDescriptor.default.installDirectoryName`;
     // callers with a selected descriptor (qwen36.gturbo, deepseekv4flash.gturbo)
     // always pass its directory name explicitly.
@@ -47,24 +79,44 @@ public enum AppModelLocation {
                         currentDirectoryURL: URL,
                         applicationSupportURL: URL,
                         fileExists: (String) -> Bool,
-                        installDirectoryName: String = "gemma4.gturbo") -> URL {
+                        installDirectoryName: String = "gemma4.gturbo",
+                        documentsRepoURL: URL? = nil) -> URL {
         if let explicitURL {
             return absoluteURL(explicitURL, relativeTo: currentDirectoryURL)
         }
         if let executableURL,
            let root = packageRoot(startingAt: executableURL.deletingLastPathComponent(),
                                   fileExists: fileExists) {
-            return root.appendingPathComponent("scratch/\(installDirectoryName)", isDirectory: true)
-                .standardizedFileURL
+            return preferredModelDirectory(
+                in: root.appendingPathComponent("scratch", isDirectory: true),
+                installDirectoryName: installDirectoryName,
+                fileExists: fileExists)
         }
         if let root = packageRoot(startingAt: currentDirectoryURL, fileExists: fileExists) {
-            return root.appendingPathComponent("scratch/\(installDirectoryName)", isDirectory: true)
-                .standardizedFileURL
+            return preferredModelDirectory(
+                in: root.appendingPathComponent("scratch", isDirectory: true),
+                installDirectoryName: installDirectoryName,
+                fileExists: fileExists)
         }
-        return applicationSupportURL
+        let appSupportMference = applicationSupportURL
             .appendingPathComponent("Mference", isDirectory: true)
-            .appendingPathComponent(installDirectoryName, isDirectory: true)
-            .standardizedFileURL
+        if let existing = existingModelDirectory(
+            in: appSupportMference,
+            installDirectoryName: installDirectoryName,
+            fileExists: fileExists) {
+            return existing
+        }
+        if let documentsRepoURL,
+           let existing = existingModelDirectory(
+               in: documentsRepoURL.appendingPathComponent("scratch", isDirectory: true),
+               installDirectoryName: installDirectoryName,
+               fileExists: fileExists) {
+            return existing
+        }
+        return preferredModelDirectory(
+            in: appSupportMference,
+            installDirectoryName: installDirectoryName,
+            fileExists: fileExists)
     }
 
     private static func absoluteURL(_ url: URL, relativeTo base: URL) -> URL {
