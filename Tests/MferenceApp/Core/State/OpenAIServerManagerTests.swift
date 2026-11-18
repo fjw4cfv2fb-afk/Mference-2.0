@@ -72,4 +72,121 @@ import Testing
         model.stopOpenAIServer()
         #expect(!model.openAIServer.isRunning)
     }
+
+    @MainActor
+    @Test func commandAndEnvironmentReflectEditedServerSettingsAndReset() {
+        let manager = OpenAIServerManager()
+        #expect(manager.environmentOverrides.isEmpty)
+
+        manager.apply(OpenAIServerSettings(
+            port: 9090,
+            bindMode: .tailnet,
+            modelId: "custom-qwen",
+            maxContext: 65_536,
+            expertCacheSlots: 96,
+            prefillChunk: 4_096,
+            promptCacheMode: .off,
+            queueLimit: 2,
+            verifyMode: .fullSha256,
+            specMode: .auto,
+            adaptiveDrafting: false,
+            mtpTopK: 4,
+            intentAlignerEnabled: false))
+
+        let cmd = manager.latestCommandPreview
+        #expect(cmd.contains("MFERENCE_INTENT_ALIGN=0"))
+        #expect(cmd.contains("MFERENCE_MTP_TOP_K=4"))
+        #expect(cmd.contains("MFERENCE_SPEC_ADAPTIVE=0"))
+        #expect(cmd.contains("--port 9090"))
+        #expect(cmd.contains("--bind tailnet"))
+        #expect(cmd.contains("--model-id custom-qwen"))
+        #expect(cmd.contains("--max-context 65536"))
+        #expect(cmd.contains("--queue-limit 2"))
+        #expect(cmd.contains("--prefill-chunk 4096"))
+        #expect(cmd.contains("--prompt-cache-mode off"))
+        #expect(cmd.contains("--expert-cache-slots 96"))
+        #expect(cmd.contains("--verify full-sha256"))
+        #expect(manager.openAIBaseURLString == "http://<tailnet-ip>:9090/v1")
+
+        manager.specMode = .pld
+        #expect(manager.environmentOverrides["MFERENCE_SPEC"] == "pld")
+        #expect(manager.environmentOverrides["MFERENCE_MTP"] == "0")
+
+        manager.resetToDefaults()
+        #expect(manager.currentSettings == OpenAIServerSettings())
+        #expect(manager.environmentOverrides.isEmpty)
+        #expect(manager.openAIBaseURLString == "http://127.0.0.1:8080/v1")
+    }
+
+    @Test func serverSettingsNormalizeInvalidValuesAndPersist() throws {
+        let invalid = OpenAIServerSettings(
+            port: 999_999,
+            modelId: "   ",
+            maxContext: 1234,
+            expertCacheSlots: 17,
+            prefillChunk: 99,
+            queueLimit: 0,
+            mtpTopK: 5)
+        #expect(!invalid.isValid())
+        let normalized = invalid.normalized()
+        #expect(normalized.isValid())
+        #expect(normalized.port == 65_535)
+        #expect(normalized.modelId == OpenAIServerSettings.defaultModelId)
+        #expect(normalized.maxContext == 32_768)
+        #expect(normalized.expertCacheSlots == 48)
+        #expect(normalized.prefillChunk == 2_048)
+        #expect(normalized.queueLimit == 4)
+        #expect(normalized.mtpTopK == 6)
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OpenAIServerSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDir = root.appendingPathComponent("qwen36-mtp.gturbo", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+
+        let defaults = OpenAIServerSettingsFileStore.loadOrCreate(forModelDirectory: modelDir)
+        #expect(defaults == OpenAIServerSettings())
+
+        let custom = OpenAIServerSettings(
+            port: 8181,
+            bindMode: .loopback,
+            modelId: "qwen-custom",
+            maxContext: 16_384,
+            expertCacheSlots: 64,
+            prefillChunk: 1_024,
+            promptCacheMode: .off,
+            queueLimit: 8,
+            verifyMode: .fullSha256,
+            specMode: .off,
+            adaptiveDrafting: false,
+            mtpTopK: 8,
+            intentAlignerEnabled: false)
+        try OpenAIServerSettingsFileStore.save(custom, forModelDirectory: modelDir)
+        let reloaded = OpenAIServerSettingsFileStore.loadOrCreate(forModelDirectory: modelDir)
+        #expect(reloaded == custom)
+    }
+
+    @MainActor
+    @Test func appModelPersistsAndResetsServerSettings() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AppModelServerSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let modelDir = root.appendingPathComponent("qwen36-mtp.gturbo", isDirectory: true)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+
+        let model = AppModel(modelDirectory: modelDir, settingsPersistenceEnabled: true)
+        model.openAIServer.port = 8282
+        model.openAIServer.prefillChunk = 4_096
+        model.openAIServer.specMode = .pld
+        model.saveOpenAIServerSettings()
+
+        let relaunched = AppModel(modelDirectory: modelDir, settingsPersistenceEnabled: true)
+        #expect(relaunched.openAIServer.port == 8282)
+        #expect(relaunched.openAIServer.prefillChunk == 4_096)
+        #expect(relaunched.openAIServer.specMode == .pld)
+
+        relaunched.resetOpenAIServerSettings()
+        let afterReset = AppModel(modelDirectory: modelDir, settingsPersistenceEnabled: true)
+        #expect(afterReset.openAIServer.currentSettings == OpenAIServerSettings())
+    }
 }

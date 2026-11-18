@@ -109,8 +109,10 @@ public final class AppModel {
         self.settingsPersistenceEnabled = settingsPersistenceEnabled
         self.installETAClock = installETAClock
         self.installETAOrigin = installETAClock.now
-        self.openAIServer.expertCacheSlots = settings.expertCacheSlots
-        self.openAIServer.maxContext = settings.contextTokens
+        let serverSettings = settingsPersistenceEnabled
+            ? OpenAIServerSettingsFileStore.loadOrCreate(forModelDirectory: directory)
+            : OpenAIServerSettings()
+        self.openAIServer.apply(serverSettings)
         refreshInstallReadiness()
         synchronizeOutputWithSelectedChat()
         if let recoveryURL = chatLoadResult.recoveryURL {
@@ -414,9 +416,20 @@ public final class AppModel {
         if canUnloadModel {
             unloadModel()
         }
-        openAIServer.expertCacheSlots = runtimeOptions.expertCacheSlots
-        openAIServer.maxContext = maxContextTokens
+        saveOpenAIServerSettings()
         openAIServer.start(modelPath: modelPathText)
+    }
+
+    public func saveOpenAIServerSettings() {
+        guard settingsPersistenceEnabled else { return }
+        try? OpenAIServerSettingsFileStore.save(
+            openAIServer.currentSettings,
+            forModelDirectory: URL(fileURLWithPath: modelPathText))
+    }
+
+    public func resetOpenAIServerSettings() {
+        openAIServer.resetToDefaults()
+        saveOpenAIServerSettings()
     }
 
     public func stopOpenAIServer() {

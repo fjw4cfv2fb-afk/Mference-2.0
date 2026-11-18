@@ -23,13 +23,21 @@ public enum OpenAIServerStatus: Equatable, Sendable {
 public final class OpenAIServerManager {
     public private(set) var status: OpenAIServerStatus = .stopped
     public private(set) var lastError: String?
+    public private(set) var activeTailnetHost: String?
+
     public var port: Int = 8080
-    public var modelId: String = "qwen3.6-35b-a3b"
+    public var bindMode: String = OpenAIServerBindMode.loopback.rawValue
+    public var modelId: String = OpenAIServerSettings.defaultModelId
     public var maxContext: Int = 32768
     public var prefillChunk: Int = 2048
-    public var promptCacheMode: String = "single-prefix"
+    public var promptCacheMode: String = OpenAIServerPromptCacheMode.singlePrefix.rawValue
     public var expertCacheSlots: Int = 48
-    public var verifyMode: String = "trusted-receipt"
+    public var queueLimit: Int = 4
+    public var verifyMode: String = OpenAIServerVerifyMode.trustedReceipt.rawValue
+    public var specMode: OpenAIServerSpecMode = .auto
+    public var adaptiveDrafting: Bool = true
+    public var mtpTopK: Int = 6
+    public var intentAlignerEnabled: Bool = true
 
     private var process: Process?
     private var healthCheckTask: Task<Void, Never>?
@@ -65,16 +73,104 @@ public final class OpenAIServerManager {
         status.isStarting
     }
 
+    public var resolvedBindMode: OpenAIServerBindMode {
+        OpenAIServerBindMode(rawValue: bindMode) ?? .loopback
+    }
+
+    public var resolvedPromptCacheMode: OpenAIServerPromptCacheMode {
+        OpenAIServerPromptCacheMode(rawValue: promptCacheMode) ?? .singlePrefix
+    }
+
+    public var resolvedVerifyMode: OpenAIServerVerifyMode {
+        OpenAIServerVerifyMode(rawValue: verifyMode) ?? .trustedReceipt
+    }
+
+    public var effectiveModelId: String {
+        let trimmed = modelId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? OpenAIServerSettings.defaultModelId : trimmed
+    }
+
+    public var displayHost: String {
+        switch resolvedBindMode {
+        case .loopback:
+            return "127.0.0.1"
+        case .tailnet:
+            return activeTailnetHost ?? "<tailnet-ip>"
+        }
+    }
+
     public var serverURLString: String {
-        "http://127.0.0.1:\(port)"
+        "http://\(displayHost):\(port)"
     }
 
     public var openAIBaseURLString: String {
-        "http://127.0.0.1:\(port)/v1"
+        "http://\(displayHost):\(port)/v1"
+    }
+
+    public var currentSettings: OpenAIServerSettings {
+        OpenAIServerSettings(
+            port: port,
+            bindMode: resolvedBindMode,
+            modelId: modelId,
+            maxContext: maxContext,
+            expertCacheSlots: expertCacheSlots,
+            prefillChunk: prefillChunk,
+            promptCacheMode: resolvedPromptCacheMode,
+            queueLimit: queueLimit,
+            verifyMode: resolvedVerifyMode,
+            specMode: specMode,
+            adaptiveDrafting: adaptiveDrafting,
+            mtpTopK: mtpTopK,
+            intentAlignerEnabled: intentAlignerEnabled
+        ).normalized()
+    }
+
+    public func apply(_ settings: OpenAIServerSettings) {
+        let clean = settings.normalized()
+        port = clean.port
+        bindMode = clean.bindMode.rawValue
+        modelId = clean.modelId
+        maxContext = clean.maxContext
+        expertCacheSlots = clean.expertCacheSlots
+        prefillChunk = clean.prefillChunk
+        promptCacheMode = clean.promptCacheMode.rawValue
+        queueLimit = clean.queueLimit
+        verifyMode = clean.verifyMode.rawValue
+        specMode = clean.specMode
+        adaptiveDrafting = clean.adaptiveDrafting
+        mtpTopK = clean.mtpTopK
+        intentAlignerEnabled = clean.intentAlignerEnabled
+    }
+
+    public func resetToDefaults() {
+        apply(OpenAIServerSettings())
     }
 
     public static func clampPort(_ candidate: Int) -> Int {
         min(max(candidate, validPortRange.lowerBound), validPortRange.upperBound)
+    }
+
+    public var environmentOverrides: [String: String] {
+        var env: [String: String] = [:]
+        switch specMode {
+        case .auto:
+            break
+        case .pld:
+            env["MFERENCE_SPEC"] = "pld"
+            env["MFERENCE_MTP"] = "0"
+        case .off:
+            env["MFERENCE_SPEC"] = "off"
+        }
+        if specMode != .off && !adaptiveDrafting {
+            env["MFERENCE_SPEC_ADAPTIVE"] = "0"
+        }
+        if specMode == .auto && mtpTopK != 6 {
+            env["MFERENCE_MTP_TOP_K"] = "\(mtpTopK)"
+        }
+        if !intentAlignerEnabled {
+            env["MFERENCE_INTENT_ALIGN"] = "0"
+        }
+        return env
     }
 
     public var statusDescription: String {
@@ -98,7 +194,20 @@ public final class OpenAIServerManager {
         let resolved = Self.resolveModelPath(candidate: modelPath)
         let ctx = maxContext ?? self.maxContext
         let slots = expertCacheSlots ?? self.expertCacheSlots
-        return ".build/release/MferenceServer --model \(resolved) --port \(port) --bind loopback --model-id \(modelId) --max-context \(ctx) --prefill-chunk \(prefillChunk) --prompt-cache-mode \(promptCacheMode) --expert-cache-slots \(slots) --verify \(verifyMode)"
+        let envPrefix = environmentOverrides
+            .sorted(by: { $0.key < $1.key })
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: " ")
+        let prefix = envPrefix.isEmpty ? "" : "\(envPrefix) "
+        return "\(prefix).build/release/MferenceServer --model \(Self.shellQuote(resolved)) --port \(Self.clampPort(port)) --bind \(resolvedBindMode.rawValue) --model-id \(Self.shellQuote(effectiveModelId)) --max-context \(ctx) --queue-limit \(max(1, queueLimit)) --prefill-chunk \(prefillChunk) --prompt-cache-mode \(resolvedPromptCacheMode.rawValue) --expert-cache-slots \(slots) --verify \(resolvedVerifyMode.rawValue)"
+    }
+
+    private static func shellQuote(_ value: String) -> String {
+        let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "/._-:@"))
+        if !value.isEmpty && value.unicodeScalars.allSatisfy(safe.contains) {
+            return value
+        }
+        return "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     public var latestCommandPreview: String {
@@ -121,7 +230,9 @@ public final class OpenAIServerManager {
         // Give caller a chance to unload internal model or coordinate state
         onBeforeStart?()
 
-        port = Self.clampPort(port)
+        apply(currentSettings)
+        let resolvedTailnet = (resolvedBindMode == .tailnet) ? Self.resolveTailscaleIPv4() : nil
+        activeTailnetHost = resolvedTailnet
         status = .starting(port: port)
         lastError = nil
 
@@ -143,14 +254,23 @@ public final class OpenAIServerManager {
         proc.arguments = [
             "--model", resolvedModelPath,
             "--port", "\(port)",
-            "--bind", "loopback",
-            "--model-id", modelId,
+            "--bind", resolvedBindMode.rawValue,
+            "--model-id", effectiveModelId,
             "--max-context", "\(maxContext)",
+            "--queue-limit", "\(max(1, queueLimit))",
             "--prefill-chunk", "\(prefillChunk)",
-            "--prompt-cache-mode", promptCacheMode,
+            "--prompt-cache-mode", resolvedPromptCacheMode.rawValue,
             "--expert-cache-slots", "\(expertCacheSlots)",
-            "--verify", verifyMode,
+            "--verify", resolvedVerifyMode.rawValue,
         ]
+        let overrides = environmentOverrides
+        if !overrides.isEmpty {
+            var env = ProcessInfo.processInfo.environment
+            for (k, v) in overrides {
+                env[k] = v
+            }
+            proc.environment = env
+        }
 
         let errPipe = Pipe()
         proc.standardError = errPipe
@@ -162,6 +282,7 @@ public final class OpenAIServerManager {
                 guard let self else { return }
                 if self.process === p {
                     self.process = nil
+                    self.activeTailnetHost = nil
                     if case .running = self.status {
                         self.status = .stopped
                     } else if case .starting = self.status {
@@ -178,8 +299,9 @@ public final class OpenAIServerManager {
         do {
             try proc.run()
             self.process = proc
+            let targetHost = (resolvedBindMode == .tailnet) ? (resolvedTailnet ?? "127.0.0.1") : "127.0.0.1"
             let targetPort = self.port
-            let currentModelId = self.modelId
+            let currentModelId = self.effectiveModelId
             let targetPID = proc.processIdentifier
 
             // Launch background task to poll health until server responds
@@ -193,7 +315,7 @@ public final class OpenAIServerManager {
                     if self.process == nil || !proc.isRunning {
                         return
                     }
-                    if await Self.checkHealth(port: targetPort) {
+                    if await Self.checkHealth(host: targetHost, port: targetPort) {
                         self.status = .running(port: targetPort, pid: targetPID, modelId: currentModelId)
                         return
                     }
@@ -206,6 +328,7 @@ public final class OpenAIServerManager {
                 }
             }
         } catch {
+            activeTailnetHost = nil
             status = .failed("Failed to launch process: \(error.localizedDescription)")
             lastError = error.localizedDescription
             self.process = nil
@@ -229,6 +352,7 @@ public final class OpenAIServerManager {
                 }
             }
         }
+        activeTailnetHost = nil
         status = .stopped
     }
 
@@ -238,6 +362,7 @@ public final class OpenAIServerManager {
         let proc = process
         process = nil
         Self.terminateProcess(proc)
+        activeTailnetHost = nil
         status = .stopped
     }
 
@@ -287,7 +412,12 @@ public final class OpenAIServerManager {
 
     /// Probes the server health endpoint.
     public static func checkHealth(port: Int) async -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/health") else { return false }
+        await checkHealth(host: "127.0.0.1", port: port)
+    }
+
+    /// Probes the server health endpoint on an explicit host.
+    public static func checkHealth(host: String, port: Int) async -> Bool {
+        guard let url = URL(string: "http://\(host):\(port)/health") else { return false }
         var request = URLRequest(url: url)
         request.timeoutInterval = 0.5
         do {
@@ -302,6 +432,27 @@ public final class OpenAIServerManager {
             return false
         }
         return false
+    }
+
+    private static func resolveTailscaleIPv4() -> String? {
+        let proc = Process()
+        let out = Pipe()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        proc.arguments = ["tailscale", "ip", "-4"]
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            proc.waitUntilExit()
+            guard proc.terminationStatus == 0,
+                  let text = String(data: data, encoding: .utf8) else { return nil }
+            let fields = text.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 1 else { return nil }
+            return String(fields[0])
+        } catch {
+            return nil
+        }
     }
 
     /// Locates the `MferenceServer` executable across common bundle and build locations.

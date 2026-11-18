@@ -181,7 +181,7 @@ struct OutputPaneView: View {
                     Circle()
                         .fill(Color.blue)
                         .frame(width: 8, height: 8)
-                    Text("OpenAI Server active at http://127.0.0.1:\(model.openAIServer.port)/v1 (model: \(model.openAIServer.modelId))")
+                    Text("OpenAI Server active at \(model.openAIServer.openAIBaseURLString) (model: \(model.openAIServer.effectiveModelId))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
