@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="460" viewBox="0 0 900 460" role="img" aria-label="Animated side-by-side Mference 2.0 Qwen 3.6 35B-A3B streaming, 16 GB unified memory, and MTP+PLD demo">
+  <defs>
+    <linearGradient id="topBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2ea043"/>
+      <stop offset="50%" stop-color="#388bfd"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+    <clipPath id="codeClip">
+      <rect x="36" y="138" width="472" height="252"/>
+    </clipPath>
+  </defs>
+
+  <style>
+    @keyframes revealLine {
+      0%, 8% { opacity: 0; }
+      14%, 92% { opacity: 1; }
+      100% { opacity: 0; }
+    }
+    @keyframes cursorBlink {
+      0%, 49% { opacity: 1; }
+      50%, 100% { opacity: 0.15; }
+    }
+    @keyframes pulseMem {
+      0%, 100% { transform: scaleY(0.92); opacity: 0.85; }
+      50% { transform: scaleY(1.0); opacity: 1.0; }
+    }
+    @keyframes specPill0 {
+      0%, 100% { opacity: 1; }
+      33% { opacity: 0.55; }
+    }
+    @keyframes specPill1 {
+      0%, 20% { opacity: 0.45; }
+      35%, 85% { opacity: 1; }
+      100% { opacity: 0.45; }
+    }
+    @keyframes specPill2 {
+      0%, 45% { opacity: 0.4; }
+      60%, 90% { opacity: 1; }
+      100% { opacity: 0.4; }
+    }
+    .l1 { animation: revealLine 9s infinite; animation-delay: 0.0s; }
+    .l2 { animation: revealLine 9s infinite; animation-delay: 0.4s; }
+    .l3 { animation: revealLine 9s infinite; animation-delay: 0.8s; }
+    .l4 { animation: revealLine 9s infinite; animation-delay: 1.2s; }
+    .l5 { animation: revealLine 9s infinite; animation-delay: 1.6s; }
+    .l6 { animation: revealLine 9s infinite; animation-delay: 2.0s; }
+    .l7 { animation: revealLine 9s infinite; animation-delay: 2.4s; }
+    .l8 { animation: revealLine 9s infinite; animation-delay: 2.8s; }
+    .l9 { animation: revealLine 9s infinite; animation-delay: 3.2s; }
+    .l10 { animation: revealLine 9s infinite; animation-delay: 3.6s; }
+    .l11 { animation: revealLine 9s infinite; animation-delay: 4.0s; }
+    .l12 { animation: revealLine 9s infinite; animation-delay: 4.4s; }
+    .cur { animation: cursorBlink 0.9s infinite; }
+    .bar { transform-box: fill-box; transform-origin: bottom; animation: pulseMem 2.4s ease-in-out infinite; }
+    .p0 { animation: specPill0 2.7s infinite; }
+    .p1 { animation: specPill1 2.7s infinite; }
+    .p2 { animation: specPill2 2.7s infinite; }
+  </style>
+
+  <!-- Outer Frame -->
+  <rect width="900" height="460" rx="16" fill="#0d1117" stroke="#30363d" stroke-width="1.5"/>
+  <rect x="0" y="0" width="900" height="4" rx="2" fill="url(#topBar)"/>
+
+  <!-- Window Title Bar -->
+  <circle cx="34" cy="27" r="5.5" fill="#ff5f56"/>
+  <circle cx="52" cy="27" r="5.5" fill="#ffbd2e"/>
+  <circle cx="70" cy="27" r="5.5" fill="#27c93f"/>
+  <text x="92" y="31" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#e6edf3">Mference.app · Qwen 3.6 35B-A3B (INT4 + MTP + Hybrid PLD)</text>
+  <rect x="692" y="16" width="184" height="22" rx="11" fill="#238636" fill-opacity="0.22" stroke="#3fb950" stroke-opacity="0.5"/>
+  <text x="784" y="31" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#3fb950">AA PASS@1: 8/8 (100%)</text>
+
+  <!-- Left Pane: Live Code Streaming -->
+  <rect x="24" y="52" width="496" height="380" rx="12" fill="#161b22" stroke="#30363d"/>
+  <rect x="24" y="52" width="496" height="34" rx="12" fill="#1c2128"/>
+  <text x="40" y="73" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="700" fill="#8b949e">C2 · Swift Coding (SciCode/LCB)</text>
+  <text x="504" y="73" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.5" font-weight="700" fill="#58a6ff">18.36 tok/s decode</text>
+
+  <!-- Think soft landing banner -->
+  <rect x="38" y="96" width="468" height="26" rx="6" fill="#0d1117" stroke="#30363d"/>
+  <text x="48" y="113" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" fill="#8b949e">&lt;think&gt; 206 tok -&gt; &lt;/think&gt;  ·  phase: structuredCodeOrTool</text>
+  <rect x="444" y="100" width="54" height="18" rx="9" fill="#238636" fill-opacity="0.28"/>
+  <text x="471" y="113" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10.5" font-weight="700" fill="#3fb950">9/9 OK</text>
+
+  <!-- Streaming Swift Lines -->
+  <g clip-path="url(#codeClip)" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.3">
+    <text class="l1" x="38" y="150" fill="#ff7b72">func <tspan fill="#d2a8ff">shortestSubarrayAtLeastK</tspan><tspan fill="#c9d1d9">(_ nums: [Int], _ k: Int) -&gt; Int {</tspan></text>
+    <text class="l2" x="38" y="169" fill="#c9d1d9">    let n = nums.count</text>
+    <text class="l3" x="38" y="188" fill="#c9d1d9">    var prefixSum = Array(repeating: 0, count: n + 1)</text>
+    <text class="l4" x="38" y="207" fill="#c9d1d9">    for i in 0..&lt;n { prefixSum[i + 1] = prefixSum[i] + nums[i] }</text>
+    <text class="l5" x="38" y="226" fill="#c9d1d9">    var deque = Array(repeating: 0, count: n + 1)</text>
+    <text class="l6" x="38" y="245" fill="#c9d1d9">    var head = 0, tail = 0, minLength = Int.max</text>
+    <text class="l7" x="38" y="264" fill="#c9d1d9">    for j in 0...n {</text>
+    <text class="l8" x="38" y="283" fill="#79c0ff">        while head &lt; tail &amp;&amp; prefixSum[j] - prefixSum[deque[head]] &gt;= k {</text>
+    <text class="l9" x="38" y="302" fill="#c9d1d9">            minLength = min(minLength, j - deque[head]); head += 1</text>
+    <text class="l10" x="38" y="321" fill="#79c0ff">        } ; while head &lt; tail &amp;&amp; prefixSum[deque[tail - 1]] &gt;= prefixSum[j] { tail -= 1 }</text>
+    <text class="l11" x="38" y="340" fill="#c9d1d9">        deque[tail] = j; tail += 1</text>
+    <text class="l12" x="38" y="359" fill="#c9d1d9">    } ; return minLength == Int.max ? -1 : minLength <tspan class="cur" fill="#3fb950">█</tspan></text>
+    <text class="l12" x="38" y="378" fill="#c9d1d9">}</text>
+  </g>
+
+  <!-- Left Bottom Telemetry Bar -->
+  <rect x="38" y="394" width="468" height="26" rx="6" fill="#0d1117" stroke="#30363d"/>
+  <text x="48" y="411" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" fill="#8b949e">visible: 249 tok · wall: 27.96s · <tspan fill="#3fb950" font-weight="700">MTP: 82.1% (457/182 = 2.51 tok/round)</tspan></text>
+
+  <!-- Top-Right Pane: 16 GB Unified Memory Monitor -->
+  <rect x="536" y="52" width="340" height="182" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="554" y="77" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" letter-spacing="0.6" fill="#8b949e">ACTIVITY MONITOR · 16 GB UNIFIED MEMORY</text>
+
+  <!-- Green Memory Pressure Graph -->
+  <rect x="554" y="88" width="304" height="54" rx="8" fill="#0d1117" stroke="#30363d"/>
+  <g fill="#2ea043">
+    <rect class="bar" x="564" y="114" width="12" height="20" rx="2" style="animation-delay:0.0s"/>
+    <rect class="bar" x="580" y="110" width="12" height="24" rx="2" style="animation-delay:0.2s"/>
+    <rect class="bar" x="596" y="112" width="12" height="22" rx="2" style="animation-delay:0.4s"/>
+    <rect class="bar" x="612" y="108" width="12" height="26" rx="2" style="animation-delay:0.6s"/>
+    <rect class="bar" x="628" y="111" width="12" height="23" rx="2" style="animation-delay:0.8s"/>
+    <rect class="bar" x="644" y="109" width="12" height="25" rx="2" style="animation-delay:1.0s"/>
+    <rect class="bar" x="660" y="113" width="12" height="21" rx="2" style="animation-delay:1.2s"/>
+    <rect class="bar" x="676" y="110" width="12" height="24" rx="2" style="animation-delay:1.4s"/>
+  </g>
+  <text x="702" y="111" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Memory Pressure</text>
+  <text x="702" y="131" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="800" fill="#3fb950">GREEN · FLAT</text>
+
+  <text x="554" y="164" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">NVMe Expert Cache</text>
+  <text x="858" y="164" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">32 Slots (Pread + Tail Warm)</text>
+  <text x="554" y="188" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Resident Core + MTP</text>
+  <text x="858" y="188" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">1.41 GB + Slab (MADV_RANDOM)</text>
+  <text x="554" y="212" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Stability Guard</text>
+  <text x="858" y="212" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#3fb950">Single Server · No Swap Panic</text>
+
+  <!-- Bottom-Right Pane: Speculative Verify + Surgery Pipeline -->
+  <rect x="536" y="250" width="340" height="182" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="554" y="275" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="700" letter-spacing="0.6" fill="#8b949e">SPECULATIVE VERIFY PIPELINE (MTP + PLD)</text>
+
+  <!-- Animated Token Verification Pills -->
+  <g class="p0">
+    <rect x="554" y="288" width="90" height="28" rx="7" fill="#1f6feb" fill-opacity="0.22" stroke="#58a6ff" stroke-opacity="0.6"/>
+    <text x="599" y="306" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#58a6ff">bonus ✓</text>
+  </g>
+  <text x="652" y="306" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" fill="#8b949e">+</text>
+  <g class="p1">
+    <rect x="660" y="288" width="94" height="28" rx="7" fill="#238636" fill-opacity="0.25" stroke="#3fb950" stroke-opacity="0.6"/>
+    <text x="707" y="306" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#3fb950">MTP d0 ✓</text>
+  </g>
+  <text x="762" y="306" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" fill="#8b949e">+</text>
+  <g class="p2">
+    <rect x="770" y="288" width="88" height="28" rx="7" fill="#8957e5" fill-opacity="0.25" stroke="#a371f7" stroke-opacity="0.6"/>
+    <text x="814" y="306" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#a371f7">PLD d1 ✓</text>
+  </g>
+
+  <text x="554" y="340" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">MTP Acceptance (AIME)</text>
+  <text x="858" y="340" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#3fb950">83.1% avg (94.3% peak)</text>
+  <text x="554" y="364" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">GDN Hybrid Rollback</text>
+  <text x="858" y="364" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">4-Slot Arena (Bit-Exact)</text>
+  <text x="554" y="388" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">INT4 Weight Surgery</text>
+  <text x="858" y="388" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#58a6ff">BF16 Scales · 0 Nibbles Changed</text>
+  <text x="554" y="412" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Async Accept Seed</text>
+  <text x="858" y="412" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#a371f7">Overlapped w/ Streaming</text>
+
+  <!-- Footer -->
+  <text x="450" y="449" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b949e">Recorded Telemetry from benchmarks/aa-scorecard-v2.json (16 GB Mac, temp = 0) · GitHub Release v2.0.0</text>
+</svg>
