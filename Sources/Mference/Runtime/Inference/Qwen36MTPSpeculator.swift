@@ -114,7 +114,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private let attention: Attention
     private let elementwise: Elementwise
     private let moe: MoE
-    private let prefillRouter: PrefillRouter
+    private let prefillQKVEpilogue: PrefillQKVEpilogue
     private let sharedRuntime: SharedExpertRuntime
     private let prefillSharedExpert: PrefillSharedExpert
     private let draftHead: LMHeadChainInt4
@@ -138,8 +138,6 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private let dQPacked: MTLBuffer
     private let dQ: MTLBuffer
     private let dGate: MTLBuffer
-    private let dK: MTLBuffer
-    private let dV: MTLBuffer
     private let dAttnOut: MTLBuffer
     private let dOOut: MTLBuffer
     private let dMlpX: MTLBuffer
@@ -171,8 +169,6 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private let aQPacked: MTLBuffer
     private let aQ: MTLBuffer
     private let aGate: MTLBuffer
-    private let aKRaw: MTLBuffer
-    private let aV: MTLBuffer
     private let aAttnOut: MTLBuffer
     private let aOOut: MTLBuffer
     private let aMlpX: MTLBuffer
@@ -211,6 +207,11 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private var seedExpectedBonus: Int32 = -1
     private var recentHiddenBase: Int = -1
     private var recentHiddenCount: Int = 0
+    private var pendingAcceptCB: MTLCommandBuffer?
+    private var pendingAcceptStartNs: UInt64 = 0
+    private var pendingAcceptExpectedPos: Int = -1
+    private var pendingAcceptExpectedBonus: Int32 = -1
+    private var pendingAcceptRCount: Int = 0
     private var emaPositionAccept: [Float] = [0.85, 0.75, 0.60, 0.45]
 
     enum GenerationPhase: Equatable, Sendable {
@@ -224,6 +225,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private let stepTruncationMinMargin: Float
     private let forceStepTruncation: Bool
     private let pldHybridEnabled: Bool = ProcessInfo.processInfo.environment["MFERENCE_MTP_PLD"] != "0"
+    private let useMultiXEnabled: Bool = ProcessInfo.processInfo.environment["MFERENCE_USE_MULTIX"] != "0"
     private var tokenHistory: [Int32] = []
     private var historyBasePosition: Int = 0
     private var insideToolCall: Bool = false
@@ -246,7 +248,8 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     var draftOverride: ((_ round: Int, _ k: Int) -> [Int32])?
 
     var specStats: Qwen38ForwardRunner.MTPSpecStats {
-        Qwen38ForwardRunner.MTPSpecStats(
+        try? flushPendingAcceptIfNeeded()
+        return Qwen38ForwardRunner.MTPSpecStats(
             rounds: stats.rounds,
             draftedTokens: stats.draftedTokens,
             acceptedTokens: stats.acceptedTokens,
@@ -371,7 +374,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
             specializedNumExperts: UInt32(numExperts),
             specializedTopK: UInt32(resolvedDraftTopK)
         )
-        self.prefillRouter = try PrefillRouter(context: context)
+        self.prefillQKVEpilogue = try PrefillQKVEpilogue(context: context)
         self.sharedRuntime = try SharedExpertRuntime(context: context, weightBits: 4, siluActivation: true)
         self.prefillSharedExpert = try PrefillSharedExpert(context: context, weightBits: 4, siluActivation: true)
         self.draftHead = try LMHeadChainInt4(context: context, maxD: d, maxVocab: config.vocabSize)
@@ -396,8 +399,6 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         self.dQPacked = try Self.makeBuffer(dev, bytes: 2 * qDim * halfBytes)
         self.dQ = try Self.makeBuffer(dev, bytes: qDim * halfBytes)
         self.dGate = try Self.makeBuffer(dev, bytes: qDim * halfBytes)
-        self.dK = try Self.makeBuffer(dev, bytes: kvDim * halfBytes)
-        self.dV = try Self.makeBuffer(dev, bytes: kvDim * halfBytes)
         self.dAttnOut = try Self.makeBuffer(dev, bytes: qDim * halfBytes)
         self.dOOut = try Self.makeBuffer(dev, bytes: d * halfBytes)
         self.dMlpX = try Self.makeBuffer(dev, bytes: d * halfBytes)
@@ -428,8 +429,6 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         self.aQPacked = try Self.makeBuffer(dev, bytes: aR * 2 * qDim * halfBytes)
         self.aQ = try Self.makeBuffer(dev, bytes: aR * qDim * halfBytes)
         self.aGate = try Self.makeBuffer(dev, bytes: aR * qDim * halfBytes)
-        self.aKRaw = try Self.makeBuffer(dev, bytes: aR * kvDim * halfBytes)
-        self.aV = try Self.makeBuffer(dev, bytes: aR * kvDim * halfBytes)
         self.aAttnOut = try Self.makeBuffer(dev, bytes: aR * qDim * halfBytes)
         self.aOOut = try Self.makeBuffer(dev, bytes: aR * d * halfBytes)
         self.aMlpX = try Self.makeBuffer(dev, bytes: aR * d * halfBytes)
@@ -448,6 +447,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     // MARK: - SpeculativeDrafter Lifecycle
 
     func reset() {
+        try? flushPendingAcceptIfNeeded()
         stats = MutableStats()
         emaPositionAccept = [0.85, 0.75, 0.60, 0.45]
         currentPhase = .visibleProse
@@ -464,6 +464,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     }
 
     func restoreTokenHistory(basePosition: Int, tokens: [Int32]) {
+        try? flushPendingAcceptIfNeeded()
         resetKVState()
         pending.removeAll(keepingCapacity: true)
         emaPositionAccept = [0.85, 0.75, 0.60, 0.45]
@@ -622,6 +623,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     }
 
     func prepareForContinuation(expectedPosition: Int) throws {
+        try flushPendingAcceptIfNeeded()
         pending.removeAll(keepingCapacity: true)
         let relExpected = expectedPosition - historyBasePosition
         if relExpected <= 0 {
@@ -679,11 +681,13 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     }
 
     func canRunRound(position: Int) -> Bool {
+        try? flushPendingAcceptIfNeeded()
         guard pending.isEmpty, position > 0 else { return false }
         return position + 2 <= maxContext && mtpLen + 1 < maxContext
     }
 
     func draft(bonus: Int32, position: Int, count: Int) throws -> [Int32] {
+        try flushPendingAcceptIfNeeded()
         let availableTarget = maxContext - position - 1
         let targetK = min(count, availableTarget, Self.maxDraftSlots)
         guard targetK > 0 else { return [] }
@@ -777,65 +781,25 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         case none
         case ambiguous
         case unique(Int32)
-    }
 
-    private func findUniqueNGramContinuation4(
-        _ pattern: (Int32, Int32, Int32, Int32),
-        count: Int
-    ) -> PLDMatchResult {
-        guard count >= 5 else { return .none }
-        var matched: Int32? = nil
-        for i in stride(from: count - 5, through: 0, by: -1) {
-            if tokenHistory[i] == pattern.0
-                && tokenHistory[i + 1] == pattern.1
-                && tokenHistory[i + 2] == pattern.2
-                && tokenHistory[i + 3] == pattern.3 {
-                let candidate = tokenHistory[i + 4]
-                if let existing = matched {
-                    if existing != candidate {
-                        return .ambiguous
-                    }
-                } else {
-                    matched = candidate
+        mutating func record(_ candidate: Int32) {
+            switch self {
+            case .none:
+                self = .unique(candidate)
+            case .unique(let existing):
+                if existing != candidate {
+                    self = .ambiguous
                 }
+            case .ambiguous:
+                break
             }
         }
-        if let matched {
-            return .unique(matched)
-        }
-        return .none
     }
 
-    private func findUniqueNGramContinuation3(
-        _ pattern: (Int32, Int32, Int32),
-        count: Int
-    ) -> PLDMatchResult {
-        guard count >= 4 else { return .none }
-        var matched: Int32? = nil
-        for i in stride(from: count - 4, through: 0, by: -1) {
-            if tokenHistory[i] == pattern.0
-                && tokenHistory[i + 1] == pattern.1
-                && tokenHistory[i + 2] == pattern.2 {
-                let candidate = tokenHistory[i + 3]
-                if let existing = matched {
-                    if existing != candidate {
-                        return .ambiguous
-                    }
-                } else {
-                    matched = candidate
-                }
-            }
-        }
-        if let matched {
-            return .unique(matched)
-        }
-        return .none
-    }
-
-    /// Zero-allocation prompt/history 4-gram (with 3-gram fallback) matcher that
-    /// returns a continuation token only when every occurrence in `tokenHistory`
-    /// agrees on the same non-delimiter next token.
-    private func pldUniqueContinuation(
+    /// Zero-allocation single-pass prompt/history n-gram matcher (checking 6/5/4/3-grams
+    /// simultaneously) that disambiguates repeated 4-grams using 5/6-gram context and
+    /// returns the highest-order unique non-delimiter continuation token.
+    func pldUniqueContinuation(
         after bonus: Int32,
         extra: Int32? = nil,
         secondExtra: Int32? = nil
@@ -843,27 +807,75 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         guard pldHybridEnabled else { return nil }
         let count = tokenHistory.count
         guard count >= 4 else { return nil }
-        let pattern4: (Int32, Int32, Int32, Int32)
+
+        let t0: Int32
+        let t1: Int32
+        let t2: Int32
+        let t3: Int32
+        let t4: Int32
+        let t5: Int32
+        let avail: Int
+
         if let secondExtra, let extra {
-            pattern4 = (tokenHistory[count - 2], bonus, extra, secondExtra)
+            t0 = secondExtra
+            t1 = extra
+            t2 = bonus
+            t3 = tokenHistory[count - 2]
+            t4 = tokenHistory[count - 3]
+            t5 = tokenHistory[count - 4]
+            avail = 6
         } else if let extra {
-            pattern4 = (tokenHistory[count - 3], tokenHistory[count - 2], bonus, extra)
+            t0 = extra
+            t1 = bonus
+            t2 = tokenHistory[count - 2]
+            t3 = tokenHistory[count - 3]
+            t4 = tokenHistory[count - 4]
+            t5 = count >= 5 ? tokenHistory[count - 5] : 0
+            avail = min(6, count + 1)
         } else {
-            pattern4 = (tokenHistory[count - 4], tokenHistory[count - 3], tokenHistory[count - 2], bonus)
+            t0 = bonus
+            t1 = tokenHistory[count - 2]
+            t2 = tokenHistory[count - 3]
+            t3 = tokenHistory[count - 4]
+            t4 = count >= 5 ? tokenHistory[count - 5] : 0
+            t5 = count >= 6 ? tokenHistory[count - 6] : 0
+            avail = min(6, count)
         }
-        switch findUniqueNGramContinuation4(pattern4, count: count) {
-        case .unique(let tok):
-            return tok < Self.qwen36EndOfTextID ? tok : nil
-        case .ambiguous:
-            return nil
-        case .none:
-            switch findUniqueNGramContinuation3((pattern4.1, pattern4.2, pattern4.3), count: count) {
-            case .unique(let tok):
-                return tok < Self.qwen36EndOfTextID ? tok : nil
-            case .ambiguous, .none:
-                return nil
+
+        var match3: PLDMatchResult = .none
+        var match4: PLDMatchResult = .none
+        var match5: PLDMatchResult = .none
+        var match6: PLDMatchResult = .none
+
+        for nextPos in stride(from: count - 1, through: 3, by: -1) {
+            guard tokenHistory[nextPos - 1] == t0,
+                  tokenHistory[nextPos - 2] == t1,
+                  tokenHistory[nextPos - 3] == t2 else {
+                continue
+            }
+            let cand = tokenHistory[nextPos]
+            match3.record(cand)
+            guard nextPos >= 4, tokenHistory[nextPos - 4] == t3 else {
+                continue
+            }
+            match4.record(cand)
+            guard avail >= 5, nextPos >= 5, tokenHistory[nextPos - 5] == t4 else {
+                continue
+            }
+            match5.record(cand)
+            if avail >= 6, nextPos >= 6, tokenHistory[nextPos - 6] == t5 {
+                match6.record(cand)
             }
         }
+
+        if case .unique(let tok) = match6 { return tok < Self.qwen36EndOfTextID ? tok : nil }
+        if case .ambiguous = match6 { return nil }
+        if case .unique(let tok) = match5 { return tok < Self.qwen36EndOfTextID ? tok : nil }
+        if case .ambiguous = match5 { return nil }
+        if case .unique(let tok) = match4 { return tok < Self.qwen36EndOfTextID ? tok : nil }
+        if case .ambiguous = match4 { return nil }
+        if case .unique(let tok) = match3 { return tok < Self.qwen36EndOfTextID ? tok : nil }
+        return nil
     }
 
     /// EVICT-style step-wise draft truncation: skips the 2nd sequential MTP draft
@@ -939,39 +951,44 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
             let nextIdx = drafts.count
             emaPositionAccept[nextIdx] = min(0.92, emaPositionAccept[nextIdx] + 0.10)
         }
-        for tok in emitted {
-            let id = Int32(bitPattern: tok)
-            if id == Self.qwen36ThinkEndID {
-                insideToolCall = false
-                insideCodeFence = false
-                notifyPhaseTransition(.visibleProse)
-            } else if id == Self.qwen36ToolCallStartID {
-                insideToolCall = true
-                insideCodeFence = false
-                notifyPhaseTransition(.structuredCodeOrTool)
-            } else if id == Self.qwen36ToolCallEndID {
-                insideToolCall = false
-                insideCodeFence = false
-                notifyPhaseTransition(.visibleProse)
-            }
-        }
     }
 
     // MARK: - Accept Sync Pass
 
+    func flushPendingAcceptIfNeeded() throws {
+        guard let cb = pendingAcceptCB else { return }
+        pendingAcceptCB = nil
+        cb.waitUntilCompleted()
+        guard cb.status == .completed else {
+            pendingAcceptRCount = 0
+            pendingAcceptExpectedPos = -1
+            pendingAcceptExpectedBonus = -1
+            throw Error.commandFailed(cb.error?.localizedDescription ?? "Qwen 3.6 MTP accept command buffer did not complete")
+        }
+        stats.acceptNanos += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - pendingAcceptStartNs
+        let rawSeedTok = dTokenBuf.contents().load(as: UInt32.self)
+        seedToken = Int32(bitPattern: rawSeedTok)
+        seedMargin = draftHead.lastTop1Margin
+        haveSeed = true
+        seedExpectedPosition = pendingAcceptExpectedPos
+        seedExpectedBonus = pendingAcceptExpectedBonus
+        mtpLen += pendingAcceptRCount
+        pendingAcceptRCount = 0
+    }
+
     /// Synchronizes all committed target `(hidden, nextToken)` pairs into the MTP KV cache
     /// and precomputes the next round's first draft token (`seedToken`) and post-norm state
-    /// (`seedHiddenBuf`) in a single GPU command buffer.
+    /// (`seedHiddenBuf`) asynchronously in a single GPU command buffer.
     func commitAcceptPass(bonus: Int32,
                           emitted: [UInt32],
                           position: Int,
                           targetNormedHidden: MTLBuffer,
                           acceptedCount accepted: Int) throws {
+        try flushPendingAcceptIfNeeded()
         let startNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        defer { stats.acceptNanos += clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - startNs }
 
         let targetEndPair = position + accepted
-        let firstMissing: Int
+        var firstMissing: Int
         if basePair == -1 {
             basePair = position - 1
             mtpLen = 0
@@ -994,7 +1011,8 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         if mtpLen + missingCount > maxContext {
             basePair = position - 1
             mtpLen = 0
-            missingCount = (targetEndPair - (position - 1)) + 1
+            firstMissing = position - 1
+            missingCount = (targetEndPair - firstMissing) + 1
         }
 
         let startSlot = mtpLen
@@ -1050,15 +1068,12 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         recentHiddenCount = accepted + 2
 
         try encodeAcceptPass(cb, rowCount: rCount, startSlot: startSlot)
-        try finish(cb)
-
-        let rawSeedTok = dTokenBuf.contents().load(as: UInt32.self)
-        seedToken = Int32(bitPattern: rawSeedTok)
-        seedMargin = draftHead.lastTop1Margin
-        haveSeed = true
-        seedExpectedPosition = position + accepted + 1
-        seedExpectedBonus = Int32(bitPattern: emitted[accepted])
-        mtpLen += rCount
+        cb.commit()
+        pendingAcceptCB = cb
+        pendingAcceptStartNs = startNs
+        pendingAcceptExpectedPos = position + accepted + 1
+        pendingAcceptExpectedBonus = Int32(bitPattern: emitted[accepted])
+        pendingAcceptRCount = rCount
     }
 
     // MARK: - Single-Step Draft & Batched Accept Encoders
@@ -1103,22 +1118,22 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                         weightOffset: Int(weights.inputNorm.offset),
                         out: dXNorm, d: UInt32(d), eps: Self.epsilon)
 
+        let slotOffset = slot * kvBytes
         encodeInt4(cb, weights: weights.qProj, x: dXNorm, y: dQPacked, rows: 2 * qDim, cols: d)
-        encodeInt4(cb, weights: weights.kProj, x: dXNorm, y: dK, rows: kvDim, cols: d)
-        encodeInt4(cb, weights: weights.vProj, x: dXNorm, y: dV, rows: kvDim, cols: d)
+        encodeInt4(cb, weights: weights.kProj, x: dXNorm, y: mtpK, yOffset: slotOffset, rows: kvDim, cols: d)
+        encodeInt4(cb, weights: weights.vProj, x: dXNorm, y: mtpV, yOffset: slotOffset, rows: kvDim, cols: d)
 
         elementwise.encodeSplitQGate(commandBuffer: cb,
                                      packed: dQPacked, q: dQ, gate: dGate,
                                      heads: numHeads, dim: headDim, rows: 1)
 
-        let slotOffset = slot * kvBytes
         rms.encodeBF16WPerHead(commandBuffer: cb,
                                x: dQ,
                                weight: weights.qNorm.buffer, weightOffset: Int(weights.qNorm.offset),
                                out: dQ,
                                headDim: UInt32(headDim), numHeads: numHeads, eps: Self.epsilon)
         rms.encodeBF16WPerHead(commandBuffer: cb,
-                               x: dK,
+                               x: mtpK, xOffset: slotOffset,
                                weight: weights.kNorm.buffer, weightOffset: Int(weights.kNorm.offset),
                                out: mtpK, outOffset: slotOffset,
                                headDim: UInt32(headDim), numHeads: numKV, eps: Self.epsilon)
@@ -1131,12 +1146,6 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                               position: UInt32(slot),
                               headDim: UInt32(headDim), numHeads: UInt32(numKV),
                               rotaryDim: rotaryDim, theta: fullRopeTheta)
-
-        guard let kvBlit = cb.makeBlitCommandEncoder() else {
-            throw Error.commandFailed("unable to create Qwen 3.6 MTP V-cache blit")
-        }
-        kvBlit.copy(from: dV, sourceOffset: 0, to: mtpV, destinationOffset: slotOffset, size: kvBytes)
-        kvBlit.endEncoding()
 
         attention.encodeFull(commandBuffer: cb,
                              q: dQ, k: mtpK, v: mtpV, out: dAttnOut,
@@ -1274,42 +1283,31 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                                weightOffset: Int(weights.inputNorm.offset),
                                out: aXNorm, t: UInt32(rCount), d: UInt32(d), eps: Self.epsilon)
 
+        let kvStartOffset = startSlot * kvBytes
         encodeInt4Batch(cb, weights: weights.qProj, x: aXNorm, y: aQPacked, rows: 2 * qDim, cols: d, tokens: rCount)
-        encodeInt4Batch(cb, weights: weights.kProj, x: aXNorm, y: aKRaw, rows: kvDim, cols: d, tokens: rCount)
-        encodeInt4Batch(cb, weights: weights.vProj, x: aXNorm, y: aV, rows: kvDim, cols: d, tokens: rCount)
+        encodeInt4Batch(cb, weights: weights.kProj, x: aXNorm, y: mtpK, yOffset: kvStartOffset, rows: kvDim, cols: d, tokens: rCount)
+        encodeInt4Batch(cb, weights: weights.vProj, x: aXNorm, y: mtpV, yOffset: kvStartOffset, rows: kvDim, cols: d, tokens: rCount)
 
         elementwise.encodeSplitQGate(commandBuffer: cb,
                                      packed: aQPacked, q: aQ, gate: aGate,
                                      heads: numHeads, dim: headDim, rows: rCount)
 
-        for r in 0..<rCount {
-            let qRowOff = r * qDim * halfBytes
-            let kvSlotOff = (startSlot + r) * kvBytes
-            rms.encodeBF16WPerHead(commandBuffer: cb,
-                                   x: aQ, xOffset: qRowOff,
-                                   weight: weights.qNorm.buffer, weightOffset: Int(weights.qNorm.offset),
-                                   out: aQ, outOffset: qRowOff,
-                                   headDim: UInt32(headDim), numHeads: numHeads, eps: Self.epsilon)
-            rms.encodeBF16WPerHead(commandBuffer: cb,
-                                   x: aKRaw, xOffset: r * kvBytes,
-                                   weight: weights.kNorm.buffer, weightOffset: Int(weights.kNorm.offset),
-                                   out: mtpK, outOffset: kvSlotOff,
-                                   headDim: UInt32(headDim), numHeads: numKV, eps: Self.epsilon)
-            rope.encodeNeoxSubdim(commandBuffer: cb, data: aQ, dataOffset: qRowOff,
-                                  position: UInt32(startSlot + r),
-                                  headDim: UInt32(headDim), numHeads: UInt32(numHeads),
-                                  rotaryDim: rotaryDim, theta: fullRopeTheta)
-            rope.encodeNeoxSubdim(commandBuffer: cb, data: mtpK, dataOffset: kvSlotOff,
-                                  position: UInt32(startSlot + r),
-                                  headDim: UInt32(headDim), numHeads: UInt32(numKV),
-                                  rotaryDim: rotaryDim, theta: fullRopeTheta)
-        }
-
-        guard let kvBlit = cb.makeBlitCommandEncoder() else {
-            throw Error.commandFailed("unable to create Qwen 3.6 MTP accept V-cache blit")
-        }
-        kvBlit.copy(from: aV, sourceOffset: 0, to: mtpV, destinationOffset: startSlot * kvBytes, size: rCount * kvBytes)
-        kvBlit.endEncoding()
+        prefillQKVEpilogue.encodeNeoxSubdimNoVNorm(
+            commandBuffer: cb,
+            q: aQ, qOffset: 0,
+            k: mtpK, kOffset: kvStartOffset,
+            qWeight: weights.qNorm.buffer, qWeightOffset: Int(weights.qNorm.offset),
+            kWeight: weights.kNorm.buffer, kWeightOffset: Int(weights.kNorm.offset),
+            startPosition: UInt32(startSlot),
+            queryCount: UInt32(rCount),
+            headDim: UInt32(headDim),
+            numQHeads: UInt32(numHeads),
+            numKVHeads: UInt32(numKV),
+            qTokenStrideElements: UInt32(qDim),
+            kvTokenStrideElements: UInt32(kvDim),
+            theta: fullRopeTheta,
+            rotaryDim: rotaryDim,
+            eps: Self.epsilon)
 
         for r in 0..<rCount {
             let rowOff = r * qDim * halfBytes
@@ -1332,23 +1330,27 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                                weightOffset: Int(weights.postAttnNorm.offset),
                                out: aMlpX, t: UInt32(rCount), d: UInt32(d), eps: Self.epsilon)
 
-        prefillRouter.encodeGemma4Block(commandBuffer: cb,
-                                        weights: weights.router.buffer,
-                                        weightsOffset: Int(weights.router.offset),
-                                        scales: weights.router.buffer,
-                                        scalesOffset: Int(weights.router.scaleOffset),
-                                        biases: weights.router.buffer,
-                                        biasesOffset: Int(weights.router.biasOffset),
-                                        hidden: aMlpX,
-                                        effectiveScale: onesD,
-                                        perExpertScale: onesExperts,
-                                        outIndices: aRouteIDs,
-                                        outWeights: aRouteWeights,
-                                        queryCount: UInt32(rCount),
-                                        numExperts: UInt32(numExperts),
-                                        d: UInt32(d),
-                                        topK: UInt32(draftTopK),
-                                        hiddenStrideElements: UInt32(d))
+        let u32Bytes = MemoryLayout<UInt32>.stride
+        for r in 0..<rCount {
+            moe.encodeRouterGemma4(commandBuffer: cb,
+                                   weights: weights.router.buffer,
+                                   weightsOffset: Int(weights.router.offset),
+                                   scales: weights.router.buffer,
+                                   scalesOffset: Int(weights.router.scaleOffset),
+                                   biases: weights.router.buffer,
+                                   biasesOffset: Int(weights.router.biasOffset),
+                                   hidden: aMlpX,
+                                   hiddenOffset: r * dBytes,
+                                   effectiveScale: onesD,
+                                   perExpertScale: onesExperts,
+                                   outIndices: aRouteIDs,
+                                   outIndicesOffset: r * draftTopK * u32Bytes,
+                                   outWeights: aRouteWeights,
+                                   outWeightsOffset: r * draftTopK * halfBytes,
+                                   numExperts: UInt32(numExperts),
+                                   d: UInt32(d),
+                                   topK: UInt32(draftTopK))
+        }
 
         // Note: `router_slot_lookup_k8_batch` writes one summary status to `aAllHit[0]`.
         moe.encodeSlotLookupBatch(commandBuffer: cb,
@@ -1383,7 +1385,6 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                                                      xStrideElements: d,
                                                      yStrideElements: d)
 
-        let u32Bytes = MemoryLayout<UInt32>.stride
         for r in 0..<rCount {
             moe.encodeSlotMapGuardedFFN(commandBuffer: cb,
                                         slab: slab,
@@ -1441,10 +1442,10 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private func encodeInt4Batch(_ cb: MTLCommandBuffer,
                                  weights: TensorView,
                                  x: MTLBuffer,
-                                 y: MTLBuffer,
+                                 y: MTLBuffer, yOffset: Int = 0,
                                  rows: Int, cols: Int,
                                  tokens: Int) {
-        let useMultiX = ProcessInfo.processInfo.environment["MFERENCE_USE_MULTIX"] != "0"
+        let useMultiX = useMultiXEnabled
             && tokens <= DequantInt4GEMVMultiX.maxTokens
             && Int(weights.offset).isMultiple(of: 2)
         if useMultiX {
@@ -1452,7 +1453,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                               weights: weights.buffer, weightsOffset: Int(weights.offset),
                               scales: weights.buffer, scalesOffset: Int(weights.scaleOffset),
                               biases: weights.buffer, biasesOffset: Int(weights.biasOffset),
-                              x: x, y: y,
+                              x: x, y: y, yOffset: yOffset,
                               m: rows, n: cols, tokens: tokens)
         } else {
             let xStride = cols * MemoryLayout<Float16>.stride
@@ -1460,13 +1461,14 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
             for r in 0..<tokens {
                 encodeInt4(cb, weights: weights,
                            x: x, xOffset: r * xStride,
-                           y: y, yOffset: r * yStride,
+                           y: y, yOffset: yOffset + r * yStride,
                            rows: rows, cols: cols)
             }
         }
     }
 
     private func copyRecentHiddenToLastHidden(rowIndex: Int) throws {
+        try flushPendingAcceptIfNeeded()
         guard let cb = queue.makeCommandBuffer(),
               let blit = cb.makeBlitCommandEncoder() else {
             throw Error.commandFailed("unable to create Qwen 3.6 MTP continuation blit")
@@ -1486,6 +1488,9 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         seedExpectedBonus = -1
         recentHiddenBase = -1
         recentHiddenCount = 0
+        pendingAcceptRCount = 0
+        pendingAcceptExpectedPos = -1
+        pendingAcceptExpectedBonus = -1
     }
 
     private func finish(_ cb: MTLCommandBuffer) throws {
@@ -1658,7 +1663,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
             expertsPerLayer: pool.expertsPerLayer,
             expertStride: pool.expertStride
         )
-        let streamer = try ResidentExpertStreamer(layout: layout, device: device, strategy: .mapped)
+        let streamer = try ResidentExpertStreamer(layout: layout, device: device, strategy: .mapped, slabOnly: true)
         guard let binding = streamer.contiguousSlabBinding else {
             throw Error.invalidWeights("mtp auxiliary streamer did not expose contiguousSlabBinding")
         }

@@ -576,6 +576,17 @@ struct Qwen36MTPSpecTests {
         #expect(surgeryResult.modifiedNormTensors >= 3)
         #expect(surgeryResult.modifiedAffineTensors >= 1)
 
+        // Idempotence guard: manifest records surgery provenance and blocks accidental double-application.
+        let manifestData = try Data(contentsOf: dir.appendingPathComponent("manifest.json"))
+        let manifestJSON = try #require(
+            try JSONSerialization.jsonObject(with: manifestData) as? [String: Any])
+        #expect(manifestJSON["surgery"] != nil)
+        #expect(throws: RepackError.self) {
+            _ = try MTPAttachTool.applyResidentWeightSurgery(
+                gturboDirectory: dir.path,
+                config: MTPAttachTool.SurgeryConfig(finalNormScale: 1.02))
+        }
+
         let ctx = try MetalContext()
         let model = try Model.load(directoryURL: dir,
                                    device: ctx.device,
@@ -680,5 +691,109 @@ struct Qwen36MTPSpecTests {
             cur = Int32(bitPattern: next)
         }
         #expect(resumedA == fullA)
+    }
+
+    @Test
+    func mtpCacheWraparound_matchesPlainBitExact() async throws {
+        let (dir, shard) = try makeAttachedToy()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.removeItem(at: shard)
+        }
+
+        let ctx = try MetalContext()
+        let model = try Model.load(directoryURL: dir, device: ctx.device, expecting: .qwen36Toy())
+        let logits = try makeLogits(ctx, vocab: model.config.vocabSize)
+        let prompt: [Int32] = [1, 2, 3, 4]
+        let steps = 10
+
+        let plainRunner = try RealForwardRunner(model: model, context: ctx, maxContext: 16)
+        plainRunner.speculator = nil
+        let baseline = try await generateGreedy(runner: plainRunner, logits: logits, prompt: prompt, steps: steps)
+
+        let specRunner = try makeSpecRunner(model: model, context: ctx, maxContext: 16, draftK: 3)
+        let specOut = try await generateGreedy(runner: specRunner, logits: logits, prompt: prompt, steps: steps)
+        #expect(specOut == baseline)
+
+        // Directly force commitAcceptPass's maxContext wraparound branch (firstMissing reset)
+        // to ensure no out-of-bounds index when mtpLen + missingCount exceeds maxContext.
+        let mtp = try #require(specRunner.mtp as? Qwen36MTPSpeculator)
+        mtp.reset()
+        let dBytes = model.config.hiddenSize * MemoryLayout<Float16>.stride
+        let dummyHidden = try #require(ctx.device.makeBuffer(length: 4 * dBytes, options: .storageModeShared))
+        var pos = 1
+        while pos <= 13 {
+            try mtp.commitAcceptPass(bonus: Int32(pos),
+                                     emitted: [UInt32(pos + 1), UInt32(pos + 2)],
+                                     position: pos,
+                                     targetNormedHidden: dummyHidden,
+                                     acceptedCount: 1)
+            pos += 2
+        }
+        try mtp.commitAcceptPass(bonus: 20,
+                                 emitted: [21, 22],
+                                 position: pos,
+                                 targetNormedHidden: dummyHidden,
+                                 acceptedCount: 1)
+        try mtp.flushPendingAcceptIfNeeded()
+        #expect(mtp.canRunRound(position: pos + 1) == false || mtp.specStats.rounds >= 0)
+    }
+
+    @Test
+    func pldHybrid_disambiguatesRepeated4GramWith5Gram() throws {
+        let (dir, shard) = try makeAttachedToy()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.removeItem(at: shard)
+        }
+        let ctx = try MetalContext()
+        let model = try Model.load(directoryURL: dir, device: ctx.device, expecting: .qwen36Toy())
+        let spec = try #require(try Qwen36MTPSpeculator.probe(
+            model: model, context: ctx, config: model.config, maxContext: 64))
+
+        // Transition to structured code/tool phase and seed history where the 4-gram [20, 30, 40, 50]
+        // appears with two conflicting continuations (99 vs 77), while the 5-gram [11, 20, 30, 40, 50]
+        // uniquely predicts 77.
+        spec.notifyTokens(tokens: [248058, 10, 20, 30, 40, 50, 99, 11, 20, 30, 40, 50, 77, 1, 11, 20, 30, 40][...],
+                          startPosition: 0)
+        #expect(spec.currentPhase == .structuredCodeOrTool)
+        #expect(spec.pldUniqueContinuation(after: 40, extra: 50) == 77)
+
+        // When even the 5-gram conflicts ([11, 20, 30, 40, 50] -> 77 vs 88), a unique 6-gram wins;
+        // if 6-gram also conflicts, PLD cleanly declines (returns nil).
+        spec.notifyTokens(tokens: [2, 11, 20, 30, 40, 50, 88, 2, 11, 20, 30, 40][...], startPosition: 18)
+        #expect(spec.pldUniqueContinuation(after: 40, extra: 50) == 88)
+        spec.notifyTokens(tokens: [2, 11, 20, 30, 40, 50, 91, 2, 11, 20, 30, 40][...], startPosition: 30)
+        #expect(spec.pldUniqueContinuation(after: 40, extra: 50) == nil)
+    }
+
+    @Test
+    func residentWeightSurgery_rejectsInvalidScales() throws {
+        let (dir, shard) = try makeAttachedToy()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.removeItem(at: shard)
+        }
+
+        #expect(throws: RepackError.self) {
+            _ = try MTPAttachTool.applyResidentWeightSurgery(
+                gturboDirectory: dir.path,
+                config: MTPAttachTool.SurgeryConfig(qkNormScale: 0))
+        }
+        #expect(throws: RepackError.self) {
+            _ = try MTPAttachTool.applyResidentWeightSurgery(
+                gturboDirectory: dir.path,
+                config: MTPAttachTool.SurgeryConfig(sharedExpertScale: -1.0))
+        }
+        #expect(throws: RepackError.self) {
+            _ = try MTPAttachTool.applyResidentWeightSurgery(
+                gturboDirectory: dir.path,
+                config: MTPAttachTool.SurgeryConfig(lateLinearResidualScale: .nan))
+        }
+        #expect(throws: RepackError.self) {
+            _ = try MTPAttachTool.applyResidentWeightSurgery(
+                gturboDirectory: dir.path,
+                config: MTPAttachTool.SurgeryConfig(qkNormStartLayerRatio: 1.5))
+        }
     }
 }

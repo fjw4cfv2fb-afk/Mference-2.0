@@ -616,6 +616,7 @@ void sample_topk64_final(
 constant constexpr uint kLMHeadRowsPerTG = 8;
 constant constexpr uint kLMHeadGroupSize = 64;
 constant constexpr uint kLMHeadRowSummaryStride = 2;
+constant constexpr uint kLMHeadSingleRowSummaryStride = 3;
 constant uint FC_HEAD_D [[function_constant(10)]];
 constant uint FC_HEAD_V [[function_constant(11)]];
 constant bool FC_HEAD_USE_FC [[function_constant(13)]];
@@ -732,10 +733,13 @@ void lm_head_greedy_int4_rows_chunk_raw(
         const float v_all = simd_max(v);
         uint i_all = (v == v_all) ? idx : 0xFFFFFFFFu;
         i_all = simd_min(i_all);
+        const float r_cand = (active && idx != i_all) ? v : -INFINITY;
+        const float r_all = simd_max(r_cand);
         if (simd_lane_id == 0) {
-            device float* slot = summaries + tg_idx * kLMHeadRowSummaryStride;
+            device float* slot = summaries + tg_idx * kLMHeadSingleRowSummaryStride;
             slot[0] = v_all;
             slot[1] = as_type<float>(i_all);
+            slot[2] = r_all;
         }
     }
 }
@@ -760,15 +764,17 @@ void lm_head_greedy_int4_rows_reduce(
     uint best_i = 0xFFFFFFFFu;
     float second_v = -INFINITY;
     for (uint i = lid; i < row_groups; i += lsize) {
-        device const float* slot = summaries + i * kLMHeadRowSummaryStride;
+        device const float* slot = summaries + i * kLMHeadSingleRowSummaryStride;
         const float v = slot[0];
         const uint idx = as_type<uint>(slot[1]);
+        const float tg_second = slot[2];
         if (v > best_v || (v == best_v && idx < best_i)) {
-            second_v = best_v;
+            second_v = max(best_v, tg_second);
             best_v = v;
             best_i = idx;
-        } else if (v > second_v) {
-            second_v = v;
+        } else {
+            if (v > second_v) second_v = v;
+            if (tg_second > second_v) second_v = tg_second;
         }
     }
 

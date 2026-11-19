@@ -212,6 +212,7 @@ public func runRawCompletion(producer: any LogitProducer,
     var thinkingHistory: [Int32] = []
     var forcedInjectionQueue: [Int32] = []
     var pendingLoopBreakTokens: [Int32]? = nil
+    let debugTokens = ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1"
 
     while true {
         try Task.checkCancellation()
@@ -300,11 +301,11 @@ public func runRawCompletion(producer: any LogitProducer,
                 thinkingHistory.removeAll(keepingCapacity: true)
                 (producer as? RealForwardRunner)?.notifyMTPPhaseTransition(structuredCodeOrTool: false)
             }
-        } else if tokenID == tokenizer.toolCallStartID || delta.contains("```") {
+        } else if tokenID == tokenizer.toolCallStartID {
             (producer as? RealForwardRunner)?.notifyMTPPhaseTransition(structuredCodeOrTool: true)
         }
 
-        if ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1" {
+        if debugTokens {
             print("[token]: id=\(tokenID), str=\(delta.debugDescription)")
         }
         let visible = stopMatcher.push(delta)

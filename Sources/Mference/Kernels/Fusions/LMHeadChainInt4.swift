@@ -5,7 +5,7 @@ import Metal
 final class LMHeadChainInt4 {
     static let rowsPerThreadgroup = 8
 
-    private static let rowSummaryStride = 2
+    private static let rowSummaryStride = 3
 
     /// Shape this instance compiles a specialized head pipeline for. Taken
     /// from the loaded model so both Gemma 4 (2816/262144) and Qwen 3.6

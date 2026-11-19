@@ -219,15 +219,16 @@ final class MoE {
                                    weights: MTLBuffer, weightsOffset: Int = 0,
                                    scales: MTLBuffer, scalesOffset: Int = 0,
                                    biases: MTLBuffer, biasesOffset: Int = 0,
-                                   hidden: MTLBuffer,
+                                   hidden: MTLBuffer, hiddenOffset: Int = 0,
                                    effectiveScale: MTLBuffer, effectiveScaleOffset: Int = 0,
                                    perExpertScale: MTLBuffer, perExpertScaleOffset: Int = 0,
-                                   outIndices: MTLBuffer,
-                                   outWeights: MTLBuffer,
+                                   outIndices: MTLBuffer, outIndicesOffset: Int = 0,
+                                   outWeights: MTLBuffer, outWeightsOffset: Int = 0,
                                    numExperts: UInt32,
                                    d: UInt32,
                                    topK: UInt32) {
         precondition(d.isMultiple(of: UInt32(Quantization.groupSize)))
+        precondition(hiddenOffset >= 0 && outIndicesOffset >= 0 && outWeightsOffset >= 0)
         precondition(numExperts <= Self.maxRouterExperts,
                      "router supports at most \(Self.maxRouterExperts) experts")
         precondition(Self.routerTopKWidths.contains(topK),
@@ -243,7 +244,7 @@ final class MoE {
             encoder.setBuffer(weights, offset: weightsOffset, index: 0)
             encoder.setBuffer(scales, offset: scalesOffset, index: 1)
             encoder.setBuffer(biases, offset: biasesOffset, index: 2)
-            encoder.setBuffer(hidden, offset: 0, index: 3)
+            encoder.setBuffer(hidden, offset: hiddenOffset, index: 3)
             encoder.setBuffer(effectiveScale, offset: effectiveScaleOffset, index: 4)
             encoder.setBuffer(routerLogits, offset: 0, index: 5)
             encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 6)
@@ -273,8 +274,8 @@ final class MoE {
             encoder.setComputePipelineState(selectPSO)
             encoder.setBuffer(routerLogits, offset: 0, index: 0)
             encoder.setBuffer(perExpertScale, offset: perExpertScaleOffset, index: 1)
-            encoder.setBuffer(outIndices, offset: 0, index: 2)
-            encoder.setBuffer(outWeights, offset: 0, index: 3)
+            encoder.setBuffer(outIndices, offset: outIndicesOffset, index: 2)
+            encoder.setBuffer(outWeights, offset: outWeightsOffset, index: 3)
             encoder.setBytes(&expertCount, length: MemoryLayout<UInt32>.stride, index: 4)
             encoder.dispatchThreadgroups(
                 MTLSize(width: 1, height: 1, depth: 1),

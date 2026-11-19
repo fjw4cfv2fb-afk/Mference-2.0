@@ -5,7 +5,7 @@ private let usage = """
 Usage:
   MferenceRepack [--dry-run] [--model <gemma4|qwen36|qwen36original|qwen38|swiftqwen38|deepseekv4flash|inklingsmall|maple|qwen38flashnext|minicpm5|minicpm5mlx|glm53flash>] --output <model.gturbo> [--overwrite] [--resume] [--skip-mtp] [--base-url <url>]
   MferenceRepack --attach-mtp <mtp-shard.safetensors> --output <model.gturbo>
-  MferenceRepack --apply-surgery --input-gturbo <model.gturbo> [--surgery-final-norm <f>] [--surgery-qk-norm <f>] [--surgery-qk-start-ratio <f>] [--surgery-router-temp <f>] [--surgery-late-residual <f>] [--surgery-late-start-ratio <f>] [--surgery-shared-expert <f>] [--surgery-shared-expert-start-ratio <f>] [--surgery-mtp-norm <f>] [--surgery-mtp-hidden-norm <f>] [--surgery-no-coadapt-mtp]
+  MferenceRepack --apply-surgery --input-gturbo <model.gturbo> [--surgery-final-norm <f>] [--surgery-qk-norm <f>] [--surgery-qk-start-ratio <f>] [--surgery-router-temp <f>] [--surgery-late-residual <f>] [--surgery-late-start-ratio <f>] [--surgery-late-linear-residual <f>] [--surgery-shared-expert <f>] [--surgery-shared-expert-start-ratio <f>] [--surgery-mtp-norm <f>] [--surgery-mtp-hidden-norm <f>] [--surgery-mtp-shared-expert <f>] [--surgery-mtp-qk-norm <f>] [--surgery-mtp-router-temp <f>] [--surgery-mtp-residual <f>] [--surgery-no-coadapt-mtp] [--surgery-force]
   MferenceRepack --discard-partial --output <model.gturbo>
   MferenceRepack --verify-install --input-gturbo <model.gturbo>
   MferenceRepack --help
@@ -132,6 +132,8 @@ private struct Arguments {
                 parsed.surgeryConfig.lateLayerResidualScale = try parseFloat(flag)
             case "--surgery-late-start-ratio":
                 parsed.surgeryConfig.lateLayerStartFraction = try parseFloat(flag)
+            case "--surgery-late-linear-residual":
+                parsed.surgeryConfig.lateLinearResidualScale = try parseFloat(flag)
             case "--surgery-shared-expert":
                 parsed.surgeryConfig.sharedExpertScale = try parseFloat(flag)
             case "--surgery-shared-expert-start-ratio":
@@ -150,6 +152,9 @@ private struct Arguments {
                 parsed.surgeryConfig.mtpResidualScale = try parseFloat(flag)
             case "--surgery-no-coadapt-mtp":
                 parsed.surgeryConfig.coAdaptMTP = false
+                index += 1
+            case "--surgery-force":
+                parsed.surgeryConfig.allowReapply = true
                 index += 1
             case "--attach-mtp":
                 guard index + 1 < values.count else {
@@ -220,6 +225,9 @@ private struct Arguments {
         if parsed.applySurgery {
             guard parsed.inputGTurbo != nil || parsed.output != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
+            }
+            if parsed.overwrite {
+                parsed.surgeryConfig.allowReapply = true
             }
             return parsed
         }

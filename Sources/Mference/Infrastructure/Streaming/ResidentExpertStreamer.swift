@@ -73,7 +73,7 @@ public final class ResidentExpertStreamer: @unchecked Sendable {
     /// Bytes per direct read while filling a `.copied` layer.
     static let copyChunkBytes = 64 << 20
 
-    public init(layout: StreamLayout, device: MTLDevice, strategy: Strategy = .mapped) throws {
+    public init(layout: StreamLayout, device: MTLDevice, strategy: Strategy = .mapped, slabOnly: Bool = false) throws {
         self.layout = layout
         self.strategy = strategy
         let pageSize = Int(getpagesize())
@@ -141,33 +141,10 @@ public final class ResidentExpertStreamer: @unchecked Sendable {
             guard let base = mapped, base != MAP_FAILED else {
                 throw StreamerError.allocFailed(errno: errno)
             }
+            _ = posix_madvise(base, mappedLength, POSIX_MADV_RANDOM)
             let mapping = Mapping(base: base, length: mappedLength)
             self.mapping = mapping
             self.sliceShift = shift
-
-            var views: [(buffer: MTLBuffer, offset: UInt64)] = []
-            views.reserveCapacity(layout.expertsPerLayer)
-            for expert in 0..<layout.expertsPerLayer {
-                let regionOffset = layout.expertOffset(layer: 0, expert: expert)
-                // Buffers must start page-aligned: align down and carry the
-                // remainder as an in-buffer offset.
-                let absolute = shift + Int(regionOffset)
-                let alignedStart = (absolute / pageSize) * pageSize
-                let delta = absolute - alignedStart
-                let rawLength = delta + Int(layout.expertStride)
-                let bufferLength = ((rawLength + pageSize - 1) / pageSize) * pageSize
-                nonisolated(unsafe) let start = base.advanced(by: alignedStart)
-                guard let buffer = device.makeBuffer(
-                    bytesNoCopy: start,
-                    length: min(bufferLength, mappedLength - alignedStart),
-                    options: .storageModeShared,
-                    deallocator: { _, _ in _ = mapping })
-                else {
-                    throw StreamerError.bufferWrapFailed
-                }
-                views.append((buffer: buffer, offset: UInt64(delta)))
-            }
-            self.expertViews = views
 
             // The slab covers every mapped page; `bytesNoCopy` wants a page
             // multiple, and mmap maps whole pages, so rounding up stays
@@ -184,6 +161,34 @@ public final class ResidentExpertStreamer: @unchecked Sendable {
                     expertStride: Int(layout.expertStride))
             } else {
                 self.slabView = nil
+            }
+
+            if slabOnly && self.slabView != nil {
+                self.expertViews = []
+            } else {
+                var views: [(buffer: MTLBuffer, offset: UInt64)] = []
+                views.reserveCapacity(layout.expertsPerLayer)
+                for expert in 0..<layout.expertsPerLayer {
+                    let regionOffset = layout.expertOffset(layer: 0, expert: expert)
+                    // Buffers must start page-aligned: align down and carry the
+                    // remainder as an in-buffer offset.
+                    let absolute = shift + Int(regionOffset)
+                    let alignedStart = (absolute / pageSize) * pageSize
+                    let delta = absolute - alignedStart
+                    let rawLength = delta + Int(layout.expertStride)
+                    let bufferLength = ((rawLength + pageSize - 1) / pageSize) * pageSize
+                    nonisolated(unsafe) let start = base.advanced(by: alignedStart)
+                    guard let buffer = device.makeBuffer(
+                        bytesNoCopy: start,
+                        length: min(bufferLength, mappedLength - alignedStart),
+                        options: .storageModeShared,
+                        deallocator: { _, _ in _ = mapping })
+                    else {
+                        throw StreamerError.bufferWrapFailed
+                    }
+                    views.append((buffer: buffer, offset: UInt64(delta)))
+                }
+                self.expertViews = views
             }
         }
     }

@@ -39,6 +39,7 @@ public enum MTPAttachTool {
         public var routerTemperature: Float
         public var lateLayerResidualScale: Float
         public var lateLayerStartFraction: Float
+        public var lateLinearResidualScale: Float
         public var sharedExpertScale: Float
         public var sharedExpertStartLayerRatio: Float
         public var mtpNormScale: Float
@@ -48,6 +49,7 @@ public enum MTPAttachTool {
         public var mtpResidualScale: Float?
         public var mtpSharedExpertScale: Float?
         public var coAdaptMTP: Bool
+        public var allowReapply: Bool
 
         public init(finalNormScale: Float = 1.0,
                     qkNormScale: Float = 1.0,
@@ -55,6 +57,7 @@ public enum MTPAttachTool {
                     routerTemperature: Float = 1.0,
                     lateLayerResidualScale: Float = 1.0,
                     lateLayerStartFraction: Float = 0.75,
+                    lateLinearResidualScale: Float = 1.0,
                     sharedExpertScale: Float = 1.0,
                     sharedExpertStartLayerRatio: Float = 0.5,
                     mtpNormScale: Float = 1.0,
@@ -63,13 +66,15 @@ public enum MTPAttachTool {
                     mtpRouterTemperature: Float? = nil,
                     mtpResidualScale: Float? = nil,
                     mtpSharedExpertScale: Float? = nil,
-                    coAdaptMTP: Bool = true) {
+                    coAdaptMTP: Bool = true,
+                    allowReapply: Bool = false) {
             self.finalNormScale = finalNormScale
             self.qkNormScale = qkNormScale
             self.qkNormStartLayerRatio = qkNormStartLayerRatio
             self.routerTemperature = routerTemperature
             self.lateLayerResidualScale = lateLayerResidualScale
             self.lateLayerStartFraction = lateLayerStartFraction
+            self.lateLinearResidualScale = lateLinearResidualScale
             self.sharedExpertScale = sharedExpertScale
             self.sharedExpertStartLayerRatio = sharedExpertStartLayerRatio
             self.mtpNormScale = mtpNormScale
@@ -79,6 +84,7 @@ public enum MTPAttachTool {
             self.mtpResidualScale = mtpResidualScale
             self.mtpSharedExpertScale = mtpSharedExpertScale
             self.coAdaptMTP = coAdaptMTP
+            self.allowReapply = allowReapply
         }
     }
 
@@ -212,7 +218,7 @@ public enum MTPAttachTool {
         }
 
         // -- Existing resident index.
-        let weightsFd = try Posix.openExistingRW(weightsPath)
+        let weightsFd = try Posix.openRead(weightsPath)
         defer { close(weightsFd) }
         let oldFileSize = try Posix.fileSize(fd: weightsFd, path: weightsPath)
         var (oldIndexSize, oldResidentSize, oldEntries) =
@@ -397,48 +403,59 @@ public enum MTPAttachTool {
                                      residentSize: newResidentSize)
 
         let rewrote = !fitsInPlace
+        let tmpPath = weightsPath + ".mtp-attach.tmp"
+        try? FileManager.default.removeItem(atPath: tmpPath)
+        defer { try? FileManager.default.removeItem(atPath: tmpPath) }
         if fitsInPlace {
-            try appended.withUnsafeBytes {
-                try Posix.pwriteAll(fd: weightsFd, path: weightsPath,
-                                    buf: $0.baseAddress!, count: appended.count,
-                                    offset: oldFileSize)
+            // Stage onto a sibling CoW clone so crashes never leave an unindexed tail.
+            try FileManager.default.copyItem(atPath: weightsPath, toPath: tmpPath)
+            do {
+                let outFd = try Posix.openExistingRW(tmpPath)
+                defer { close(outFd) }
+                try appended.withUnsafeBytes {
+                    try Posix.pwriteAll(fd: outFd, path: tmpPath,
+                                        buf: $0.baseAddress!, count: appended.count,
+                                        offset: oldFileSize)
+                }
+                try indexImage.withUnsafeBytes {
+                    try Posix.pwriteAll(fd: outFd, path: tmpPath,
+                                        buf: $0.baseAddress!, count: indexImage.count,
+                                        offset: 0)
+                }
+                try Posix.fsync(outFd, path: tmpPath)
             }
-            try indexImage.withUnsafeBytes {
-                try Posix.pwriteAll(fd: weightsFd, path: weightsPath,
-                                    buf: $0.baseAddress!, count: indexImage.count,
-                                    offset: 0)
-            }
-            try Posix.fsync(weightsFd, path: weightsPath)
+            try Posix.rename(from: tmpPath, to: weightsPath)
         } else {
             // Grown index: rebuild the file with every payload byte shifted.
-            let tmpPath = weightsPath + ".mtp-attach.tmp"
-            let outFd = try Posix.openCreateRW(tmpPath)
-            defer { close(outFd) }
-            try indexImage.withUnsafeBytes {
-                try Posix.pwriteAll(fd: outFd, path: tmpPath,
-                                    buf: $0.baseAddress!, count: indexImage.count,
-                                    offset: 0)
+            do {
+                let outFd = try Posix.openCreateRW(tmpPath)
+                defer { close(outFd) }
+                try indexImage.withUnsafeBytes {
+                    try Posix.pwriteAll(fd: outFd, path: tmpPath,
+                                        buf: $0.baseAddress!, count: indexImage.count,
+                                        offset: 0)
+                }
+                let tile = 8 << 20
+                let buf = UnsafeMutableRawBufferPointer.allocate(byteCount: tile, alignment: 16_384)
+                defer { buf.deallocate() }
+                var copied: UInt64 = 0
+                while copied < oldResidentSize {
+                    let take = Int(min(UInt64(tile), oldResidentSize - copied))
+                    try Posix.preadAll(fd: weightsFd, path: weightsPath,
+                                       buf: buf.baseAddress!, count: take,
+                                       offset: oldIndexSize + copied)
+                    try Posix.pwriteAll(fd: outFd, path: tmpPath,
+                                        buf: buf.baseAddress!, count: take,
+                                        offset: newIndexSize + copied)
+                    copied += UInt64(take)
+                }
+                try appended.withUnsafeBytes {
+                    try Posix.pwriteAll(fd: outFd, path: tmpPath,
+                                        buf: $0.baseAddress!, count: appended.count,
+                                        offset: newIndexSize + oldResidentSize)
+                }
+                try Posix.fsync(outFd, path: tmpPath)
             }
-            let tile = 8 << 20
-            let buf = UnsafeMutableRawBufferPointer.allocate(byteCount: tile, alignment: 16_384)
-            defer { buf.deallocate() }
-            var copied: UInt64 = 0
-            while copied < oldResidentSize {
-                let take = Int(min(UInt64(tile), oldResidentSize - copied))
-                try Posix.preadAll(fd: weightsFd, path: weightsPath,
-                                   buf: buf.baseAddress!, count: take,
-                                   offset: oldIndexSize + copied)
-                try Posix.pwriteAll(fd: outFd, path: tmpPath,
-                                    buf: buf.baseAddress!, count: take,
-                                    offset: newIndexSize + copied)
-                copied += UInt64(take)
-            }
-            try appended.withUnsafeBytes {
-                try Posix.pwriteAll(fd: outFd, path: tmpPath,
-                                    buf: $0.baseAddress!, count: appended.count,
-                                    offset: newIndexSize + oldResidentSize)
-            }
-            try Posix.fsync(outFd, path: tmpPath)
             try Posix.rename(from: tmpPath, to: weightsPath)
         }
 
@@ -510,9 +527,40 @@ public enum MTPAttachTool {
         gturboDirectory: String,
         config: SurgeryConfig
     ) throws -> SurgeryResult {
-        guard config.routerTemperature > 0, config.finalNormScale > 0 else {
-            throw RepackError.configurationInvalid(
-                detail: "routerTemperature and finalNormScale must be positive")
+        let mtpQKNormScale = config.mtpQKNormScale ?? (config.coAdaptMTP ? config.qkNormScale : 1.0)
+        let mtpRouterTemp = config.mtpRouterTemperature ?? (config.coAdaptMTP ? config.routerTemperature : 1.0)
+        let mtpResidualScale = config.mtpResidualScale ?? (config.coAdaptMTP ? config.lateLayerResidualScale : 1.0)
+        let mtpSharedExpertScale = config.mtpSharedExpertScale ?? (config.coAdaptMTP ? config.sharedExpertScale : 1.0)
+        let positiveParams: [(String, Float)] = [
+            ("finalNormScale", config.finalNormScale),
+            ("qkNormScale", config.qkNormScale),
+            ("routerTemperature", config.routerTemperature),
+            ("lateLayerResidualScale", config.lateLayerResidualScale),
+            ("lateLinearResidualScale", config.lateLinearResidualScale),
+            ("sharedExpertScale", config.sharedExpertScale),
+            ("mtpNormScale", config.mtpNormScale),
+            ("mtpHiddenNormScale", config.mtpHiddenNormScale),
+            ("mtpQKNormScale", mtpQKNormScale),
+            ("mtpRouterTemperature", mtpRouterTemp),
+            ("mtpResidualScale", mtpResidualScale),
+            ("mtpSharedExpertScale", mtpSharedExpertScale),
+        ]
+        for (paramName, value) in positiveParams {
+            guard value.isFinite, value > 0 else {
+                throw RepackError.configurationInvalid(
+                    detail: "\(paramName) must be finite and positive (got \(value))")
+            }
+        }
+        let ratioParams: [(String, Float)] = [
+            ("qkNormStartLayerRatio", config.qkNormStartLayerRatio),
+            ("lateLayerStartFraction", config.lateLayerStartFraction),
+            ("sharedExpertStartLayerRatio", config.sharedExpertStartLayerRatio),
+        ]
+        for (paramName, ratio) in ratioParams {
+            guard ratio.isFinite, ratio >= 0.0, ratio <= 1.0 else {
+                throw RepackError.configurationInvalid(
+                    detail: "\(paramName) must be finite and within 0.0...1.0 (got \(ratio))")
+            }
         }
         let weightsPath = (gturboDirectory as NSString)
             .appendingPathComponent("model_weights.bin")
@@ -527,46 +575,53 @@ public enum MTPAttachTool {
             throw RepackError.configurationInvalid(
                 detail: "\(manifestPath) is not a valid .gturbo manifest")
         }
+        if manifestRoot["surgery"] != nil && !config.allowReapply {
+            throw RepackError.configurationInvalid(
+                detail: "\(gturboDirectory) already has resident weight surgery recorded in " +
+                        "manifest.json; pass --overwrite or --surgery-force to re-apply")
+        }
         let numLayers = (arch["numLayers"] as? Int) ?? 0
         let qkStartLayer = Int(Float(max(0, numLayers)) * max(0.0, min(1.0, config.qkNormStartLayerRatio)))
         let lateStartLayer = Int(Float(max(0, numLayers)) * max(0.0, min(1.0, config.lateLayerStartFraction)))
         let sharedStartLayer = Int(Float(max(0, numLayers)) * max(0.0, min(1.0, config.sharedExpertStartLayerRatio)))
         let routerScale = 1.0 / config.routerTemperature
-        let mtpQKNormScale = config.mtpQKNormScale ?? (config.coAdaptMTP ? config.qkNormScale : 1.0)
-        let mtpRouterTemp = config.mtpRouterTemperature ?? (config.coAdaptMTP ? config.routerTemperature : 1.0)
-        guard mtpRouterTemp > 0 else {
-            throw RepackError.configurationInvalid(detail: "mtpRouterTemperature must be positive")
-        }
         let mtpRouterScale = 1.0 / mtpRouterTemp
-        let mtpResidualScale = config.mtpResidualScale ?? (config.coAdaptMTP ? config.lateLayerResidualScale : 1.0)
-        let mtpSharedExpertScale = config.mtpSharedExpertScale ?? (config.coAdaptMTP ? config.sharedExpertScale : 1.0)
 
-        let weightsFd = try Posix.openExistingRW(weightsPath)
-        defer { close(weightsFd) }
-        let fileSize = try Posix.fileSize(fd: weightsFd, path: weightsPath)
-        let (_, _, entries) = try readIndex(fd: weightsFd, path: weightsPath)
-
-        func scaleBF16Region(offset: UInt64, byteCount: UInt64, factor: Float) throws {
-            guard factor != 1.0, byteCount > 0, byteCount % 2 == 0 else { return }
-            let count = Int(byteCount / 2)
-            var words = [UInt16](repeating: 0, count: count)
-            try words.withUnsafeMutableBytes {
-                try Posix.preadAll(fd: weightsFd, path: weightsPath,
-                                   buf: $0.baseAddress!, count: Int(byteCount), offset: offset)
-            }
-            for i in 0..<count {
-                let v = Float(bitPattern: UInt32(words[i]) << 16) * factor
-                words[i] = Int4AffineEncoder.bf16Bits(v)
-            }
-            try words.withUnsafeBytes {
-                try Posix.pwriteAll(fd: weightsFd, path: weightsPath,
-                                    buf: $0.baseAddress!, count: Int(byteCount), offset: offset)
-            }
-        }
+        // Stage onto a sibling file (APFS copy-on-write clone) so a crash never leaves
+        // half-scaled weights on disk, then swap atomically over model_weights.bin.
+        let tmpWeightsPath = weightsPath + ".surgery.tmp"
+        try? FileManager.default.removeItem(atPath: tmpWeightsPath)
+        try FileManager.default.copyItem(atPath: weightsPath, toPath: tmpWeightsPath)
+        defer { try? FileManager.default.removeItem(atPath: tmpWeightsPath) }
 
         var modifiedNorms = 0
         var modifiedAffine = 0
         var didCoAdaptMTP = false
+        let fileSize: UInt64
+
+        do {
+            let weightsFd = try Posix.openExistingRW(tmpWeightsPath)
+            defer { close(weightsFd) }
+            fileSize = try Posix.fileSize(fd: weightsFd, path: tmpWeightsPath)
+            let (_, _, entries) = try readIndex(fd: weightsFd, path: tmpWeightsPath)
+
+            func scaleBF16Region(offset: UInt64, byteCount: UInt64, factor: Float) throws {
+                guard factor != 1.0, byteCount > 0, byteCount % 2 == 0 else { return }
+                let count = Int(byteCount / 2)
+                var words = [UInt16](repeating: 0, count: count)
+                try words.withUnsafeMutableBytes {
+                    try Posix.preadAll(fd: weightsFd, path: tmpWeightsPath,
+                                       buf: $0.baseAddress!, count: Int(byteCount), offset: offset)
+                }
+                for i in 0..<count {
+                    let v = Float(bitPattern: UInt32(words[i]) << 16) * factor
+                    words[i] = Int4AffineEncoder.bf16Bits(v)
+                }
+                try words.withUnsafeBytes {
+                    try Posix.pwriteAll(fd: weightsFd, path: tmpWeightsPath,
+                                        buf: $0.baseAddress!, count: Int(byteCount), offset: offset)
+                }
+            }
 
         for entry in entries {
             let isMtpLayer = entry.name.hasPrefix("mtp.")
@@ -709,14 +764,46 @@ public enum MTPAttachTool {
                                             factor: config.lateLayerResidualScale)
                         modifiedAffine += 1
                     }
+                } else if !isMtpLayer,
+                          config.lateLinearResidualScale != 1.0,
+                          entry.name.hasSuffix(".linear_attn.out_proj.weight"),
+                          let layerIdx = parseLayerIndex(from: entry.name),
+                          layerIdx >= lateStartLayer {
+                    try scaleBF16Region(offset: entry.scaleOffset,
+                                        byteCount: entry.scaleSize,
+                                        factor: config.lateLinearResidualScale)
+                    try scaleBF16Region(offset: entry.biasOffset,
+                                        byteCount: entry.biasSize,
+                                        factor: config.lateLinearResidualScale)
+                    modifiedAffine += 1
                 }
             }
         }
+            try Posix.fsync(weightsFd, path: tmpWeightsPath)
+        }
 
-        try Posix.fsync(weightsFd, path: weightsPath)
-        let sha = try Sha256Stream.hashFile(path: weightsPath, tileBytes: 8 << 20)
+        let sha = try Sha256Stream.hashFile(path: tmpWeightsPath, tileBytes: 8 << 20)
+        try Posix.rename(from: tmpWeightsPath, to: weightsPath)
         files["model_weights.bin"] = ["size": Int(fileSize), "sha256": sha]
         manifestRoot["files"] = files
+        manifestRoot["surgery"] = [
+            "coAdaptMTP": didCoAdaptMTP,
+            "finalNormScale": Double(config.finalNormScale),
+            "lateLayerResidualScale": Double(config.lateLayerResidualScale),
+            "lateLayerStartFraction": Double(config.lateLayerStartFraction),
+            "lateLinearResidualScale": Double(config.lateLinearResidualScale),
+            "mtpHiddenNormScale": Double(config.mtpHiddenNormScale),
+            "mtpNormScale": Double(config.mtpNormScale),
+            "mtpQKNormScale": Double(mtpQKNormScale),
+            "mtpResidualScale": Double(mtpResidualScale),
+            "mtpRouterTemperature": Double(mtpRouterTemp),
+            "mtpSharedExpertScale": Double(mtpSharedExpertScale),
+            "qkNormScale": Double(config.qkNormScale),
+            "qkNormStartLayerRatio": Double(config.qkNormStartLayerRatio),
+            "routerTemperature": Double(config.routerTemperature),
+            "sharedExpertScale": Double(config.sharedExpertScale),
+            "sharedExpertStartLayerRatio": Double(config.sharedExpertStartLayerRatio),
+        ] as [String: Any]
         let newManifest = try JSONSerialization.data(
             withJSONObject: manifestRoot,
             options: [.sortedKeys, .withoutEscapingSlashes])
@@ -725,8 +812,15 @@ public enum MTPAttachTool {
         let receiptPath = (gturboDirectory as NSString)
             .appendingPathComponent("verified-install.json")
         try? FileManager.default.removeItem(atPath: receiptPath)
-        _ = try? VerifiedInstallTool.run(
-            options: VerifyInstallOptions(inputGTurbo: gturboDirectory))
+        do {
+            _ = try VerifiedInstallTool.run(
+                options: VerifyInstallOptions(inputGTurbo: gturboDirectory))
+        } catch {
+            throw RepackError.configurationInvalid(
+                detail: "Resident weight surgery was applied, but regenerating the install " +
+                        "receipt failed (\(error)); repair the install and run " +
+                        "--verify-install --input-gturbo \(gturboDirectory)")
+        }
 
         return SurgeryResult(modifiedNormTensors: modifiedNorms,
                              modifiedAffineTensors: modifiedAffine,
@@ -826,11 +920,6 @@ public enum MTPAttachTool {
         try FileManager.default.createDirectory(atPath: auxDir, withIntermediateDirectories: true)
         let finalPath = (auxDir as NSString).appendingPathComponent("layer_00.bin")
         let totalSize = UInt64(numExperts) * expertStride
-        if let existingSize = (try? FileManager.default.attributesOfItem(atPath: finalPath)[.size] as? NSNumber)?.uint64Value,
-           existingSize == totalSize {
-            let sha = try Sha256Stream.hashFile(path: finalPath, tileBytes: 8 << 20)
-            return (totalSize, sha, expertStride)
-        }
         let tmpPath = finalPath + ".mtp-attach.tmp"
         try? FileManager.default.removeItem(atPath: tmpPath)
 

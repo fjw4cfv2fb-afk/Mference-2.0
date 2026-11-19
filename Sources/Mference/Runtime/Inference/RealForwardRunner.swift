@@ -450,6 +450,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
     public let maxContext: Int
 
+    /// Cached per-runner environment switches so hot-path decode/verify steps
+    /// never rebuild `ProcessInfo.processInfo.environment`.
+    private let useMultiXEnabled: Bool
+    private let debugLoggingEnabled: Bool
+    private let phaseLoggingEnabled: Bool
+    private let defaultSpecDraftK: Int
+
     /// Per-instance head and RDADVISE modes. The fused head (default) skips the
     /// 512 KB logits write and leaves a greedy argmax in `lastGreedyToken`;
     /// callers that sample from the logits buffer (non-greedy configs) must pass
@@ -640,12 +647,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.routerEvent = context.device.makeSharedEvent()
         self.eagerFetchEvent = context.device.makeSharedEvent()
         self.maxContext = maxContext
+        let env = ProcessInfo.processInfo.environment
+        self.useMultiXEnabled = env["MFERENCE_USE_MULTIX"] != "0"
+        self.debugLoggingEnabled = env["MFERENCE_DEBUG"] == "1"
+        self.phaseLoggingEnabled = env["MFERENCE_PHASES"] == "1"
+        self.defaultSpecDraftK = env["MFERENCE_SPEC_K"].flatMap(Int.init)
+            ?? env["MFERENCE_MTP_K"].flatMap(Int.init) ?? 2
         // Shadow prefetch is the accepted DSV4 production default
         // (community A/B 2026-08-07: short +18%, long +13%, byte-identical;
         // docs/experiments/summaries/14-dsv4-shadow-prefetch.md). The env
         // variable still overrides in either direction; other families keep
         // `off` until they have their own accepted A/B.
-        if ProcessInfo.processInfo.environment["MFERENCE_SPEC_PREFETCH"] == nil,
+        if env["MFERENCE_SPEC_PREFETCH"] == nil,
            (model.config.family == .deepseekV4Flash || model.config.family == .qwen36) {
             self.speculativePrefetchMode = .shadow
         }
@@ -1902,7 +1915,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         let emitted = (0...accepted).map { targets[$0] }
 
-        if ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1" {
+        if debugLoggingEnabled {
             print("[verify timing]: tokens=\(verifyTokens.count) verify=\(String(format: "%.2f", Double(verifyNanos)/1e6))ms accepted=\(accepted) drafts=\(drafts) targets=\(targets)")
         }
 
@@ -1917,7 +1930,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         // 6. Synchronize accepted target hidden states + KV into MTP speculator.
         if let mtp {
-            let wroteVerifyNormed = ProcessInfo.processInfo.environment["MFERENCE_USE_MULTIX"] != "0"
+            let wroteVerifyNormed = useMultiXEnabled
                 && verifyTokens.count <= LMHeadGreedyMultiX.maxTokens
             if !wroteVerifyNormed {
                 guard let normCB = ctx.queue.makeCommandBuffer() else {
@@ -1965,9 +1978,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         var slotCap: Int
                         if cfg.topKExperts > 0, let slots = model.routedExpertCacheSlotCount(layer: 0) {
                             let rawCap = max(1, (slots / cfg.topKExperts) - 1)
-                            // Cap adaptive draft depth at K = 2 so 4-token MoE verify does not
-                            // amplify expert-cache streaming latency.
-                            slotCap = min(2, rawCap)
+                            // Cap adaptive draft depth at K = 2 on <= 32-slot caches so 4-token MoE verify
+                            // does not amplify expert-cache streaming latency; allow K = 3 at 48+ slots.
+                            slotCap = slots >= 48 ? min(3, rawCap) : min(2, rawCap)
                         } else {
                             slotCap = 2
                         }
@@ -1976,20 +1989,16 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         }
                         draftK = qwen36Spec.recommendedDraftCount(maxSlotSupportedK: slotCap)
                     } else {
-                        let rawK = ProcessInfo.processInfo.environment["MFERENCE_SPEC_K"].flatMap(Int.init)
-                            ?? ProcessInfo.processInfo.environment["MFERENCE_MTP_K"].flatMap(Int.init) ?? 2
-                        draftK = min(4, max(1, rawK))
+                        draftK = min(4, max(1, defaultSpecDraftK))
                     }
                 } else {
-                    let rawK = ProcessInfo.processInfo.environment["MFERENCE_SPEC_K"].flatMap(Int.init)
-                        ?? ProcessInfo.processInfo.environment["MFERENCE_MTP_K"].flatMap(Int.init) ?? 2
-                    draftK = min(4, max(1, rawK))
+                    draftK = min(4, max(1, defaultSpecDraftK))
                 }
                 do {
                     try await runVerifyRound(token: token, position: position, draftCount: draftK)
                     return
                 } catch {
-                    if ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1" {
+                    if phaseLoggingEnabled {
                         print("[spec round error]: \(error)")
                     }
                 }
@@ -2979,25 +2988,55 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             } else {
                 perExpertScale = (onesPerExpertScale!, 0)
             }
-            prefillRouter.encodeGemma4Block(
-                        commandBuffer: cb,
-                        weights: views.router.buffer,
-                        weightsOffset: Int(views.router.offset),
-                        scales: views.router.buffer,
-                        scalesOffset: Int(views.router.scaleOffset),
-                        biases: views.router.buffer,
-                        biasesOffset: Int(views.router.biasOffset),
-                        hidden: cfg.ffnSandwichNorms ? scratch.routerX : scratch.routedX,
-                        effectiveScale: effectiveScaleBuffers[L],
-                        perExpertScale: perExpertScale.buffer,
-                        perExpertScaleOffset: perExpertScale.offset,
-                        outIndices: scratch.routeIDs,
-                        outWeights: scratch.routeWeights,
-                        queryCount: UInt32(t),
-                        numExperts: UInt32(cfg.numExperts),
-                        d: UInt32(D),
-                        topK: UInt32(cfg.topKExperts),
-                        hiddenStrideElements: UInt32(D))
+            let routerInput = cfg.ffnSandwichNorms ? scratch.routerX : scratch.routedX
+            if isVerifyPass,
+               t <= 4,
+               MoE.routerTopKWidths.contains(UInt32(cfg.topKExperts)),
+               UInt32(cfg.numExperts) <= MoE.maxRouterExperts {
+                let halfBytes = MemoryLayout<Float16>.stride
+                let u32Bytes = MemoryLayout<UInt32>.stride
+                for r in 0..<t {
+                    moe.encodeRouterGemma4(commandBuffer: cb,
+                                           weights: views.router.buffer,
+                                           weightsOffset: Int(views.router.offset),
+                                           scales: views.router.buffer,
+                                           scalesOffset: Int(views.router.scaleOffset),
+                                           biases: views.router.buffer,
+                                           biasesOffset: Int(views.router.biasOffset),
+                                           hidden: routerInput,
+                                           hiddenOffset: r * D * halfBytes,
+                                           effectiveScale: effectiveScaleBuffers[L],
+                                           perExpertScale: perExpertScale.buffer,
+                                           perExpertScaleOffset: perExpertScale.offset,
+                                           outIndices: scratch.routeIDs,
+                                           outIndicesOffset: r * cfg.topKExperts * u32Bytes,
+                                           outWeights: scratch.routeWeights,
+                                           outWeightsOffset: r * cfg.topKExperts * halfBytes,
+                                           numExperts: UInt32(cfg.numExperts),
+                                           d: UInt32(D),
+                                           topK: UInt32(cfg.topKExperts))
+                }
+            } else {
+                prefillRouter.encodeGemma4Block(
+                            commandBuffer: cb,
+                            weights: views.router.buffer,
+                            weightsOffset: Int(views.router.offset),
+                            scales: views.router.buffer,
+                            scalesOffset: Int(views.router.scaleOffset),
+                            biases: views.router.buffer,
+                            biasesOffset: Int(views.router.biasOffset),
+                            hidden: routerInput,
+                            effectiveScale: effectiveScaleBuffers[L],
+                            perExpertScale: perExpertScale.buffer,
+                            perExpertScaleOffset: perExpertScale.offset,
+                            outIndices: scratch.routeIDs,
+                            outWeights: scratch.routeWeights,
+                            queryCount: UInt32(t),
+                            numExperts: UInt32(cfg.numExperts),
+                            d: UInt32(D),
+                            topK: UInt32(cfg.topKExperts),
+                            hiddenStrideElements: UInt32(D))
+            }
 
             let FmoE = UInt32(cfg.moeIntermediateSize)
             let maxVerifyTokens = LMHeadGreedyMultiX.maxTokens
@@ -3232,7 +3271,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 }
                 let tIoNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
 
-                if ProcessInfo.processInfo.environment["MFERENCE_DEBUG"] == "1" && L < 3 {
+                if debugLoggingEnabled && L < 3 {
                     print("[verify L\(L)]: rWait=\(String(format: "%.2f", Double(tRouterWait)/1e6))ms plan=\(String(format: "%.2f", Double(tPlanNanos)/1e6))ms enc=\(String(format: "%.2f", Double(tEncodeNanos)/1e6))ms ioIssue=\(String(format: "%.2f", Double(tIoNanos)/1e6))ms misses=\(plan.misses.count)")
                 }
 
@@ -3609,7 +3648,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if writeFinalHead {
             let finalNorm = model.finalNorm
             let lm = model.lmHead
-            if ProcessInfo.processInfo.environment["MFERENCE_USE_MULTIX"] != "0" && isVerifyPass && t <= LMHeadGreedyMultiX.maxTokens {
+            if useMultiXEnabled && isVerifyPass && t <= LMHeadGreedyMultiX.maxTokens {
                 guard let headCB = ctx.queue.makeCommandBuffer() else {
                     throw ModelError.residentBufferWrapFailed
                 }
@@ -3671,10 +3710,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     verifyResults.append(greedyTokenBuf.contents().load(as: UInt32.self))
                 }
             } else {
+                let mtpNoVerify = !isVerifyPass ? (speculator as? Qwen36MTPSpeculator) : nil
+                if let mtp = mtpNoVerify {
+                    try mtp.flushPendingAcceptIfNeeded()
+                }
                 guard let finalCB = ctx.queue.makeCommandBuffer() else {
                     throw ModelError.residentBufferWrapFailed
                 }
-                let mtpNoVerify = !isVerifyPass ? (speculator as? Qwen36MTPSpeculator) : nil
                 if let mtp = mtpNoVerify {
                     self.rms.encodeBF16W(commandBuffer: finalCB,
                                          x: scratch.hidden,
@@ -4494,8 +4536,33 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         if emitHead {
             let useFusedHeadForThisToken = useFusedGreedyHead && outputMode == .greedyIfAvailable
+            let mtp = speculator as? Qwen36MTPSpeculator
+            if let mtp {
+                try mtp.flushPendingAcceptIfNeeded()
+            }
             let headCB = ctx.queue.makeCommandBuffer()!
-            if useFusedHeadForThisToken {
+            if let mtp {
+                self.rms.encodeBF16W(commandBuffer: headCB, x: self.hidden,
+                                     weight: fNorm.buffer, weightOffset: Int(fNorm.offset),
+                                     out: mtp.lastHiddenBuf, d: D, eps: eps)
+                if useFusedHeadForThisToken {
+                    self.fusionHead.encodeGreedyFromNormed(
+                        commandBuffer: headCB,
+                        normedHidden: mtp.lastHiddenBuf,
+                        normedOffset: 0,
+                        weights: lm.buffer, weightsOffset: Int(lm.offset),
+                        scales: lm.buffer, scalesOffset: Int(lm.scaleOffset),
+                        biases: lm.buffer, biasesOffset: Int(lm.biasOffset),
+                        outToken: self.greedyTokenBuf,
+                        d: D, vocab: UInt32(self.cfg.vocabSize))
+                } else {
+                    self.int4.encode(commandBuffer: headCB,
+                                     weights: lm.buffer, weightsOffset: Int(lm.offset),
+                                     scales:  lm.buffer, scalesOffset:  Int(lm.scaleOffset),
+                                     biases:  lm.buffer, biasesOffset:  Int(lm.biasOffset),
+                                     x: mtp.lastHiddenBuf, y: logits, m: UInt32(self.cfg.vocabSize), n: D)
+                }
+            } else if useFusedHeadForThisToken {
                 gFusionHead(headCB)
             } else {
                 gFinalNorm(headCB)
@@ -4518,18 +4585,6 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
             } else {
                 totalHeadNanos &+= clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tHead
-            }
-            if let mtp = speculator as? Qwen36MTPSpeculator {
-                if let normCB = ctx.queue.makeCommandBuffer() {
-                    self.rms.encodeBF16W(commandBuffer: normCB,
-                                         x: self.hidden,
-                                         weight: fNorm.buffer,
-                                         weightOffset: Int(fNorm.offset),
-                                         out: mtp.lastHiddenBuf,
-                                         d: D, eps: eps)
-                    normCB.commit()
-                    waitForCompletion(normCB)
-                }
             }
         } else {
             if let pending = pendingRoutedCommand {

@@ -17,7 +17,7 @@ default_bin = os.path.join(REPO_ROOT, ".build/out/Products/Release/MferenceCLI")
 if not os.path.exists(default_bin):
     default_bin = os.path.join(REPO_ROOT, ".build/arm64-apple-macosx/release/MferenceCLI")
 CLI_BIN = os.environ.get("CLI_BIN", default_bin)
-MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(REPO_ROOT, "scratch/test_qwen36.gturbo"))
+MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(REPO_ROOT, "scratch/qwen36-mtp.gturbo"))
 DEFAULT_OUT_FILE = os.path.join(REPO_ROOT, "benchmarks/baseline-reasoning-accuracy.json")
 
 PROBLEMS = [
