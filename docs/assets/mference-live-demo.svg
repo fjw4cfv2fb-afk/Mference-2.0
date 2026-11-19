@@ -6,7 +6,7 @@
       <stop offset="100%" stop-color="#a371f7"/>
     </linearGradient>
     <clipPath id="codeClip">
-      <rect x="36" y="138" width="472" height="252"/>
+      <rect x="36" y="138" width="478" height="252"/>
     </clipPath>
   </defs>
 
@@ -82,7 +82,7 @@
   <text x="471" y="113" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10.5" font-weight="700" fill="#3fb950">9/9 OK</text>
 
   <!-- Streaming Swift Lines -->
-  <g clip-path="url(#codeClip)" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11.3">
+  <g clip-path="url(#codeClip)" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="9.5">
     <text class="l1" x="38" y="150" fill="#ff7b72">func <tspan fill="#d2a8ff">shortestSubarrayAtLeastK</tspan><tspan fill="#c9d1d9">(_ nums: [Int], _ k: Int) -&gt; Int {</tspan></text>
     <text class="l2" x="38" y="169" fill="#c9d1d9">    let n = nums.count</text>
     <text class="l3" x="38" y="188" fill="#c9d1d9">    var prefixSum = Array(repeating: 0, count: n + 1)</text>
@@ -92,7 +92,7 @@
     <text class="l7" x="38" y="264" fill="#c9d1d9">    for j in 0...n {</text>
     <text class="l8" x="38" y="283" fill="#79c0ff">        while head &lt; tail &amp;&amp; prefixSum[j] - prefixSum[deque[head]] &gt;= k {</text>
     <text class="l9" x="38" y="302" fill="#c9d1d9">            minLength = min(minLength, j - deque[head]); head += 1</text>
-    <text class="l10" x="38" y="321" fill="#79c0ff">        } ; while head &lt; tail &amp;&amp; prefixSum[deque[tail - 1]] &gt;= prefixSum[j] { tail -= 1 }</text>
+    <text class="l10" x="38" y="321" fill="#79c0ff">        } ; while head &lt; tail &amp;&amp; prefixSum[deque[tail-1]] &gt;= prefixSum[j] { tail -= 1 }</text>
     <text class="l11" x="38" y="340" fill="#c9d1d9">        deque[tail] = j; tail += 1</text>
     <text class="l12" x="38" y="359" fill="#c9d1d9">    } ; return minLength == Int.max ? -1 : minLength <tspan class="cur" fill="#3fb950">█</tspan></text>
     <text class="l12" x="38" y="378" fill="#c9d1d9">}</text>
@@ -100,7 +100,7 @@
 
   <!-- Left Bottom Telemetry Bar -->
   <rect x="38" y="394" width="468" height="26" rx="6" fill="#0d1117" stroke="#30363d"/>
-  <text x="48" y="411" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" fill="#8b949e">visible: 249 tok · wall: 27.96s · <tspan fill="#3fb950" font-weight="700">MTP: 82.1% (457/182 = 2.51 tok/round)</tspan></text>
+  <text x="46" y="411" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="10.2" fill="#8b949e">visible: 249 tok · wall: 27.96s · <tspan fill="#3fb950" font-weight="700">MTP: 82.1% (457/182 = 2.51 tok/round)</tspan></text>
 
   <!-- Top-Right Pane: 16 GB Unified Memory Monitor -->
   <rect x="536" y="52" width="340" height="182" rx="12" fill="#161b22" stroke="#30363d"/>
@@ -121,12 +121,12 @@
   <text x="702" y="111" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Memory Pressure</text>
   <text x="702" y="131" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="15" font-weight="800" fill="#3fb950">GREEN · FLAT</text>
 
-  <text x="554" y="164" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">NVMe Expert Cache</text>
-  <text x="858" y="164" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">32 Slots (Pread + Tail Warm)</text>
-  <text x="554" y="188" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Resident Core + MTP</text>
-  <text x="858" y="188" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">1.41 GB + Slab (MADV_RANDOM)</text>
-  <text x="554" y="212" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Stability Guard</text>
-  <text x="858" y="212" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#3fb950">Single Server · No Swap Panic</text>
+  <text x="554" y="164" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Expert Cache</text>
+  <text x="858" y="164" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">32 Slots (Pread + Tail Warm)</text>
+  <text x="554" y="188" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Resident + MTP</text>
+  <text x="858" y="188" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">1.41 GB + MADV_RANDOM Slab</text>
+  <text x="554" y="212" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Stability Guard</text>
+  <text x="858" y="212" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#3fb950">Single Server · No Swap Panic</text>
 
   <!-- Bottom-Right Pane: Speculative Verify + Surgery Pipeline -->
   <rect x="536" y="250" width="340" height="182" rx="12" fill="#161b22" stroke="#30363d"/>
@@ -148,14 +148,14 @@
     <text x="814" y="306" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#a371f7">PLD d1 ✓</text>
   </g>
 
-  <text x="554" y="340" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">MTP Acceptance (AIME)</text>
-  <text x="858" y="340" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#3fb950">83.1% avg (94.3% peak)</text>
-  <text x="554" y="364" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">GDN Hybrid Rollback</text>
-  <text x="858" y="364" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#e6edf3">4-Slot Arena (Bit-Exact)</text>
-  <text x="554" y="388" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">INT4 Weight Surgery</text>
-  <text x="858" y="388" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#58a6ff">BF16 Scales · 0 Nibbles Changed</text>
-  <text x="554" y="412" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8b949e">Async Accept Seed</text>
-  <text x="858" y="412" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="12" font-weight="700" fill="#a371f7">Overlapped w/ Streaming</text>
+  <text x="554" y="340" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">MTP Acceptance</text>
+  <text x="858" y="340" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#3fb950">83.1% avg (94.3% AIME)</text>
+  <text x="554" y="364" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">GDN Rollback</text>
+  <text x="858" y="364" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#e6edf3">4-Slot Arena (Bit-Exact)</text>
+  <text x="554" y="388" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Weight Surgery</text>
+  <text x="858" y="388" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#58a6ff">BF16 Scales · 0 Nibbles</text>
+  <text x="554" y="412" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#8b949e">Async Accept</text>
+  <text x="858" y="412" text-anchor="end" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="11" font-weight="700" fill="#a371f7">Overlapped w/ Streaming</text>
 
   <!-- Footer -->
   <text x="450" y="449" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8b949e">Recorded Telemetry from benchmarks/aa-scorecard-v2.json (16 GB Mac, temp = 0) · GitHub Release v2.0.0</text>

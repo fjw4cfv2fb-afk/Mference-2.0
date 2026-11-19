@@ -1,0 +1,100 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="Mference 2.0 GitHub Social Preview: Qwen 3.6 35B-A3B on a 16 GB Mac in Swift 6.1 and Metal 3">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="65%" stop-color="#0e131b"/>
+      <stop offset="100%" stop-color="#131926"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2ea043"/>
+      <stop offset="50%" stop-color="#388bfd"/>
+      <stop offset="100%" stop-color="#a371f7"/>
+    </linearGradient>
+    <radialGradient id="glowBlue" cx="82%" cy="18%" r="48%">
+      <stop offset="0%" stop-color="#388bfd" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#388bfd" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowGreen" cx="14%" cy="85%" r="45%">
+      <stop offset="0%" stop-color="#2ea043" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#2ea043" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="metalTile" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#222832"/>
+      <stop offset="100%" stop-color="#11161d"/>
+    </linearGradient>
+    <linearGradient id="metalM" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#f0f6fc"/>
+      <stop offset="52%" stop-color="#9ecbff"/>
+      <stop offset="100%" stop-color="#58a6ff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed dark canvas for crisp OpenGraph social cards -->
+  <rect width="1280" height="640" fill="url(#bgGrad)"/>
+  <rect width="1280" height="640" fill="url(#glowBlue)"/>
+  <rect width="1280" height="640" fill="url(#glowGreen)"/>
+  <rect x="0" y="0" width="1280" height="6" fill="url(#accentGrad)"/>
+
+  <!-- Top Badges -->
+  <rect x="64" y="42" width="184" height="30" rx="15" fill="#1f6feb" fill-opacity="0.18" stroke="#388bfd" stroke-opacity="0.5"/>
+  <text x="156" y="61" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.7" fill="#58a6ff">SWIFT 6.1 + METAL 3</text>
+
+  <rect x="262" y="42" width="214" height="30" rx="15" fill="#238636" fill-opacity="0.20" stroke="#3fb950" stroke-opacity="0.5"/>
+  <text x="369" y="61" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.7" fill="#3fb950">16 GB UNIFIED MEMORY</text>
+
+  <rect x="490" y="42" width="234" height="30" rx="15" fill="#8957e5" fill-opacity="0.20" stroke="#a371f7" stroke-opacity="0.5"/>
+  <text x="607" y="61" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.7" fill="#d2a8ff">NVME EXPERT STREAMING</text>
+
+  <rect x="1084" y="42" width="132" height="30" rx="15" fill="#161b22" stroke="#30363d"/>
+  <text x="1150" y="61" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="13" font-weight="700" fill="#e6edf3">Release v2.0.0</text>
+
+  <!-- Metallic Brand Emblem + Title -->
+  <rect x="64" y="96" width="104" height="104" rx="24" fill="url(#metalTile)" stroke="#30363d" stroke-width="2"/>
+  <path d="M88 174 L88 122 L103 122 L116 146 L129 122 L144 122 L144 174 L131 174 L131 143 L116 168 L101 143 L101 174 Z" fill="url(#metalM)"/>
+
+  <text x="192" y="142" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="52" font-weight="800" letter-spacing="-0.8" fill="#f0f6fc">Mference 2.0</text>
+  <text x="192" y="177" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="24" font-weight="600" fill="#c9d1d9">Qwen 3.6 35B-A3B (256-Expert MoE) on a 16 GB Mac</text>
+  <text x="192" y="206" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16.5" fill="#8b949e">19-Tensor MoE MTP · 4-Slot Gated-DeltaNet Rollback Arena · Lossless BF16 Scale Surgery</text>
+
+  <!-- 4 Metric Cards (2x2 Grid) -->
+  <!-- Card 1 -->
+  <rect x="64" y="242" width="562" height="148" rx="16" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="94" y="276" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.9" fill="#8b949e">PASS@1 ACCURACY (AA 8-TASK SCORECARD)</text>
+  <text x="94" y="336" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="50" font-weight="800" fill="#3fb950">100.0%</text>
+  <text x="296" y="334" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#e6edf3">8 / 8 passed</text>
+  <rect x="444" y="302" width="154" height="32" rx="16" fill="#238636" fill-opacity="0.28" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="521" y="323" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#3fb950">+75.0 pts vs INT4</text>
+  <text x="94" y="368" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" fill="#8b949e">Raw INT4 baseline: 25.0% (2/8) · Zero nibbles changed</text>
+
+  <!-- Card 2 -->
+  <rect x="654" y="242" width="562" height="148" rx="16" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="684" y="276" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.9" fill="#8b949e">PEAK DECODE THROUGHPUT</text>
+  <text x="684" y="336" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="50" font-weight="800" fill="#58a6ff">18.36</text>
+  <text x="832" y="334" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#e6edf3">tok/s (Swift)</text>
+  <rect x="1028" y="302" width="160" height="32" rx="16" fill="#1f6feb" fill-opacity="0.24" stroke="#388bfd" stroke-opacity="0.55"/>
+  <text x="1108" y="323" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#58a6ff">16.47 tok/s avg</text>
+  <text x="684" y="368" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" fill="#8b949e">AIME peak: 17.88 tok/s · 32 NVMe cache slots · Zero Python</text>
+
+  <!-- Card 3 -->
+  <rect x="64" y="414" width="562" height="148" rx="16" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="94" y="448" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.9" fill="#8b949e">ADAPTIVE 19-TENSOR MTP + 6-GRAM PLD</text>
+  <text x="94" y="508" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="50" font-weight="800" fill="#d2a8ff">83.1%</text>
+  <text x="258" y="506" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#e6edf3">accept rate</text>
+  <rect x="444" y="474" width="154" height="32" rx="16" fill="#8957e5" fill-opacity="0.28" stroke="#a371f7" stroke-opacity="0.55"/>
+  <text x="521" y="495" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#d2a8ff">94.3% on AIME</text>
+  <text x="94" y="540" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" fill="#8b949e">2.55 tokens/round · Bit-exact greedy speculative rollback</text>
+
+  <!-- Card 4 -->
+  <rect x="654" y="414" width="562" height="148" rx="16" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="684" y="448" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="700" letter-spacing="0.9" fill="#8b949e">REASONING EFFICIENCY &amp; WALL LATENCY</text>
+  <text x="684" y="508" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="50" font-weight="800" fill="#3fb950">-69.5%</text>
+  <text x="884" y="506" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="20" font-weight="600" fill="#e6edf3">&lt;think&gt; waste</text>
+  <rect x="1028" y="474" width="160" height="32" rx="16" fill="#238636" fill-opacity="0.28" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="1108" y="495" text-anchor="middle" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" font-weight="700" fill="#3fb950">-21.3% Task Time</text>
+  <text x="684" y="540" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14" fill="#8b949e">413.4 -&gt; 126.1 avg think tokens · 25.31s avg task wall time</text>
+
+  <!-- Footer -->
+  <line x1="64" y1="588" x2="1216" y2="588" stroke="#30363d" stroke-width="1"/>
+  <text x="64" y="616" font-family="'SF Mono', Menlo, Consolas, monospace" font-size="14.5" font-weight="600" fill="#c9d1d9">github.com/fjw4cfv2fb-afk/Mference-2.0</text>
+  <text x="1216" y="616" text-anchor="end" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" fill="#8b949e">macOS App · OpenAI API Server (:8080) · DeepSeek Harness · Apache-2.0 / MIT</text>
+</svg>

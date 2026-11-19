@@ -4,9 +4,17 @@ All metrics below match the reproducible A/B benchmark run in [`benchmarks/aa-sc
 
 ---
 
+## 0. Ready-to-Upload Images (`PNG`)
+
+- **GitHub Social Preview (`Settings → General → Social preview`, `1280×640`):** [`docs/assets/mference-social-preview-1280x640.png`](../assets/mference-social-preview-1280x640.png)
+- **Live Coding + Memory Demo Card (`1800×920`):** [`docs/assets/mference-live-demo.png`](../assets/mference-live-demo.png)
+- **Raw INT4 vs. Mference 2.0 Benchmark Card (`1800×890`):** [`docs/assets/mference-v2-benchmark.png`](../assets/mference-v2-benchmark.png)
+
+---
+
 ## 1. X / Twitter 4-Post Launch Thread
 
-Attach `docs/assets/mference-live-demo.svg` (rendered PNG/screen recording) to **Post 1** and `docs/assets/mference-v2-benchmark.svg` to **Post 2**.
+Attach [`docs/assets/mference-live-demo.png`](../assets/mference-live-demo.png) to **Post 1** and [`docs/assets/mference-v2-benchmark.png`](../assets/mference-v2-benchmark.png) to **Post 2**.
 
 ### Post 1 (The Hook + Demo)
 > I got Qwen 3.6 35B-A3B (4-bit, 256 MoE experts) running at **100% Pass@1 (8/8)** and up to **18.36 tok/s** on a **16 GB Mac** — in pure Swift 6.1 + Metal 3, streaming experts from NVMe with zero Python in inference.
