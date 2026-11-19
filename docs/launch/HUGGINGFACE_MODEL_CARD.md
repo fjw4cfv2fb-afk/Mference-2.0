@@ -19,6 +19,8 @@ tags:
 
 # Qwen3.6-35B-A3B-4bit-MTP-Surgery (.gturbo for Mference 2.0)
 
+*Hugging Face Repository:* **[`voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo`](https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo)**
+
 Run **[Qwen 3.6 35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (`40` hybrid Gated-DeltaNet + full-attention layers, `256` experts/layer, `top-8` routed + shared expert) on a **16 GB unified-memory Apple Silicon Mac** at **`100.0% (8/8)` Pass@1** and up to **`18.36 tok/s`** decode in pure **Swift 6.1 + Metal 3** via **[Mference 2.0](https://github.com/fjw4cfv2fb-afk/Mference-2.0)**.
 
 ## What Makes This Conversion Different?
