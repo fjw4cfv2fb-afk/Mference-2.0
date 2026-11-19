@@ -31,6 +31,32 @@
 
 ---
 
+## At a Glance — 35B MoE on a 16 GB Mac
+
+Measured on a **16 GB unified-memory Mac** (`32` expert cache slots, `temperature = 0`, `max_new_tokens = 512`) across the 8-task Artificial Analysis methodology suite ([`benchmarks/aa-scorecard-v2.json`](benchmarks/aa-scorecard-v2.json)):
+
+| Metric | Raw INT4 Baseline | Mference 2.0 (Surgery + Adaptive MTP) | Impact |
+| :--- | ---: | ---: | :--- |
+| **Pass@1 Accuracy** | `25.0%` (`2/8`) | **`100.0%` (`8/8`)** | **`+75.0 pts`** — eliminates `<think>` loops |
+| **Decode Speed** | `15.96 tok/s` | **`16.47 tok/s` avg** | Up to **`18.36 tok/s`** (Swift) / **`17.88 tok/s`** (AIME) |
+| **MTP Acceptance** | `79.1%` static `K=2` | **`83.1%` adaptive hybrid** | **`2.55`** tokens/round (up to **`94.3%`** on AIME) |
+| **Avg Time per Task** | `32.14s` | **`25.31s`** | **`-21.3%`** (`13.11s` avg TTFAT) |
+| **Thinking Waste** | `413.4` avg tokens | **`126.1` avg tokens** | **`-69.5%`** wasted reasoning tokens |
+
+```bash
+git clone https://github.com/fjw4cfv2fb-afk/Mference-2.0.git && cd Mference-2.0
+./mference-ui.sh install qwen36-mtp   # Qwen 3.6 35B-A3B + 19-tensor MTP shard + lossless surgery
+./mference-ui.sh                      # MferenceServer (:8080) + Open WebUI (:3000)
+```
+*(Or package the native macOS desktop app at `~/Applications/Mference.app` via `./Scripts/build-app.sh` — see [Try it](#try-it) for full CLI and DeepSeek Harness setup.)*
+
+### Why It Works
+1. **Lossless INT4 Resident Weight Surgery:** Scales `BF16` affine `scale`/`bias` tables ($\alpha w = (\alpha s)q + (\alpha b)$) and `BF16` norms directly inside `model_weights.bin` with automatic MTP co-adaptation and manifest provenance checks — fixing quantized reasoning collapse with **zero nibble re-quantization**.
+2. **Native 19-Tensor MoE MTP + 6-Gram Hybrid PLD:** Combines an async-pipelined `commitAcceptPass`, a 4-slot Gated-DeltaNet rollback arena, lossless `topK = 6` draft expert pruning, exact within-block top-2 EVICT margin truncation, and single-pass 6/5/4/3-gram prompt lookup for tool/code spans.
+3. **Bounded-Memory NVMe Expert Streaming (`16 GB` Safe):** Streams `256` routed experts per layer on demand via `PreadExpertStreamer` with prefill-tail warm start, `POSIX_MADV_RANDOM` slab-only MTP mapping, and a 2-slot LRU `ServerPromptCache` (`PrefixSnapshot`).
+
+---
+
 ## Architecture
 
 **Mference 2.0** is built around **[Qwen 3.6 35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (`40` layers in a 3:1 hybrid Gated-DeltaNet linear-attention + full-attention layout, `256` routed experts per layer with `top-8` routing + scalar-gated shared expert, and a `19`-tensor MTP speculative draft sidecar). Rather than loading all 35B parameters into RAM, it keeps resident core weights, linear GDN state, and KV cache in unified memory while streaming routed experts on demand from NVMe SSD.
@@ -104,16 +130,17 @@ Defined in [`Package.swift`](Package.swift):
    - Prefill-tail expert warm start (`v5`) sorts final-chunk experts so tail tokens stay resident in the slot cache for decode step 1.
 
 2. **Native MTP + Hybrid PLD Speculation (`v5`)**
-   - **Precomputed Seed & Verify/Rollback:** `RealForwardRunner` batches `[bonus] + drafts[0..<K]` through `executePrefillChunk` + `LMHeadGreedyMultiX`, rewinds `KVCacheManager` and restores linear-attention state from a **4-slot GDN rollback arena** on rejection, and precomputes the next round's `seedToken` and logit margin inside `commitAcceptPass`.
-   - **Phase-Aware Adaptive `K`:** `Qwen36MTPSpeculator` tracks `<think>`, visible prose, and `<tool_call>`/code-fence phases with per-position acceptance EMAs, lifting `K` immediately on `</think>` transitions and capping `K` under 16 GiB RAM/context pressure.
+   - **Async-Pipelined Seed & Verify/Rollback:** `RealForwardRunner` batches `[bonus] + drafts[0..<K]` through `executePrefillChunk` (using `MoE.encodeRouterGemma4` for `t <= 4`) + `LMHeadGreedyMultiX`, rewinds `KVCacheManager` and restores linear-attention state from a **4-slot GDN rollback arena** on rejection, and overlaps `commitAcceptPass` (syncing `mtpK`/`mtpV` + precomputing the next `seedToken`) asynchronously with CPU detokenization and SSE streaming.
+   - **Zero-Blit MTP Execution:** Draft and accept passes write `k_proj`/`v_proj` directly into `mtpK`/`mtpV`, batch accept-pass per-head norms + NeoX RoPE via `PrefillQKVEpilogue`, deduplicate final `RMSNorm` into `mtp.lastHiddenBuf`, and use `POSIX_MADV_RANDOM` slab-only mapping for `packed_experts_mtp/layer_00.bin`.
+   - **Phase-Aware Adaptive `K`:** `Qwen36MTPSpeculator` tracks `<think>`, visible prose, and `<tool_call>`/code-fence token transitions via `notifyTokens` with per-position acceptance EMAs, lifting `K` immediately on `</think>` transitions and capping `K` under 16 GiB RAM/context pressure.
    - **Lossless Draft Expert Pruning (`moe.metal`):** Draft steps use `router_topk_select_k4_par` / `k6_par` (`draftTopK = 6` by default) while trunk verification always evaluates full `topK = 8`.
-   - **EVICT Logit-Margin Truncation (`logit.metal` / `LMHeadChainInt4`):** Captures `top1 - top2` directly in the greedy argmax reducer and truncates `K` to `1` on low-confidence or phase-boundary tokens.
-   - **Hybrid PLD + MTP (`v5`):** Uses zero-cost 3-gram/4-gram Prompt Lookup Decoding over `tokenHistory` during `<tool_call>` and code spans to fill `draft[1..]` without running extra sequential MTP neural passes.
+   - **Exact Within-Block EVICT Truncation (`logit.metal` / `LMHeadChainInt4`):** `lm_head_greedy_int4_rows_chunk_raw` tracks within-8-row runner-up logits (`kLMHeadSingleRowSummaryStride = 3`) so `lastTop1Margin = top1 - top2` is exact across the full vocabulary before truncating weak/boundary steps to `K = 1`.
+   - **Hybrid PLD + MTP (`v5`):** Runs a zero-allocation single-pass backward scan checking 6/5/4/3-grams over `tokenHistory` during `<tool_call>` and fenced code spans (disambiguating repeated 4-grams with 5/6-gram context) to populate `draft[1..]` without extra sequential MTP neural passes.
    - **Dynamic Greedy / Sampled Mode Switching:** Pure greedy requests (`temperature == 0`, `repetitionPenalty == 1`) use the fused MTP head; requests with `temperature > 0` or penalties switch dynamically to full `.logits` sampling without reloading weights.
 
 3. **Lossless Resident Weight Surgery (`MTPAttachTool`)**
-   - Group-64 affine quantized weights satisfy $w = s \cdot q + b$, so scaling by $\alpha$ transforms linearly into $(\alpha \cdot s) \cdot q + (\alpha \cdot b)$ on `BF16` scale/bias tables and `BF16` norm vectors inside `model_weights.bin` — **never unpacking or re-quantizing `INT4`/`INT8` nibbles**.
-   - Automatically co-adapts `mtp.norm.weight`, `mtp.layers.0.self_attn.{q_norm,k_norm,o_proj}`, `mtp.layers.0.mlp.gate`, and `mtp.layers.0.mlp.shared_expert.down_proj` (`coAdaptMTP`), then refreshes SHA-256 digests and `verified-install.json`.
+   - Group-64 affine quantized weights satisfy $w = s \cdot q + b$, so scaling by $\alpha$ transforms linearly into $(\alpha \cdot s) \cdot q + (\alpha \cdot b)$ on `BF16` scale/bias tables and `BF16` norm vectors staged atomically via a `.surgery.tmp` clone before swapping over `model_weights.bin` — **never unpacking or re-quantizing `INT4`/`INT8` nibbles**.
+   - Supports optional late Gated-DeltaNet residual calibration (`--surgery-late-linear-residual`), finite/positive parameter validation, automatically co-adapts `mtp.norm.weight`, `mtp.layers.0.self_attn.{q_norm,k_norm,o_proj}`, `mtp.layers.0.mlp.gate`, and `mtp.layers.0.mlp.shared_expert.down_proj` (`coAdaptMTP`), records provenance under `manifest.json["surgery"]` to prevent accidental double-application, refreshes SHA-256 digests, and regenerates `verified-install.json`.
 
 4. **Multi-Slot LRU Prompt Cache & Agentic Guards (`v5`)**
    - `ServerPromptCache` manages up to `2` LRU prefix slots (shrinking automatically to `1` under memory pressure), saving and restoring linear KV cache, GDN recurrent states, and MTP `tokenHistory` via `PrefixSnapshot` when switching between interleaved conversations.

@@ -145,8 +145,8 @@ sequenceDiagram
 Key design wins in [`RealForwardRunner.swift`](Sources/Mference/Runtime/Inference/RealForwardRunner.swift) and [`Qwen36MTPSpeculator.swift`](Sources/Mference/Runtime/Inference/Qwen36MTPSpeculator.swift):
 
 - **4-Slot GDN Rollback Arena:** Captures snapshots of the Gated-DeltaNet recurrent + conv states during the batched verify pass so rejecting draft token `accepted < K` rolls back both full-attention KV (`kv.rewind`) and hybrid linear-attention GDN state without recomputing accepted prefix positions.
-- **Precomputed Next-Round Seed:** Inside `commitAcceptPass`, the batched MTP accept pass simultaneously updates `mtpK`/`mtpV` for all newly committed `(hidden, token)` pairs **and** runs `mtp.norm` + `draftHead.encodeGreedyFromNormed` on the final row, caching `seedToken`, `seedMargin`, and `seedHiddenBuf` for the next round. Round `N+1` starts directly from the already-computed `draft[0]` without running `runSingleDraftStep` for slot 0.
-- **Deduplicated RMSNorm:** When writing `mtp.lastHiddenBuf` on non-verify decode steps, `RealForwardRunner` calls `LMHeadChainInt4.encodeGreedyFromNormed` directly instead of recomputing final RMSNorm inside `LMHeadChainInt4`.
+- **Async-Pipelined Next-Round Seed (`commitAcceptPass`):** Submits the batched MTP accept pass asynchronously (`pendingAcceptCB`), simultaneously updating `mtpK`/`mtpV` for all newly committed `(hidden, token)` pairs and running `mtp.norm` + `draftHead.encodeGreedyFromNormed` for the next round's `seedToken`/`seedMargin` while CPU detokenization and SSE streaming proceed; `flushPendingAcceptIfNeeded()` synchronizes deterministically before any subsequent `draft`, continuation, reset, stats read, or write to `lastHiddenBuf`. Also safely resets `firstMissing = position - 1` whenever `mtpLen + missingCount > maxContext` wraps the MTP KV buffer.
+- **Zero-Blit MTP Execution & Parallel Verify Routing:** Draft and accept passes write `k_proj`/`v_proj` directly into `mtpK`/`mtpV` (`slotOffset` / `startSlot * kvBytes`) without intermediate KV buffers or `kvBlit` passes; `encodeAcceptPass` batches Q/K per-head norms + NeoX RoPE in one `PrefillQKVEpilogue.encodeNeoxSubdimNoVNorm` call; verify (`t <= 4`) and accept routing use parallel `MoE.encodeRouterGemma4` instead of `PrefillRouter`; `ResidentExpertStreamer(..., slabOnly: true)` skips 256 unused per-expert `MTLBuffer` wrappers and sets `POSIX_MADV_RANDOM` on `packed_experts_mtp/layer_00.bin`; and `produceToken` / prefill compute final RMSNorm once into `mtp.lastHiddenBuf` via `LMHeadChainInt4.encodeGreedyFromNormed` (or `int4.encode`).
 
 ### Phase-Aware Adaptive Draft Depth (`K`)
 
@@ -172,17 +172,17 @@ Behavior in `recommendedDraftCount(maxSlotSupportedK:)`:
 
 ### EVICT-Style Margin Truncation (`logit.metal` & `LMHeadChainInt4`)
 
-- [`Sources/Mference/Metal/Sampling/logit.metal`](Sources/Mference/Metal/Sampling/logit.metal) modifies `lm_head_greedy_int4_rows_reduce` so the single-pass argmax reducer tracks both `best_v` and runner-up `second_v`, writing `max(0.0, top1 - top2)` into `summaries[0]`.
+- [`Sources/Mference/Metal/Sampling/logit.metal`](Sources/Mference/Metal/Sampling/logit.metal) sets `kLMHeadSingleRowSummaryStride = 3` so `lm_head_greedy_int4_rows_chunk_raw` tracks each 8-row threadgroup's runner-up (`slot[2] = r_all`), and `lm_head_greedy_int4_rows_reduce` folds both chunk winners and `tg_second` into exact global `max(0.0, top1 - top2)` written at `summaries[0]`.
 - [`LMHeadChainInt4.lastTop1Margin`](Sources/Mference/Kernels/Fusions/LMHeadChainInt4.swift) reads this zero-copy shared float margin immediately after command completion.
 - `Qwen36MTPSpeculator.shouldTruncateAfterFirstDraft` truncates draft depth to `K = 1` (skipping sequential draft step 2 and reducing MoE verify bandwidth) when `draft[0]` lands on a control/phase token (`>= 248044`, `<think>`, `</think>`, `<tool_call>`, `</tool_call>`) or when `firstMargin < threshold` (`1.10` in `.thinking`/`.visibleProse`; `min(0.25, 1.10 * 0.45)` in `.structuredCodeOrTool`), **unless** PLD uniquely confirms `draft[0]`.
 
 ### Hybrid PLD + MTP Speculation
 
-Implemented in [`Qwen36MTPSpeculator.swift`](Sources/Mference/Runtime/Inference/Qwen36MTPSpeculator.swift) (`pldUniqueContinuation`, `findUniqueNGramContinuation4`, `findUniqueNGramContinuation3`):
+Implemented in [`Qwen36MTPSpeculator.swift`](Sources/Mference/Runtime/Inference/Qwen36MTPSpeculator.swift) (`pldUniqueContinuation`):
 
-- When `historyAligned` is true during `.structuredCodeOrTool`, `<tool_call>`, or fenced code blocks:
-  1. Checks if a unique 4-gram (or fallback 3-gram) continuation in `tokenHistory` agrees on `draft[0]` (`pldConfirmsFirst`), preventing EVICT truncation even on tight margins.
-  2. Uses `pldUniqueContinuation` to populate `draft[1]` (and `draft[2]` if `K >= 3`) directly from prompt/context history **without executing extra sequential `mtp.layers.0` Metal passes**, directly accelerating repetitive tool parameters (`patch_file` blocks, file paths, signatures) and boilerplate code.
+- When `historyAligned` is true during `.structuredCodeOrTool`, `<tool_call>`, or fenced code blocks (`tokenHistory` tracks code fences via Qwen tokens `71093`/`52451` and tool spans via `notifyTokens` without double-toggling on closing fences):
+  1. Executes a zero-allocation single-pass backward scan over `tokenHistory` tracking uniqueness across **6-, 5-, 4-, and 3-grams** simultaneously (disambiguating repeated 4-grams with 5/6-gram context).
+  2. Checks if a unique continuation agrees on `draft[0]` (`pldConfirmsFirst`), preventing EVICT truncation even on tight margins, and populates `draft[1]` (and `draft[2]` if `K >= 3`) directly from prompt/context history **without executing extra sequential `mtp.layers.0` Metal passes**.
 - Snapshot-aware: `PrefixSnapshot` in `RealForwardRunner` saves and restores `Qwen36MTPSpeculator.capturedTokenHistory` across LRU cache switches so PLD remains consistent across multi-turn chats.
 
 ### Prefill-Tail Expert Cache Warm Start
@@ -216,7 +216,7 @@ where $q_{i,g,j} \in [0, 15]$ (4-bit) or $[0, 255]$ (8-bit) are packed nibbles/b
 
 $$\alpha \cdot w_{i,g,j} = (\alpha \cdot s_{i,g}) \cdot q_{i,g,j} + (\alpha \cdot b_{i,g})$$
 
-**No nibble payload $q$ is ever unpacked, re-rounded, or re-quantized.** Only `BF16` norm vectors (`dtype == 1`) and `BF16` affine `scale`/`bias` regions (`dtype == 0`) are scaled in-place in `model_weights.bin`.
+**No nibble payload $q$ is ever unpacked, re-rounded, or re-quantized.** Only `BF16` norm vectors (`dtype == 1`) and `BF16` affine `scale`/`bias` regions (`dtype == 0`) are scaled on an APFS copy-on-write `.surgery.tmp` clone, `fsync`ed, hashed, and atomically swapped over `model_weights.bin`.
 
 ### Surgery Parameters & Target Layers
 
@@ -224,12 +224,14 @@ $$\alpha \cdot w_{i,g,j} = (\alpha \cdot s_{i,g}) \cdot q_{i,g,j} + (\alpha \cdo
 | :--- | :--- | ---: | :--- | :--- |
 | `finalNormScale` | `--surgery-final-norm` | `1.0` | `final_norm.weight` / `*.model.norm.weight` | Adjusts final logit temperature before `lm_head` |
 | `qkNormScale` | `--surgery-qk-norm` | `1.0` | `.q_norm.weight`, `.k_norm.weight` on layers $\ge$ `qkNormStartLayerRatio * L` | Sharpens late full-attention Q/K magnitude |
-| `qkNormStartLayerRatio` | `--surgery-qk-start-ratio` | `0.5` | Layer index threshold ratio | Controls start depth for Q/K norm scaling |
+| `qkNormStartLayerRatio` | `--surgery-qk-start-ratio` | `0.5` | Layer index threshold ratio (`0.0...1.0`) | Controls start depth for Q/K norm scaling |
 | `routerTemperature` | `--surgery-router-temp` | `1.0` | `.mlp.gate.weight` (multiplies scale & bias by $1 / T$) on layers $\ge$ `lateLayerStartFraction * L` | Sharpens MoE router gating logits ($T < 1$) |
-| `lateLayerResidualScale` | `--surgery-late-residual` | `1.0` | `.self_attn.o_proj.weight`, `.attn.o_proj.weight`, `.mlp.down_proj.weight` on layers $\ge$ `lateLayerStartFraction * L` | Damps late residual contributions to suppress attention loops |
-| `lateLayerStartFraction` | `--surgery-late-start-ratio` | `0.75` | Layer index threshold ratio | Controls start depth for late attention/router surgery |
+| `lateLayerResidualScale` | `--surgery-late-residual` | `1.0` | `.self_attn.o_proj.weight`, `.attn.o_proj.weight`, `.mlp.down_proj.weight` on layers $\ge$ `lateLayerStartFraction * L` | Damps late full-attention / dense contributions to suppress loops |
+| `lateLinearResidualScale` | `--surgery-late-linear-residual` | `1.0` | `.linear_attn.out_proj.weight` on layers $\ge$ `lateLayerStartFraction * L` | Optional late Gated-DeltaNet output residual scaling |
+| `lateLayerStartFraction` | `--surgery-late-start-ratio` | `0.75` | Layer index threshold ratio (`0.0...1.0`) | Controls start depth for late attention/router surgery |
 | `sharedExpertScale` | `--surgery-shared-expert` | `1.0` | `.shared_expert.down_proj.weight` on layers $\ge$ `sharedExpertStartLayerRatio * L` | Boosts the always-active dense shared expert independently of late damping |
-| `sharedExpertStartLayerRatio` | `--surgery-shared-expert-start-ratio` | `0.5` | Layer index threshold ratio | Anchors logical coherence & schema adherence from mid layers upward |
+| `sharedExpertStartLayerRatio` | `--surgery-shared-expert-start-ratio` | `0.5` | Layer index threshold ratio (`0.0...1.0`) | Anchors logical coherence & schema adherence from mid layers upward |
+| `allowReapply` | `--surgery-force` / `--overwrite` | `false` | Checked against `manifest.json["surgery"]` | Prevents accidental double-application of scales |
 
 ### Automatic MTP Co-Adaptation (`coAdaptMTP`)
 
@@ -251,7 +253,7 @@ Direct binary comparison of `scratch/qwen36-mtp.gturbo/model_weights.bin` (`630`
 
 ### CLI Invocation (`MferenceRepack --apply-surgery`)
 
-After mutating `model_weights.bin`, `applyResidentWeightSurgery` calls `fsync`, recomputes the `SHA-256` of `model_weights.bin`, atomically writes updated `manifest.json`, removes stale `verified-install.json`, and regenerates a valid install receipt:
+`applyResidentWeightSurgery` validates that all active scale/temperature values are finite positive numbers (and layer ratios lie in `0.0...1.0`), refuses accidental re-application when `manifest.json["surgery"]` is already present unless `--surgery-force` or `--overwrite` is passed, stages mutations on a `.surgery.tmp` clone, swaps atomically via `rename`, records full surgery parameters in `manifest.json["surgery"]`, recomputes the `SHA-256` of `model_weights.bin`, atomically writes updated `manifest.json`, removes stale `verified-install.json`, and regenerates a valid install receipt (propagating verification failures):
 
 ```bash
 swift run -c release MferenceRepack \
