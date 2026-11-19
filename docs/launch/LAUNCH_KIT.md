@@ -37,6 +37,7 @@ Attach `docs/assets/mference-live-demo.svg` (rendered PNG/screen recording) to *
 > cc `@awnihannun` `@Alibaba_Qwen` `@JustinLin610` `@simonw` `@ggerganov`
 >
 > Full architecture writeup: https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
+> Hugging Face card: https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
 
 ---
 
@@ -51,6 +52,7 @@ Built **Mference 2.0** (building on `NeelM0906/Mference` and `drumih/turbo-field
 
 * Repo: https://github.com/fjw4cfv2fb-afk/Mference-2.0
 * Prebuilt `v2.0.0` macOS `.app` + CLI binaries: https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0
+* Hugging Face Model Card (`voodmany`): https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
 
 ### Results on a 16 GB Mac (8-task Coding / AIME Math / GPQA / IFBench / Tool-Call suite, `temp=0`, `32` expert cache slots)
 * **Pass@1 Accuracy:** `25.0% (2/8)` raw INT4 baseline → **`100.0% (8/8)`** (`+75.0 pts`)
@@ -84,6 +86,7 @@ Hi HN — I wanted to run Qwen 3.6 35B-A3B (a 40-layer hybrid Gated-DeltaNet + f
 
 Repo: https://github.com/fjw4cfv2fb-afk/Mference-2.0
 Prebuilt macOS v2.0.0 binaries: https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0
+Hugging Face model card: https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
 Architecture & math writeup: https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
 
 A few interesting systems problems we had to solve in pure Swift + Metal (building on NeelM0906/Mference and TurboFieldfare):
