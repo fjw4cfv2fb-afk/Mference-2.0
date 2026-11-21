@@ -9,12 +9,19 @@ import UniformTypeIdentifiers
 
 // MARK: - Output Configuration
 
+struct VoiceClip {
+    let start: Double
+    let wavPath: String
+}
+
 struct ReelSpec {
     let filename: String
     let duration: Double
+    let boundaries: [Double]
     let sceneCuts: [Double]
+    let voiceClips: [VoiceClip]
     let previewTimes: [(label: String, time: Double)]
-    let renderer: (_ ctx: CGContext, _ time: Double, _ duration: Double) -> Void
+    let renderer: (_ ctx: CGContext, _ time: Double, _ duration: Double, _ boundaries: [Double]) -> Void
 }
 
 private let kWidth = 1080
@@ -321,14 +328,15 @@ func drawMetallicEmblem(_ ctx: CGContext, x: CGFloat, y: CGFloat, size: CGFloat,
 
 // MARK: - REEL 1: "I ran Qwen 3.6 35B on a 16 GB Mac" (18.5s)
 
-func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
+func renderReel1(_ ctx: CGContext, time: Double, duration: Double, boundaries: [Double]) {
+    let b = boundaries.count >= 6 ? boundaries : [0.0, 2.5, 7.5, 12.5, 16.0, duration]
     drawBackground(ctx, time: time, duration: duration, subtitle: "MFERENCE 2.0  ·  SWIFT 6.1 + METAL 3")
 
-    if time < 2.5 {
-        // SCENE 1 (0.0 - 2.5s): HOOK
-        let pMyth = easeOutCubic(progressIn(time, 0.0, 0.45))
-        let pFact = easeOutCubic(progressIn(time, 0.75, 0.55))
-        let pSpec = easeOutCubic(progressIn(time, 1.35, 0.5))
+    if time < b[1] {
+        // SCENE 1: HOOK
+        let pMyth = easeOutCubic(progressIn(time, b[0], 0.50))
+        let pFact = easeOutCubic(progressIn(time, b[0] + min(2.2, (b[1] - b[0]) * 0.32), 0.60))
+        let pSpec = easeOutCubic(progressIn(time, b[0] + min(3.4, (b[1] - b[0]) * 0.50), 0.55))
 
         // Myth Card
         let mythY = 260 + CGFloat(1.0 - pMyth) * 30
@@ -363,10 +371,11 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
             drawRoundedRect(ctx, rect: CGRect(x: px, y: py, width: 428, height: 76), radius: 18, fill: cgColor(0x161B22, alpha: CGFloat(pSpec)), stroke: cgColor(0x30363D, alpha: CGFloat(pSpec)), lineWidth: 2.0)
             drawText(item.0, rect: CGRect(x: px + 18, y: py + 21, width: 392, height: 36), size: 25, weight: .bold, colorHex: UInt32(item.1), alpha: CGFloat(pSpec), mono: true, align: .center)
         }
-    } else if time < 7.5 {
-        // SCENE 2 (2.5 - 7.5s): LIVE CODE STREAM + 16 GB ACTIVITY MONITOR
-        let lt = time - 2.5
-        let enter = easeOutCubic(progressIn(lt, 0.0, 0.35))
+    } else if time < b[2] {
+        // SCENE 2: LIVE CODE STREAM + 16 GB ACTIVITY MONITOR
+        let lt = time - b[1]
+        let span = max(1.0, b[2] - b[1])
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.40))
 
         drawText("Streaming 35B MoE from NVMe", rect: CGRect(x: 72, y: 236, width: 880, height: 54), size: 42, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
         drawText("Swift Coding (C2)  ·  Green Unified-Memory Pressure", rect: CGRect(x: 72, y: 294, width: 880, height: 34), size: 22, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
@@ -409,9 +418,10 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
             ("}", 0x79C0FF),
         ]
 
-        let revealedLines = Int(floor(clamp01(lt / 3.8) * Double(codeLines.count))) + 1
+        let typeSpan = min(6.2, span * 0.65)
+        let revealedLines = Int(floor(clamp01(lt / typeSpan) * Double(codeLines.count))) + 1
         for i in 0..<min(revealedLines, codeLines.count) {
-            let lineFade = progressIn(lt, Double(i) * (3.8 / Double(codeLines.count)), 0.16)
+            let lineFade = progressIn(lt, Double(i) * (typeSpan / Double(codeLines.count)), 0.16)
             let yPos = 496 + CGFloat(i) * 31
             drawText(codeLines[i].0, rect: CGRect(x: 100, y: yPos, width: 824, height: 28), size: 15.5, weight: .medium, colorHex: codeLines[i].1, alpha: CGFloat(lineFade * enter), mono: true)
         }
@@ -446,12 +456,12 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
             drawText(row.0, rect: CGRect(x: 106, y: ry, width: 320, height: 32), size: 22, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
             drawText(row.1, rect: CGRect(x: 420, y: ry, width: 498, height: 32), size: 22, weight: .bold, colorHex: row.2, alpha: CGFloat(enter), mono: true, align: .right)
         }
-    } else if time < 12.5 {
-        // SCENE 3 (7.5 - 12.5s): LOSSLESS WEIGHT SURGERY REVEAL
-        let lt = time - 7.5
+    } else if time < b[3] {
+        // SCENE 3: LOSSLESS WEIGHT SURGERY REVEAL
+        let lt = time - b[2]
         let enter = easeOutCubic(progressIn(lt, 0.0, 0.4))
-        let barGrow = easeOutCubic(progressIn(lt, 0.5, 1.5))
-        let cardGrow = easeOutCubic(progressIn(lt, 1.5, 0.6))
+        let barGrow = easeOutCubic(progressIn(lt, 0.6, 2.2))
+        let cardGrow = easeOutCubic(progressIn(lt, 1.8, 0.7))
 
         drawText("Lossless Weight Surgery", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 46, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
         drawText("Fixed quantization collapse without changing 1 INT4 nibble", rect: CGRect(x: 72, y: 308, width: 880, height: 34), size: 22, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
@@ -497,13 +507,13 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
         drawText("<THINK> TOKEN WASTE", rect: CGRect(x: 548, y: 1178, width: 344, height: 28), size: 18, weight: .bold, colorHex: 0x8B949E, alpha: CGFloat(cardGrow), mono: true, align: .center)
         drawText("-69.5%", rect: CGRect(x: 548, y: 1226, width: 344, height: 80), size: 68, weight: .heavy, colorHex: 0x3FB950, alpha: CGFloat(cardGrow), align: .center)
         drawText("413.4 -> 126.1 avg tokens", rect: CGRect(x: 548, y: 1324, width: 344, height: 32), size: 20, weight: .semibold, colorHex: 0xC9D1D9, alpha: CGFloat(cardGrow), align: .center)
-    } else if time < 16.0 {
-        // SCENE 4 (12.5 - 16.0s): HYBRID MTP + GATED-DELTANET ROLLBACK
-        let lt = time - 12.5
-        let enter = easeOutCubic(progressIn(lt, 0.0, 0.35))
-        let p0 = easeOutBack(progressIn(lt, 0.35, 0.35))
-        let p1 = easeOutBack(progressIn(lt, 0.75, 0.35))
-        let p2 = easeOutBack(progressIn(lt, 1.15, 0.35))
+    } else if time < b[4] {
+        // SCENE 4: HYBRID MTP + GATED-DELTANET ROLLBACK
+        let lt = time - b[3]
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.4))
+        let p0 = easeOutBack(progressIn(lt, 0.45, 0.40))
+        let p1 = easeOutBack(progressIn(lt, 1.00, 0.40))
+        let p2 = easeOutBack(progressIn(lt, 1.55, 0.40))
 
         drawText("Hybrid MoE MTP + 6-Gram PLD", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 42, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
         drawText("Speculative decoding across 30 Gated-DeltaNet linear layers", rect: CGRect(x: 72, y: 306, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
@@ -534,8 +544,8 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
         drawText("Exact Top-2 EVICT Margin + Async Accept", rect: CGRect(x: 112, y: 1268, width: 800, height: 42), size: 32, weight: .bold, colorHex: 0x3FB950, alpha: CGFloat(enter))
         drawText("-21.3% total task wall time  ·  17.88 tok/s AIME peak", rect: CGRect(x: 112, y: 1330, width: 800, height: 42), size: 24, weight: .semibold, colorHex: 0xE6EDF3, alpha: CGFloat(enter), mono: true)
     } else {
-        // SCENE 5 (16.0 - 18.5s): CTA
-        let lt = time - 16.0
+        // SCENE 5: CTA
+        let lt = time - b[4]
         let enter = easeOutCubic(progressIn(lt, 0.0, 0.45))
 
         drawMetallicEmblem(ctx, x: 422, y: 316, size: 180, alpha: CGFloat(enter))
@@ -555,13 +565,14 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double) {
 
 // MARK: - REEL 2: "Changing 0 weight nibbles took it from 25% to 100%" (17.0s)
 
-func renderReel2(_ ctx: CGContext, time: Double, duration: Double) {
+func renderReel2(_ ctx: CGContext, time: Double, duration: Double, boundaries: [Double]) {
+    let b = boundaries.count >= 6 ? boundaries : [0.0, 2.5, 6.5, 11.5, 15.0, duration]
     drawBackground(ctx, time: time, duration: duration, subtitle: "LOSSLESS INT4 WEIGHT SURGERY  ·  MFERENCE 2.0")
 
-    if time < 2.5 {
-        // SCENE 1 (0.0 - 2.5s): HOOK
-        let p1 = easeOutCubic(progressIn(time, 0.0, 0.45))
-        let p2 = easeOutCubic(progressIn(time, 0.75, 0.5))
+    if time < b[1] {
+        // SCENE 1: HOOK
+        let p1 = easeOutCubic(progressIn(time, b[0], 0.5))
+        let p2 = easeOutCubic(progressIn(time, b[0] + min(2.0, (b[1] - b[0]) * 0.32), 0.6))
 
         drawRoundedRect(ctx, rect: CGRect(x: 72, y: 266, width: 880, height: 290), radius: 26, fill: cgColor(0x161B22, alpha: CGFloat(p1)), stroke: cgColor(0xF85149, alpha: 0.55 * CGFloat(p1)), lineWidth: 2.5)
         drawText("QUANTIZATION COLLAPSE", rect: CGRect(x: 112, y: 302, width: 520, height: 28), size: 19, weight: .bold, colorHex: 0xF85149, alpha: CGFloat(p1), mono: true)
@@ -574,11 +585,11 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double) {
         drawSingleLineBadge(ctx, text: "NO FINE-TUNING · NO RE-QUANTIZATION", x: 112, y: 708, width: 540, height: 42, bgHex: 0x238636, bgAlpha: 0.25, borderHex: 0x3FB950, textHex: 0x3FB950, fontSize: 18, mono: true, alpha: CGFloat(p2))
         drawText("Changing 0 weight\nnibbles took it from\n25% to 100%.", rect: CGRect(x: 112, y: 780, width: 800, height: 240), size: 62, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(p2), lineSpacing: 8)
         drawText("Pure BF16 scale & norm algebra in resident model_weights.bin", rect: CGRect(x: 112, y: 1068, width: 800, height: 34), size: 21, weight: .semibold, colorHex: 0x58A6FF, alpha: CGFloat(p2), mono: true)
-    } else if time < 6.5 {
-        // SCENE 2 (2.5 - 6.5s): THE PROBLEM (<think> loops)
-        let lt = time - 2.5
-        let enter = easeOutCubic(progressIn(lt, 0.0, 0.35))
-        let countProg = easeOutCubic(progressIn(lt, 0.3, 2.2))
+    } else if time < b[2] {
+        // SCENE 2: THE PROBLEM (<think> loops)
+        let lt = time - b[1]
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.40))
+        let countProg = easeOutCubic(progressIn(lt, 0.4, min(3.2, max(1.8, (b[2] - b[1]) * 0.5))))
 
         drawText("Why Raw INT4 Breaks", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 46, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
         drawText("Small 4-bit scale drift pushes models into infinite reasoning loops", rect: CGRect(x: 72, y: 308, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
@@ -607,11 +618,11 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double) {
             let lFade = progressIn(lt, 0.5 + Double(idx) * 0.45, 0.25)
             drawText(item.0, rect: CGRect(x: 112, y: 924 + CGFloat(idx) * 52, width: 800, height: 36), size: 22, weight: .semibold, colorHex: UInt32(item.1), alpha: CGFloat(lFade * enter), mono: true)
         }
-    } else if time < 11.5 {
-        // SCENE 3 (6.5 - 11.5s): THE MATH TRICK + 4 SURGERY KNOBS
-        let lt = time - 6.5
-        let enter = easeOutCubic(progressIn(lt, 0.0, 0.35))
-        let knobs = easeOutCubic(progressIn(lt, 1.0, 0.5))
+    } else if time < b[3] {
+        // SCENE 3: THE MATH TRICK + 4 SURGERY KNOBS
+        let lt = time - b[2]
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.4))
+        let knobs = easeOutCubic(progressIn(lt, 1.4, 0.65))
 
         drawText("The Lossless Algebra Trick", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 46, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
         drawText("MLX group-64 affine INT4 weights scale linearly in BF16", rect: CGRect(x: 72, y: 306, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
@@ -645,12 +656,12 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double) {
             drawText(item.1, rect: CGRect(x: kx + 28, y: ky + 72, width: 372, height: 74), size: 62, weight: .heavy, colorHex: UInt32(item.3), alpha: CGFloat(knobs), mono: true)
             drawText(item.2, rect: CGRect(x: kx + 28, y: ky + 168, width: 372, height: 36), size: 19, weight: .medium, colorHex: 0xC9D1D9, alpha: CGFloat(knobs))
         }
-    } else if time < 15.0 {
-        // SCENE 4 (11.5 - 15.0s): BEFORE VS AFTER RESULTS
-        let lt = time - 11.5
-        let c1 = easeOutCubic(progressIn(lt, 0.0, 0.45))
-        let c2 = easeOutCubic(progressIn(lt, 0.45, 0.45))
-        let c3 = easeOutCubic(progressIn(lt, 0.9, 0.45))
+    } else if time < b[4] {
+        // SCENE 4: BEFORE VS AFTER RESULTS
+        let lt = time - b[3]
+        let c1 = easeOutCubic(progressIn(lt, 0.0, 0.5))
+        let c2 = easeOutCubic(progressIn(lt, 0.7, 0.5))
+        let c3 = easeOutCubic(progressIn(lt, 1.4, 0.5))
 
         drawText("Before vs. After Surgery", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 46, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(c1))
         drawText("Reproducible 8-Task AA Suite · 16 GB Mac · Temp 0", rect: CGRect(x: 72, y: 308, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(c1))
@@ -670,8 +681,8 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double) {
             drawText(item.3, rect: CGRect(x: 112, y: cy + 206, width: 800, height: 30), size: 20, weight: .medium, colorHex: 0xC9D1D9, alpha: a, mono: true)
         }
     } else {
-        // SCENE 5 (15.0 - 17.0s): CTA
-        let lt = time - 15.0
+        // SCENE 5: CTA
+        let lt = time - b[4]
         let enter = easeOutCubic(progressIn(lt, 0.0, 0.45))
 
         drawMetallicEmblem(ctx, x: 422, y: 316, size: 180, alpha: CGFloat(enter))
@@ -689,11 +700,90 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double) {
     }
 }
 
-// MARK: - Procedural Dark-Tech Synthesizer (44.1 kHz Stereo)
+// MARK: - WAV Reader & Procedural Dark-Tech Synthesizer + Voiceover Ducking (44.1 kHz Stereo)
 
-func generateAudioTrack(duration: Double, sceneCuts: [Double]) -> [Int16] {
+func loadMonoWAVSamples(path: String) -> [Double] {
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), data.count >= 12 else {
+        return []
+    }
+    var offset = 12
+    var bitsPerSample = 16
+    var numChannels = 1
+    var pcmBytes = Data()
+
+    while offset + 8 <= data.count {
+        let chunkID = String(bytes: data[offset..<(offset + 4)], encoding: .ascii) ?? ""
+        let cSize = Int(
+            UInt32(data[offset + 4]) |
+            (UInt32(data[offset + 5]) << 8) |
+            (UInt32(data[offset + 6]) << 16) |
+            (UInt32(data[offset + 7]) << 24)
+        )
+        let payloadStart = offset + 8
+        let payloadEnd = min(data.count, payloadStart + cSize)
+        if chunkID == "fmt " && payloadEnd - payloadStart >= 16 {
+            numChannels = Int(UInt16(data[payloadStart + 2]) | (UInt16(data[payloadStart + 3]) << 8))
+            bitsPerSample = Int(UInt16(data[payloadStart + 14]) | (UInt16(data[payloadStart + 15]) << 8))
+        } else if chunkID == "data" && payloadEnd > payloadStart {
+            pcmBytes = data[payloadStart..<payloadEnd]
+            break
+        }
+        offset = payloadStart + cSize + (cSize & 1)
+    }
+
+    guard bitsPerSample == 16, numChannels >= 1, pcmBytes.count >= 2 * numChannels else {
+        return []
+    }
+    let frameCount = pcmBytes.count / (2 * numChannels)
+    var samples = [Double](repeating: 0.0, count: frameCount)
+    pcmBytes.withUnsafeBytes { raw in
+        guard let ptr = raw.baseAddress?.assumingMemoryBound(to: Int16.self) else { return }
+        for i in 0..<frameCount {
+            samples[i] = Double(Int16(littleEndian: ptr[i * numChannels])) / 32768.0
+        }
+    }
+    return samples
+}
+
+func generateAudioTrack(duration: Double, sceneCuts: [Double], voiceClips: [VoiceClip]) -> [Int16] {
     let totalSamples = Int(round(duration * Double(kSampleRate)))
     var out = [Int16](repeating: 0, count: totalSamples * kChannels)
+
+    // Pre-mix normalized mono voiceover buffer and compute smooth sidechain ducking envelope
+    var voiceBuf = [Double](repeating: 0.0, count: totalSamples)
+    var rawEnv = [Double](repeating: 0.0, count: totalSamples)
+
+    for clip in voiceClips {
+        var samples = loadMonoWAVSamples(path: clip.wavPath)
+        guard !samples.isEmpty else { continue }
+        let peak = samples.reduce(0.0) { max($0, abs($1)) }
+        if peak > 0.02 {
+            let normGain = min(2.2, 0.88 / peak)
+            for j in 0..<samples.count { samples[j] *= normGain }
+        }
+
+        let startSample = max(0, Int(round(clip.start * Double(kSampleRate))))
+        let copyCount = min(samples.count, totalSamples - startSample)
+        let fadeSamples = min(440, copyCount / 4) // 10ms de-click fade at clip ends
+        for j in 0..<copyCount {
+            var s = samples[j]
+            if j < fadeSamples { s *= Double(j) / Double(fadeSamples) }
+            if copyCount - j - 1 < fadeSamples { s *= Double(copyCount - j - 1) / Double(fadeSamples) }
+            let idx = startSample + j
+            voiceBuf[idx] += s
+            rawEnv[idx] = 1.0
+        }
+    }
+
+    // Smooth ducking envelope (~15ms attack, ~220ms release)
+    var duckEnv = [Double](repeating: 0.0, count: totalSamples)
+    var envState = 0.0
+    for i in 0..<totalSamples {
+        let target = rawEnv[i]
+        let coeff = target > envState ? 0.004 : 0.00018
+        envState += (target - envState) * coeff
+        duckEnv[i] = envState
+    }
 
     let bpm = 120.0
     let stepDuration = 60.0 / bpm / 4.0 // 16th note = 0.125s
@@ -725,13 +815,13 @@ func generateAudioTrack(duration: Double, sceneCuts: [Double]) -> [Int16] {
             let fEnv = 44.0 + 95.0 * exp(-beatT * 38.0)
             let phase = 2.0 * .pi * (44.0 * beatT - (95.0 / 38.0) * (exp(-beatT * 38.0) - 1.0))
             let amp = exp(-beatT * 14.0)
-            kick = sin(phase) * amp * 0.42 + sin(2.0 * .pi * fEnv * beatT) * 0.05 * amp
+            kick = sin(phase) * amp * 0.40 + sin(2.0 * .pi * fEnv * beatT) * 0.05 * amp
         }
 
         // 2. Clean minor bass groove on 8ths
         let eighthIdx = stepIdx / 2
         let eighthT = t - Double(eighthIdx) * (stepDuration * 2.0)
-        let bassAmp = (stepIdx % 2 == 0 ? 0.24 : 0.16) * exp(-eighthT * 5.2)
+        let bassAmp = (stepIdx % 2 == 0 ? 0.22 : 0.14) * exp(-eighthT * 5.2)
         let bass = (sin(2.0 * .pi * root * t) + 0.35 * sin(2.0 * .pi * (root * 2.0) * t)) * bassAmp
 
         // 3. Soft stereo dark-tech arpeggio
@@ -740,12 +830,12 @@ func generateAudioTrack(duration: Double, sceneCuts: [Double]) -> [Int16] {
         let arpEnv = exp(-stepT * 16.0) * (1.0 - exp(-stepT * 400.0))
         let panL = (stepIdx % 2 == 0) ? 0.85 : 0.55
         let panR = (stepIdx % 2 == 0) ? 0.55 : 0.85
-        let arpCore = (sin(2.0 * .pi * arpFreq * t) + 0.25 * sin(2.0 * .pi * arpFreq * 2.0 * t)) * arpEnv * 0.15
+        let arpCore = (sin(2.0 * .pi * arpFreq * t) + 0.25 * sin(2.0 * .pi * arpFreq * 2.0 * t)) * arpEnv * 0.14
 
         // 4. Crisp offbeat hi-hat
         var hat = 0.0
         if beatStep == 2 && stepT < 0.035 {
-            hat = nextNoise() * exp(-stepT * 95.0) * 0.07
+            hat = nextNoise() * exp(-stepT * 95.0) * 0.06
         }
 
         // 5. Scene cut transition chime
@@ -758,16 +848,21 @@ func generateAudioTrack(duration: Double, sceneCuts: [Double]) -> [Int16] {
             }
         }
 
-        // Master envelope + soft clip
-        let fadeIn = clamp01(t / 0.15)
-        let fadeOut = clamp01((duration - t) / 0.35)
-        let master = fadeIn * fadeOut
+        // Sidechain duck music bed cleanly underneath spoken voiceover (~15% while speaking, ~38% in gaps)
+        let musicGain = voiceClips.isEmpty ? 0.85 : (0.38 - 0.23 * duckEnv[i])
+        let musicFadeIn = clamp01(t / 0.15)
+        let musicFadeOut = clamp01((duration - t) / 0.35)
+        let mEnv = musicGain * musicFadeIn * musicFadeOut
 
-        let left = tanh((kick + bass + arpCore * panL + hat + chime) * master * 0.9)
-        let right = tanh((kick + bass + arpCore * panR - hat * 0.8 + chime) * master * 0.9)
+        let v = voiceBuf[i]
+        let mL = (kick + bass + arpCore * panL + hat) * mEnv + chime * 0.65 * musicFadeOut
+        let mR = (kick + bass + arpCore * panR - hat * 0.8) * mEnv + chime * 0.65 * musicFadeOut
 
-        out[i * 2] = Int16(max(-32767, min(32767, Int(left * 28000.0))))
-        out[i * 2 + 1] = Int16(max(-32767, min(32767, Int(right * 28000.0))))
+        let left = tanh((v + mL) * 0.92)
+        let right = tanh((v + mR) * 0.92)
+
+        out[i * 2] = Int16(max(-32767, min(32767, Int(left * 29000.0))))
+        out[i * 2 + 1] = Int16(max(-32767, min(32767, Int(right * 29000.0))))
     }
 
     return out
@@ -911,7 +1006,7 @@ func renderVideoOnly(_ spec: ReelSpec, to videoURL: URL, previewDir: URL) throws
                         let nsCtx = NSGraphicsContext(cgContext: ctx, flipped: true)
                         let prevCtx = NSGraphicsContext.current
                         NSGraphicsContext.current = nsCtx
-                        spec.renderer(ctx, t, spec.duration)
+                        spec.renderer(ctx, t, spec.duration, spec.boundaries)
                         NSGraphicsContext.current = prevCtx
                         ctx.restoreGState()
 
@@ -1019,12 +1114,68 @@ func renderReel(_ spec: ReelSpec, outDir: URL, previewDir: URL) throws {
     }
 
     try renderVideoOnly(spec, to: tmpVideoURL, previewDir: previewDir)
-    let pcm = generateAudioTrack(duration: spec.duration, sceneCuts: spec.sceneCuts)
+    let pcm = generateAudioTrack(duration: spec.duration, sceneCuts: spec.sceneCuts, voiceClips: spec.voiceClips)
     try writeWAV(pcm, sampleRate: kSampleRate, channels: kChannels, to: tmpWavURL)
     try muxVideo(tmpVideoURL, andAudio: tmpWavURL, duration: spec.duration, to: mp4URL)
 }
 
 // MARK: - Main Entry Point
+
+struct VoiceManifestEntry {
+    let duration: Double
+    let boundaries: [Double]
+    let clips: [VoiceClip]
+}
+
+func loadVoiceManifest(from url: URL) -> [String: VoiceManifestEntry] {
+    guard let data = try? Data(contentsOf: url),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let reelsDict = obj["reels"] as? [String: [String: Any]] else {
+        return [:]
+    }
+    var result: [String: VoiceManifestEntry] = [:]
+    for (filename, info) in reelsDict {
+        guard let dur = info["duration"] as? Double,
+              let bounds = info["boundaries"] as? [Double],
+              bounds.count >= 6 else { continue }
+        var clips: [VoiceClip] = []
+        if let rawClips = info["clips"] as? [[String: Any]] {
+            for rc in rawClips {
+                if let st = rc["start"] as? Double, let wav = rc["wav"] as? String {
+                    clips.append(VoiceClip(start: st, wavPath: wav))
+                }
+            }
+        }
+        result[filename] = VoiceManifestEntry(duration: dur, boundaries: bounds, clips: clips)
+    }
+    return result
+}
+
+func makeSpec(
+    filename: String,
+    prefix: String,
+    defaultBoundaries: [Double],
+    manifest: [String: VoiceManifestEntry],
+    renderer: @escaping (_ ctx: CGContext, _ time: Double, _ duration: Double, _ boundaries: [Double]) -> Void
+) -> ReelSpec {
+    let entry = manifest[filename]
+    let boundaries = entry?.boundaries ?? defaultBoundaries
+    let duration = entry?.duration ?? boundaries.last ?? 18.0
+    let sceneCuts = Array(boundaries.dropFirst().dropLast())
+    let previewTimes: [(label: String, time: Double)] = (0..<5).map { idx in
+        let t = boundaries[idx] + (boundaries[idx + 1] - boundaries[idx]) * 0.65
+        return ("\(prefix)_s\(idx + 1)", t)
+    }
+    return ReelSpec(
+        filename: filename,
+        duration: duration,
+        boundaries: boundaries,
+        sceneCuts: sceneCuts,
+        voiceClips: entry?.clips ?? [],
+        previewTimes: previewTimes,
+        renderer: renderer
+    )
+}
 
 func main() throws {
     _ = NSApplication.shared
@@ -1034,41 +1185,37 @@ func main() throws {
         ? URL(fileURLWithPath: args[1], isDirectory: true)
         : cwd.appendingPathComponent("scratch/reels", isDirectory: true)
     let previewDir = outDir.appendingPathComponent("previews", isDirectory: true)
+    let manifestURL = outDir.appendingPathComponent("voiceovers/manifest.json")
 
     try FileManager.default.createDirectory(at: previewDir, withIntermediateDirectories: true)
 
+    let manifest = loadVoiceManifest(from: manifestURL)
+    if manifest.isEmpty {
+        print("[reels] Note: no voiceovers/manifest.json found; using music-only default timings.")
+    } else {
+        print("[reels] Loaded synchronized voiceovers from \(manifestURL.path)")
+    }
+
     let specs = [
-        ReelSpec(
+        makeSpec(
             filename: "mference-reel-1-16gb-mac.mp4",
-            duration: 18.5,
-            sceneCuts: [2.5, 7.5, 12.5, 16.0],
-            previewTimes: [
-                ("reel1_s1", 1.7),
-                ("reel1_s2", 6.2),
-                ("reel1_s3", 11.2),
-                ("reel1_s4", 14.8),
-                ("reel1_s5", 17.6),
-            ],
+            prefix: "reel1",
+            defaultBoundaries: [0.0, 2.5, 7.5, 12.5, 16.0, 18.5],
+            manifest: manifest,
             renderer: renderReel1
         ),
-        ReelSpec(
+        makeSpec(
             filename: "mference-reel-2-weight-surgery.mp4",
-            duration: 17.0,
-            sceneCuts: [2.5, 6.5, 11.5, 15.0],
-            previewTimes: [
-                ("reel2_s1", 1.7),
-                ("reel2_s2", 5.2),
-                ("reel2_s3", 10.2),
-                ("reel2_s4", 13.8),
-                ("reel2_s5", 16.2),
-            ],
+            prefix: "reel2",
+            defaultBoundaries: [0.0, 2.5, 6.5, 11.5, 15.0, 17.0],
+            manifest: manifest,
             renderer: renderReel2
         ),
     ]
 
     for spec in specs {
         let start = Date()
-        print("[reels] Rendering \(spec.filename) (\(spec.duration)s @ \(kWidth)x\(kHeight) \(kFPS)fps)...")
+        print("[reels] Rendering \(spec.filename) (\(spec.duration)s, \(spec.voiceClips.count) voice clips @ \(kWidth)x\(kHeight) \(kFPS)fps)...")
         try renderReel(spec, outDir: outDir, previewDir: previewDir)
         let elapsed = Date().timeIntervalSince(start)
         let size = (try? FileManager.default.attributesOfItem(atPath: outDir.appendingPathComponent(spec.filename).path)[.size] as? Int64) ?? 0
