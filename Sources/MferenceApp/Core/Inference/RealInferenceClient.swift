@@ -171,6 +171,7 @@ actor RealInferenceSession {
     private var executedPrefillMode: PrefillExecutedMode?
     private var kvStorageMode: PrefillKVStorageMode?
     private var scratch: RawCompletionScratch?
+    private var modelSupportsVision = false
 
     func ensureLoaded(key: SessionLoadKey,
                       onState: @Sendable (AppModelLoadState) -> Void) async throws {
@@ -182,6 +183,7 @@ actor RealInferenceSession {
         kvStorageMode = nil
         scratch = nil
         loadedKey = nil
+        modelSupportsVision = false
 
         let start = Date()
         do {
@@ -248,6 +250,9 @@ actor RealInferenceSession {
             kvStorageMode = loadedRuntime.kvStorageMode
             scratch = loadedScratch
             loadedKey = key
+            modelSupportsVision = loadedModel.config.family == .qwen36
+                && FileManager.default.fileExists(
+                    atPath: key.directory.appendingPathComponent("vision_weights.bin").path)
             onState(.ready(modelDirectory: key.directory,
                            loadSeconds: Date().timeIntervalSince(start)))
         } catch is CancellationError {
@@ -298,6 +303,7 @@ actor RealInferenceSession {
         tokenizer = nil
         tokenizerDirectoryCache.clear()
         loadedKey = nil
+        modelSupportsVision = false
     }
 
     func run(request: AppGenerationRequest,
@@ -310,11 +316,20 @@ actor RealInferenceSession {
             ? .chunked : .off
         do {
             try request.validate()
+            var effectiveRequest = request
+            if !modelSupportsVision {
+                effectiveRequest.messages = effectiveRequest.messages.map { msg in
+                    guard Qwen36VisionImageStore.containsMarker(in: msg.content) else { return msg }
+                    let cleaned = Qwen36VisionImageStore.strippingMarkers(from: msg.content)
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    return AppGenerationMessage(role: msg.role, content: cleaned)
+                }
+            }
             let requestKey = SessionLoadKey(
-                directory: request.modelDirectory.standardizedFileURL,
-                maxContext: request.maxContextTokens,
-                options: request.runtimeOptions,
-                forceLogitsHead: Self.forceLogitsHead(for: request))
+                directory: effectiveRequest.modelDirectory.standardizedFileURL,
+                maxContext: effectiveRequest.maxContextTokens,
+                options: effectiveRequest.runtimeOptions,
+                forceLogitsHead: Self.forceLogitsHead(for: effectiveRequest))
             guard let loadedKey else { throw AppInferenceError.modelNotLoaded }
             guard loadedKey == requestKey else { throw AppInferenceError.reloadRequired }
             guard let runner,
@@ -331,7 +346,7 @@ actor RealInferenceSession {
                                                                  kvStorageMode: kvStorageMode)
 
             let request = try AppGenerationContextWindow.prepare(
-                request,
+                effectiveRequest,
                 tokenizer: tokenizer)
             let renderedPrompt = try tokenizer.applyChatTemplate(
                 request.messages.map(Self.tokenizerMessage))

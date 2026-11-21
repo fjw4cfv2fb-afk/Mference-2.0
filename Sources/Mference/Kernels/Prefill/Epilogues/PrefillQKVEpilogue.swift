@@ -14,6 +14,11 @@ final class PrefillQKVEpilogue {
     /// only (no V norm at all), then NeoX sub-dim partial RoPE (rotation
     /// confined to the first `rotaryDim` elements, frequency divisor =
     /// rotaryDim). V passes through unchanged.
+    private enum NeoxSubdimRoPEMode {
+        case standard(startPosition: UInt32)
+        case mrope(triples: MTLBuffer, offset: Int, limits: SIMD2<UInt32>)
+    }
+
     func encodeNeoxSubdimNoVNorm(commandBuffer: MTLCommandBuffer,
                                  q: MTLBuffer,
                                  qOffset: Int = 0,
@@ -33,6 +38,82 @@ final class PrefillQKVEpilogue {
                                  theta: Float,
                                  rotaryDim: UInt32,
                                  eps: Float) {
+        encodeNeoxSubdimNoVNormCore(
+            commandBuffer: commandBuffer,
+            q: q, qOffset: qOffset,
+            k: k, kOffset: kOffset,
+            qWeight: qWeight, qWeightOffset: qWeightOffset,
+            kWeight: kWeight, kWeightOffset: kWeightOffset,
+            mode: .standard(startPosition: startPosition),
+            queryCount: queryCount,
+            headDim: headDim,
+            numQHeads: numQHeads,
+            numKVHeads: numKVHeads,
+            qTokenStrideElements: qTokenStrideElements,
+            kvTokenStrideElements: kvTokenStrideElements,
+            theta: theta,
+            rotaryDim: rotaryDim,
+            eps: eps)
+    }
+
+    func encodeNeoxSubdimNoVNormMRoPE(commandBuffer: MTLCommandBuffer,
+                                      q: MTLBuffer,
+                                      qOffset: Int = 0,
+                                      k: MTLBuffer,
+                                      kOffset: Int = 0,
+                                      qWeight: MTLBuffer,
+                                      qWeightOffset: Int = 0,
+                                      kWeight: MTLBuffer,
+                                      kWeightOffset: Int = 0,
+                                      mropeTriples: MTLBuffer,
+                                      mropeTriplesOffset: Int = 0,
+                                      mropeLimits: SIMD2<UInt32> = SIMD2<UInt32>(33, 30),
+                                      queryCount: UInt32,
+                                      headDim: UInt32,
+                                      numQHeads: UInt32,
+                                      numKVHeads: UInt32,
+                                      qTokenStrideElements: UInt32,
+                                      kvTokenStrideElements: UInt32,
+                                      theta: Float,
+                                      rotaryDim: UInt32,
+                                      eps: Float) {
+        encodeNeoxSubdimNoVNormCore(
+            commandBuffer: commandBuffer,
+            q: q, qOffset: qOffset,
+            k: k, kOffset: kOffset,
+            qWeight: qWeight, qWeightOffset: qWeightOffset,
+            kWeight: kWeight, kWeightOffset: kWeightOffset,
+            mode: .mrope(triples: mropeTriples, offset: mropeTriplesOffset, limits: mropeLimits),
+            queryCount: queryCount,
+            headDim: headDim,
+            numQHeads: numQHeads,
+            numKVHeads: numKVHeads,
+            qTokenStrideElements: qTokenStrideElements,
+            kvTokenStrideElements: kvTokenStrideElements,
+            theta: theta,
+            rotaryDim: rotaryDim,
+            eps: eps)
+    }
+
+    private func encodeNeoxSubdimNoVNormCore(commandBuffer: MTLCommandBuffer,
+                                             q: MTLBuffer,
+                                             qOffset: Int,
+                                             k: MTLBuffer,
+                                             kOffset: Int,
+                                             qWeight: MTLBuffer,
+                                             qWeightOffset: Int,
+                                             kWeight: MTLBuffer,
+                                             kWeightOffset: Int,
+                                             mode: NeoxSubdimRoPEMode,
+                                             queryCount: UInt32,
+                                             headDim: UInt32,
+                                             numQHeads: UInt32,
+                                             numKVHeads: UInt32,
+                                             qTokenStrideElements: UInt32,
+                                             kvTokenStrideElements: UInt32,
+                                             theta: Float,
+                                             rotaryDim: UInt32,
+                                             eps: Float) {
         precondition(queryCount > 0, "queryCount must be positive")
         precondition(headDim > 0 && headDim % 2 == 0, "headDim must be positive and even")
         precondition(numQHeads > 0, "numQHeads must be positive")
@@ -68,26 +149,54 @@ final class PrefillQKVEpilogue {
                                 numHeads: numKVHeads,
                                 tokenStrideElements: kvTokenStrideElements,
                                 eps: eps)
-        rope.encodeNeoxSubdim(commandBuffer: commandBuffer,
-                              data: q,
-                              dataOffset: qOffset,
-                              startPosition: startPosition,
-                              queryCount: queryCount,
-                              headDim: headDim,
-                              numHeads: numQHeads,
-                              rotaryDim: rotaryDim,
-                              tokenStrideElements: qTokenStrideElements,
-                              theta: theta)
-        rope.encodeNeoxSubdim(commandBuffer: commandBuffer,
-                              data: k,
-                              dataOffset: kOffset,
-                              startPosition: startPosition,
-                              queryCount: queryCount,
-                              headDim: headDim,
-                              numHeads: numKVHeads,
-                              rotaryDim: rotaryDim,
-                              tokenStrideElements: kvTokenStrideElements,
-                              theta: theta)
+        switch mode {
+        case .standard(let startPosition):
+            rope.encodeNeoxSubdim(commandBuffer: commandBuffer,
+                                  data: q,
+                                  dataOffset: qOffset,
+                                  startPosition: startPosition,
+                                  queryCount: queryCount,
+                                  headDim: headDim,
+                                  numHeads: numQHeads,
+                                  rotaryDim: rotaryDim,
+                                  tokenStrideElements: qTokenStrideElements,
+                                  theta: theta)
+            rope.encodeNeoxSubdim(commandBuffer: commandBuffer,
+                                  data: k,
+                                  dataOffset: kOffset,
+                                  startPosition: startPosition,
+                                  queryCount: queryCount,
+                                  headDim: headDim,
+                                  numHeads: numKVHeads,
+                                  rotaryDim: rotaryDim,
+                                  tokenStrideElements: kvTokenStrideElements,
+                                  theta: theta)
+        case .mrope(let triples, let offset, let limits):
+            rope.encodeNeoxSubdimMRoPE(commandBuffer: commandBuffer,
+                                       data: q,
+                                       dataOffset: qOffset,
+                                       mropeTriples: triples,
+                                       mropeTriplesOffset: offset,
+                                       queryCount: queryCount,
+                                       headDim: headDim,
+                                       numHeads: numQHeads,
+                                       rotaryDim: rotaryDim,
+                                       tokenStrideElements: qTokenStrideElements,
+                                       theta: theta,
+                                       mropeLimits: limits)
+            rope.encodeNeoxSubdimMRoPE(commandBuffer: commandBuffer,
+                                       data: k,
+                                       dataOffset: kOffset,
+                                       mropeTriples: triples,
+                                       mropeTriplesOffset: offset,
+                                       queryCount: queryCount,
+                                       headDim: headDim,
+                                       numHeads: numKVHeads,
+                                       rotaryDim: rotaryDim,
+                                       tokenStrideElements: kvTokenStrideElements,
+                                       theta: theta,
+                                       mropeLimits: limits)
+        }
     }
 
     func encode(commandBuffer: MTLCommandBuffer,

@@ -5,6 +5,7 @@ private let usage = """
 Usage:
   MferenceRepack [--dry-run] [--model <gemma4|qwen36|qwen36original|qwen38|swiftqwen38|deepseekv4flash|inklingsmall|maple|qwen38flashnext|minicpm5|minicpm5mlx|glm53flash>] --output <model.gturbo> [--overwrite] [--resume] [--skip-mtp] [--base-url <url>]
   MferenceRepack --attach-mtp <mtp-shard.safetensors> --output <model.gturbo>
+  MferenceRepack --attach-vision --output <model.gturbo> [--overwrite] [--base-url <url>]
   MferenceRepack --apply-surgery --input-gturbo <model.gturbo> [--surgery-final-norm <f>] [--surgery-qk-norm <f>] [--surgery-qk-start-ratio <f>] [--surgery-router-temp <f>] [--surgery-late-residual <f>] [--surgery-late-start-ratio <f>] [--surgery-late-linear-residual <f>] [--surgery-shared-expert <f>] [--surgery-shared-expert-start-ratio <f>] [--surgery-mtp-norm <f>] [--surgery-mtp-hidden-norm <f>] [--surgery-mtp-shared-expert <f>] [--surgery-mtp-qk-norm <f>] [--surgery-mtp-router-temp <f>] [--surgery-mtp-residual <f>] [--surgery-no-coadapt-mtp] [--surgery-force]
   MferenceRepack --discard-partial --output <model.gturbo>
   MferenceRepack --verify-install --input-gturbo <model.gturbo>
@@ -74,6 +75,7 @@ private struct Arguments {
     var discardPartial = false
     var verifyInstall = false
     var applySurgery = false
+    var attachVision = false
     var surgeryConfig = MTPAttachTool.SurgeryConfig()
     var attachMTP: String?
     var inputGTurbo: String?
@@ -119,6 +121,9 @@ private struct Arguments {
                 index += 1
             case "--apply-surgery":
                 parsed.applySurgery = true
+                index += 1
+            case "--attach-vision":
+                parsed.attachVision = true
                 index += 1
             case "--surgery-final-norm":
                 parsed.surgeryConfig.finalNormScale = try parseFloat(flag)
@@ -222,6 +227,16 @@ private struct Arguments {
             }
             return parsed
         }
+        if parsed.attachVision {
+            guard parsed.output != nil || parsed.inputGTurbo != nil else {
+                throw ParseError.missingRequired("--output")
+            }
+            guard !parsed.resume, !parsed.verifyInstall, !parsed.dryRun, !parsed.skipMTP else {
+                throw ParseError.invalidMode(
+                    "--attach-vision accepts --output <model.gturbo> [--overwrite] [--base-url <url>]")
+            }
+            return parsed
+        }
         if parsed.applySurgery {
             guard parsed.inputGTurbo != nil || parsed.output != nil else {
                 throw ParseError.missingRequired("--input-gturbo")
@@ -307,6 +322,26 @@ private func run(_ values: [String]) async -> Int32 {
             return 0
         } catch {
             printError("attach-mtp failed: \(error)")
+            return 1
+        }
+    }
+
+    if arguments.attachVision, let target = arguments.output ?? arguments.inputGTurbo {
+        do {
+            let result = try await VisionAttachTool.run(
+                gturboDirectory: target,
+                overwrite: arguments.overwrite,
+                token: ProcessInfo.processInfo.environment["HF_TOKEN"],
+                baseURL: arguments.baseURL ?? URL(string: "https://huggingface.co")!) { message in
+                FileHandle.standardError.write(Data(("[vision] " + message + "\n").utf8))
+            }
+            print("Attached \(result.tensorCount) vision tensors to \(target)")
+            print("Downloaded bytes: \(result.bytesDownloaded) (\(result.rangeRequestCount) range requests)")
+            print("vision_weights.bin: \(result.visionFileBytes) bytes (sha256: \(result.visionSha256))")
+            print("verified-install.json updated: \(result.verifiedReceiptUpdated)")
+            return 0
+        } catch {
+            printError("attach-vision failed: \(error)")
             return 1
         }
     }

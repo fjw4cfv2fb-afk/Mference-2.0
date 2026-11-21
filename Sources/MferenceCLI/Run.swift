@@ -24,19 +24,46 @@ public func run(args: Args,
         let expertStreaming = try resolveExpertStreaming(args.expertCacheSlots,
                                                          modelURL: modelURL)
         let tokenizer = try await MFTokenizer.load(forModelDirectory: modelURL)
+        let imageMarkerPrefix: String
+        if args.imagePaths.isEmpty {
+            imageMarkerPrefix = ""
+        } else {
+            let visionURL = modelURL.appendingPathComponent("vision_weights.bin")
+            guard FileManager.default.fileExists(atPath: visionURL.path) else {
+                return errored(
+                    stderr,
+                    "visual input requires vision_weights.bin sidecar in \(modelURL.path) (run MferenceRepack --attach-vision)",
+                    2)
+            }
+            let registeredPages = try args.imagePaths.flatMap { path in
+                let url = URL(fileURLWithPath: path)
+                return try Qwen36VisionImageStore.shared.registerVisualInput(fileURL: url)
+            }
+            let formatted = Qwen36VisionImageStore.formatMarkers(for: registeredPages)
+            imageMarkerPrefix = formatted.isEmpty ? "" : formatted + "\n"
+        }
         let promptIds: [Int32]
         if let rawPrompt = args.prompt {
-            promptIds = tokenizer.encode(rawPrompt, addBOS: true)
+            let combinedPrompt = imageMarkerPrefix.isEmpty ? rawPrompt : imageMarkerPrefix + rawPrompt
+            promptIds = tokenizer.encode(combinedPrompt, addBOS: true)
         } else if let messagesFile = args.messagesFile {
             let data = try Data(contentsOf: URL(fileURLWithPath: messagesFile),
                                 options: [.mappedIfSafe])
             let rows = try JSONDecoder().decode([MessageJSON].self, from: data)
-            let messages = try rows.map { row -> MFTokenizer.Message in
+            var messages = try rows.map { row -> MFTokenizer.Message in
                 guard let role = MFTokenizer.Role(rawValue: row.role) else {
                     throw MFTokenizerError.invalidChatTemplate("unsupported role \(row.role)")
                 }
                 return MFTokenizer.Message(role: role, content: row.content,
                                            reasoningContent: row.reasoning_content)
+            }
+            if !imageMarkerPrefix.isEmpty,
+               let lastUserIndex = messages.lastIndex(where: { $0.role == .user }) {
+                let target = messages[lastUserIndex]
+                messages[lastUserIndex] = MFTokenizer.Message(
+                    role: target.role,
+                    content: imageMarkerPrefix + (target.content ?? ""),
+                    reasoningContent: target.reasoningContent)
             }
             promptIds = try tokenizer.encodeChat(messages: messages, reasoningEffort: args.reasoningEffort)
         } else {

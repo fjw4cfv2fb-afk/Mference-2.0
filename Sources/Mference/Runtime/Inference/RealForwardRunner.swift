@@ -419,6 +419,13 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private var linearLayerIndex: [Int: Int] = [:]
     private var numLinearLayers: Int = 0
     private var prefillTokenBuffer: MTLBuffer?
+    private static let qwen36MRoPELimits = SIMD2<UInt32>(33, 30)
+    private var visionEncoder: Qwen36VisionEncoder?
+    private var prefillMRoPETriplesBuffer: MTLBuffer?
+    private var prefillVisionStagingBuffer: MTLBuffer?
+    private var mropeTriples: [(UInt32, UInt32, UInt32)] = []
+    private var mropeNextBaseAfterCount: [UInt32] = [0]
+    private var hasActiveMRoPE: Bool = false
     private var cachedPrefillLayerViews: [LayerPrefillQKVViews]?
     private var cachedLayerRoutedOffsets: [MoEExpertOffsets]?
 
@@ -1121,6 +1128,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
 
         if model.config.family == .qwen36 {
+            let visionURL = model.directoryURL.appendingPathComponent("vision_weights.bin")
+            if FileManager.default.fileExists(atPath: visionURL.path) {
+                self.visionEncoder = Qwen36VisionEncoder(weightsURL: visionURL)
+            }
             do {
                 self.speculator = try Self.probeQwen36Speculator(
                     model: model,
@@ -1179,6 +1190,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         verifyArenaRoundBase = -1
         verifyArenaCaptured = 0
         dsv4State?.reset()
+        mropeTriples.removeAll()
+        mropeNextBaseAfterCount = [0]
+        hasActiveMRoPE = false
         // Short-conv history dies with the KV cache, and ONLY with it:
         // `prepareForContinuation` retains both, so a resumed conversation
         // keeps the last K-1 conv inputs that match the cached prefix.
@@ -1200,6 +1214,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         fileprivate let pinnedGDNCheckpointPosition: Int?
         fileprivate let historyBasePosition: Int
         fileprivate let tokenHistory: [Int32]
+        fileprivate let mropeTriples: [(UInt32, UInt32, UInt32)]
+        fileprivate let mropeNextBaseAfterCount: [UInt32]
+        fileprivate let hasActiveMRoPE: Bool
 
         public func rewindablePosition(atOrBefore maxPosition: Int) -> Int? {
             guard gdnSnapshot != nil else { return min(maxPosition, position) }
@@ -1257,6 +1274,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             minimalGDNSnapshots[pinnedPos] = pinnedSnap
         }
         let history = (speculator as? Qwen36MTPSpeculator)?.capturedTokenHistory ?? (basePosition: 0, tokens: [])
+        let snapMRoPETriples = hasActiveMRoPE ? Array(mropeTriples.prefix(pos)) : []
+        let snapMRoPENextBase = hasActiveMRoPE ? Array(mropeNextBaseAfterCount.prefix(pos + 1)) : [0]
         return PrefixSnapshot(
             position: pos,
             kLayers: kLayers,
@@ -1265,7 +1284,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             gdnSnapshots: minimalGDNSnapshots,
             pinnedGDNCheckpointPosition: pinnedGDNCheckpointPosition,
             historyBasePosition: history.basePosition,
-            tokenHistory: history.tokens)
+            tokenHistory: history.tokens,
+            mropeTriples: snapMRoPETriples,
+            mropeNextBaseAfterCount: snapMRoPENextBase,
+            hasActiveMRoPE: hasActiveMRoPE)
     }
 
     @discardableResult
@@ -1327,6 +1349,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         } else {
             speculator?.reset()
         }
+        mropeTriples = snapshot.mropeTriples
+        mropeNextBaseAfterCount = snapshot.mropeNextBaseAfterCount.isEmpty ? [0] : snapshot.mropeNextBaseAfterCount
+        hasActiveMRoPE = snapshot.hasActiveMRoPE
         resetTransientState()
         return true
     }
@@ -1408,7 +1433,239 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         verifyArenaRoundBase = -1
         verifyArenaCaptured = 0
+        rewindMRoPE(to: expectedPosition)
         resetTransientState()
+    }
+
+    private func rewindMRoPE(to position: Int) {
+        if mropeTriples.count > position {
+            mropeTriples.removeLast(mropeTriples.count - position)
+        }
+        if mropeNextBaseAfterCount.count > position + 1 {
+            mropeNextBaseAfterCount.removeLast(mropeNextBaseAfterCount.count - (position + 1))
+        }
+        hasActiveMRoPE = mropeTriples.enumerated().contains { idx, tr in
+            tr.0 != UInt32(idx) || tr.1 != UInt32(idx) || tr.2 != UInt32(idx)
+        }
+    }
+
+    private func backfillLinearMRoPE(upTo position: Int) {
+        if mropeNextBaseAfterCount.isEmpty {
+            mropeNextBaseAfterCount = [0]
+        }
+        while mropeTriples.count < position {
+            let idx = mropeTriples.count
+            let base = mropeNextBaseAfterCount.last ?? UInt32(idx)
+            mropeTriples.append((base, base, base))
+            let nextBase = base + 1
+            if mropeNextBaseAfterCount.count == mropeTriples.count {
+                mropeNextBaseAfterCount.append(nextBase)
+            } else {
+                mropeNextBaseAfterCount[mropeTriples.count] = nextBase
+            }
+        }
+        if mropeNextBaseAfterCount.count <= position {
+            var base = mropeNextBaseAfterCount.last ?? UInt32(mropeTriples.count)
+            while mropeNextBaseAfterCount.count <= position {
+                base += 1
+                mropeNextBaseAfterCount.append(base)
+            }
+        }
+    }
+
+    private func recordLinearMRoPEPositions(startPosition: Int, count: Int) {
+        rewindMRoPE(to: startPosition)
+        backfillLinearMRoPE(upTo: startPosition)
+        var base = mropeNextBaseAfterCount[startPosition]
+        for _ in 0..<count {
+            mropeTriples.append((base, base, base))
+            base += 1
+            mropeNextBaseAfterCount.append(base)
+        }
+    }
+
+    private func ensureVisionEncoderLoaded() throws -> Qwen36VisionEncoder {
+        if let visionEncoder {
+            return visionEncoder
+        }
+        let visionURL = model.directoryURL.appendingPathComponent("vision_weights.bin")
+        guard model.config.family == .qwen36,
+              FileManager.default.fileExists(atPath: visionURL.path) else {
+            throw Qwen36VisionImageError.visionSidecarMissing(visionURL.path)
+        }
+        let encoder = Qwen36VisionEncoder(weightsURL: visionURL)
+        self.visionEncoder = encoder
+        return encoder
+    }
+
+    private func prepareVisionAndMRoPE(tokens: ArraySlice<Int32>, startPosition: Int) throws {
+        guard !tokens.isEmpty else { return }
+        let containsVisual = tokens.contains(where: { $0 < 0 })
+        guard hasActiveMRoPE || containsVisual else { return }
+
+        let encoder = containsVisual ? try ensureVisionEncoderLoaded() : nil
+        rewindMRoPE(to: startPosition)
+        backfillLinearMRoPE(upTo: startPosition)
+
+        var base = mropeNextBaseAfterCount[startPosition]
+        var encodedIDs = Set<Int>()
+        let count = tokens.count
+        for offset in 0..<count {
+            let tok = tokens[tokens.index(tokens.startIndex, offsetBy: offset)]
+            if tok < 0 {
+                guard let (imageID, row) = Qwen36VisionImageStore.decodeVisualTokenID(tok) else {
+                    throw Qwen36VisionImageError.missingRegisteredImage(imageID: -1, sha256: nil)
+                }
+                guard let image = Qwen36VisionImageStore.shared.image(for: imageID) else {
+                    throw Qwen36VisionImageError.missingRegisteredImage(imageID: imageID, sha256: nil)
+                }
+                if !encodedIDs.contains(imageID) {
+                    _ = try encoder!.ensureEncoded(imageID: imageID)
+                    encodedIDs.insert(imageID)
+                }
+                hasActiveMRoPE = true
+                let w = max(1, image.llmGridW)
+                let h = max(1, image.llmGridH)
+                let r = row / w
+                let c = row % w
+                mropeTriples.append((base, base + UInt32(r), base + UInt32(c)))
+
+                let isLastInImageRun: Bool = {
+                    guard offset + 1 < count else { return true }
+                    let nextTok = tokens[tokens.index(tokens.startIndex, offsetBy: offset + 1)]
+                    guard nextTok < 0,
+                          let nextDecoded = Qwen36VisionImageStore.decodeVisualTokenID(nextTok) else {
+                        return true
+                    }
+                    return nextDecoded.imageID != imageID || nextDecoded.row != row + 1
+                }()
+                if isLastInImageRun {
+                    base += UInt32(max(1, h, w))
+                    mropeNextBaseAfterCount.append(base)
+                } else {
+                    mropeNextBaseAfterCount.append(base + UInt32(max(1, r + 1, c + 1)))
+                }
+            } else {
+                mropeTriples.append((base, base, base))
+                base += 1
+                mropeNextBaseAfterCount.append(base)
+            }
+        }
+    }
+
+    private struct VisionStagingRun {
+        let chunkStartIndex: Int
+        let rowCount: Int
+        let stagingByteOffset: Int
+    }
+
+    private func stageChunkVisionRows(
+        tokens: ArraySlice<Int32>,
+        hiddenSize: Int
+    ) throws -> [VisionStagingRun] {
+        var totalVisualRows = 0
+        for tok in tokens where tok < 0 { totalVisualRows += 1 }
+        guard totalVisualRows > 0 else { return [] }
+
+        let rowBytes = hiddenSize * MemoryLayout<Float16>.stride
+        let neededBytes = totalVisualRows * rowBytes
+        if prefillVisionStagingBuffer == nil || prefillVisionStagingBuffer!.length < neededBytes {
+            guard let buf = ctx.device.makeBuffer(length: max(neededBytes, rowBytes),
+                                                  options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            prefillVisionStagingBuffer = buf
+        }
+        guard let staging = prefillVisionStagingBuffer else {
+            throw ModelError.residentBufferWrapFailed
+        }
+
+        let dstBase = staging.contents().assumingMemoryBound(to: Float16.self)
+        var runs: [VisionStagingRun] = []
+        var stagedRows = 0
+        var cachedByImageID: [Int: [Float16]] = [:]
+        var runStart: Int?
+        var runStagingByteOffset = 0
+        var runCount = 0
+
+        func flushRun() {
+            if let start = runStart, runCount > 0 {
+                runs.append(VisionStagingRun(
+                    chunkStartIndex: start,
+                    rowCount: runCount,
+                    stagingByteOffset: runStagingByteOffset))
+            }
+            runStart = nil
+            runCount = 0
+        }
+
+        for (idx, tok) in tokens.enumerated() {
+            guard tok < 0 else {
+                flushRun()
+                continue
+            }
+            guard let (imageID, row) = Qwen36VisionImageStore.decodeVisualTokenID(tok) else {
+                throw Qwen36VisionImageError.missingRegisteredImage(imageID: -1, sha256: nil)
+            }
+            let emb: [Float16]
+            if let cached = cachedByImageID[imageID] {
+                emb = cached
+            } else if let stored = Qwen36VisionImageStore.shared.cachedEmbeddings(for: imageID) {
+                cachedByImageID[imageID] = stored
+                emb = stored
+            } else {
+                let encoder = try ensureVisionEncoderLoaded()
+                let computed = try encoder.ensureEncoded(imageID: imageID)
+                cachedByImageID[imageID] = computed
+                emb = computed
+            }
+            let srcStart = row * hiddenSize
+            guard srcStart + hiddenSize <= emb.count else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt(
+                    "visual row \(row) out of bounds for image \(imageID)")
+            }
+            if runStart == nil {
+                runStart = idx
+                runStagingByteOffset = stagedRows * rowBytes
+            }
+            let dstRow = dstBase.advanced(by: stagedRows * hiddenSize)
+            emb.withUnsafeBufferPointer { src in
+                dstRow.update(from: src.baseAddress!.advanced(by: srcStart), count: hiddenSize)
+            }
+            stagedRows += 1
+            runCount += 1
+        }
+        flushRun()
+        return runs
+    }
+
+    private func stageChunkMRoPETriples(startPosition: Int,
+                                        count: Int,
+                                        minCapacity: Int) throws {
+        guard count > 0 else { return }
+        guard startPosition + count <= mropeTriples.count else {
+            throw PrefillError.prefillCursorMismatch(
+                "mrope triples missing for range \(startPosition)..<\(startPosition + count) (count=\(mropeTriples.count))")
+        }
+        let neededBytes = count * 3 * MemoryLayout<UInt32>.stride
+        if prefillMRoPETriplesBuffer == nil || prefillMRoPETriplesBuffer!.length < neededBytes {
+            guard let buf = ctx.device.makeBuffer(
+                length: max(minCapacity, count) * 3 * MemoryLayout<UInt32>.stride,
+                options: .storageModeShared) else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            prefillMRoPETriplesBuffer = buf
+        }
+        guard let mropeBuf = prefillMRoPETriplesBuffer else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        let ptr = mropeBuf.contents().bindMemory(to: UInt32.self, capacity: count * 3)
+        for k in 0..<count {
+            let tr = mropeTriples[startPosition + k]
+            ptr[k * 3] = tr.0
+            ptr[k * 3 + 1] = tr.1
+            ptr[k * 3 + 2] = tr.2
+        }
     }
 
     private func resetTransientState() {
@@ -1891,6 +2148,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // 2. Prepare batched candidate slice: [bonus] + drafts
         let verifyTokens: [Int32] = [token] + drafts
         let scratch = try ensurePrefillScratch(config: .defaultChunked)
+        if hasActiveMRoPE {
+            recordLinearMRoPEPositions(startPosition: position, count: verifyTokens.count)
+        }
 
         // 3. Run batched verify forward pass through trunk
         let verifyStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
@@ -1924,6 +2184,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // 5. Rollback if any draft rejected
         if accepted < drafts.count {
             kv?.rewind(to: position + accepted + 1)
+            if hasActiveMRoPE {
+                rewindMRoPE(to: position + accepted + 1)
+            }
             try restoreGDNFromVerifyArena(slot: accepted, wait: mtp == nil)
             verifyArenaCaptured = min(accepted + 1, 4)
         }
@@ -2207,6 +2470,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             return PrefillResult(newPosition: pos, seed: .logitsWritten, execution: execution)
         }
 
+        try prepareVisionAndMRoPE(tokens: tokens, startPosition: startPosition)
         let scratch = try ensurePrefillScratch(config: config)
         let spans = PrefillChunkPlanner.spans(tokenCount: tokens.count,
                                               startPosition: startPosition,
@@ -2336,11 +2600,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         guard let tokenBuffer = prefillTokenBuffer else {
             throw ModelError.residentBufferWrapFailed
         }
+        let D = cfg.hiddenSize
         let tokenPtr = tokenBuffer.contents().bindMemory(to: UInt32.self, capacity: tokens.count)
         for (idx, tok) in tokens.enumerated() {
-            tokenPtr[idx] = UInt32(bitPattern: tok)
+            tokenPtr[idx] = UInt32(bitPattern: tok < 0 ? Qwen36VisionImageStore.imagePadTokenID : tok)
         }
-        let D = cfg.hiddenSize
+        let visionRuns = try stageChunkVisionRows(tokens: tokens, hiddenSize: D)
+        let useChunkMRoPE = hasActiveMRoPE && cfg.ropeNeoxSubdim
+        if useChunkMRoPE {
+            try stageChunkMRoPETriples(startPosition: startPosition,
+                                       count: tokens.count,
+                                       minCapacity: scratch.layout.chunkTokens)
+        }
         let eps: Float = 1e-6
         let embedOutScale = cfg.embeddingScaledBySqrtHidden
             ? Float(D).squareRoot()
@@ -2536,6 +2807,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             t: UInt32(t),
                             d: UInt32(D),
                             outScale: embedOutScale)
+        if !visionRuns.isEmpty, let staging = prefillVisionStagingBuffer {
+            guard let blit = cb.makeBlitCommandEncoder() else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            let rowBytes = D * MemoryLayout<Float16>.stride
+            for run in visionRuns {
+                blit.copy(from: staging,
+                          sourceOffset: run.stagingByteOffset,
+                          to: scratch.hidden,
+                          destinationOffset: run.chunkStartIndex * rowBytes,
+                          size: run.rowCount * rowBytes)
+            }
+            blit.endEncoding()
+        }
 
         for L in 0..<cfg.numLayers {
             try prefillWillEncodeLayer?(L)
@@ -2842,24 +3127,46 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
                 if cfg.ropeNeoxSubdim {
                     let rotaryDim = UInt32(Double(headDim) * cfg.partialRotaryFactor)
-                    prefillQKVEpilogue.encodeNeoxSubdimNoVNorm(
-                        commandBuffer: cb,
-                        q: attnQ,
-                        k: scratch.kStage,
-                        qWeight: views.qNorm!.buffer,
-                        qWeightOffset: Int(views.qNorm!.offset),
-                        kWeight: views.kNorm!.buffer,
-                        kWeightOffset: Int(views.kNorm!.offset),
-                        startPosition: UInt32(startPosition),
-                        queryCount: UInt32(t),
-                        headDim: UInt32(headDim),
-                        numQHeads: UInt32(cfg.numHeads),
-                        numKVHeads: UInt32(numKVHeads),
-                        qTokenStrideElements: UInt32(qDim),
-                        kvTokenStrideElements: UInt32(kvDim),
-                        theta: Float(cfg.fullRopeTheta),
-                        rotaryDim: rotaryDim,
-                        eps: eps)
+                    if useChunkMRoPE, let mropeBuf = prefillMRoPETriplesBuffer {
+                        prefillQKVEpilogue.encodeNeoxSubdimNoVNormMRoPE(
+                            commandBuffer: cb,
+                            q: attnQ,
+                            k: scratch.kStage,
+                            qWeight: views.qNorm!.buffer,
+                            qWeightOffset: Int(views.qNorm!.offset),
+                            kWeight: views.kNorm!.buffer,
+                            kWeightOffset: Int(views.kNorm!.offset),
+                            mropeTriples: mropeBuf,
+                            mropeLimits: Self.qwen36MRoPELimits,
+                            queryCount: UInt32(t),
+                            headDim: UInt32(headDim),
+                            numQHeads: UInt32(cfg.numHeads),
+                            numKVHeads: UInt32(numKVHeads),
+                            qTokenStrideElements: UInt32(qDim),
+                            kvTokenStrideElements: UInt32(kvDim),
+                            theta: Float(cfg.fullRopeTheta),
+                            rotaryDim: rotaryDim,
+                            eps: eps)
+                    } else {
+                        prefillQKVEpilogue.encodeNeoxSubdimNoVNorm(
+                            commandBuffer: cb,
+                            q: attnQ,
+                            k: scratch.kStage,
+                            qWeight: views.qNorm!.buffer,
+                            qWeightOffset: Int(views.qNorm!.offset),
+                            kWeight: views.kNorm!.buffer,
+                            kWeightOffset: Int(views.kNorm!.offset),
+                            startPosition: UInt32(startPosition),
+                            queryCount: UInt32(t),
+                            headDim: UInt32(headDim),
+                            numQHeads: UInt32(cfg.numHeads),
+                            numKVHeads: UInt32(numKVHeads),
+                            qTokenStrideElements: UInt32(qDim),
+                            kvTokenStrideElements: UInt32(kvDim),
+                            theta: Float(cfg.fullRopeTheta),
+                            rotaryDim: rotaryDim,
+                            eps: eps)
+                    }
                 } else {
                     let rotatedPairs = isFull
                         ? UInt32(Double(cfg.fullHeadDim) * cfg.partialRotaryFactor / 2.0)
@@ -3841,6 +4148,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             return
         }
         let D    = UInt32(cfg.hiddenSize)
+        if hasActiveMRoPE {
+            recordLinearMRoPEPositions(startPosition: position, count: 1)
+        }
         verifyArenaRoundBase = -1
         verifyArenaCaptured = 0
         let FmoE = UInt32(cfg.moeIntermediateSize)
@@ -6040,6 +6350,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                             qRows: 2 * qDim,
                             kvRows: kvDim,
                             n: D)
+        let ropePosition: UInt32
+        if hasActiveMRoPE, position < mropeTriples.count {
+            ropePosition = mropeTriples[position].0
+        } else {
+            ropePosition = UInt32(position)
+        }
         fusedQKVEpilogue.encodeQwenGated(commandBuffer: cb,
                                          qPacked: qPackedScratch,
                                          qOut: qScratch,
@@ -6053,7 +6369,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                          headDim: UInt32(headDim),
                                          numQHeads: UInt32(cfg.numHeads),
                                          numKVHeads: UInt32(numKV),
-                                         position: UInt32(position),
+                                         position: ropePosition,
                                          theta: Float(cfg.fullRopeTheta),
                                          rotaryDim: rotaryDim,
                                          eps: eps)

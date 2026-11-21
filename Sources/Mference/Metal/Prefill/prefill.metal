@@ -1091,6 +1091,36 @@ kernel void prefill_rope_neox_subdim_block(
                                  float(start_position + t), theta_base);
 }
 
+/// Interleaved M-RoPE variant of `prefill_rope_neox_subdim_block` (Qwen 3.5 / 3.6):
+/// `mrope_triples` holds `(pos_t, pos_h, pos_w)` per token (`queryCount * 3` uints);
+/// `mrope_limits` packs `(mrope_section[1] * 3, mrope_section[2] * 3)`.
+kernel void prefill_rope_neox_subdim_mrope_block(
+    device half*        data                [[buffer(0)]],
+    device const uint*  mrope_triples       [[buffer(1)]],
+    constant uint&      head_dim            [[buffer(2)]],
+    constant uint&      num_heads           [[buffer(3)]],
+    constant uint&      token_stride_elems  [[buffer(4)]],
+    constant float&     theta_base          [[buffer(5)]],
+    constant uint&      rotary_dim          [[buffer(6)]],
+    constant uint2&     mrope_limits        [[buffer(7)]],
+    uint3               gid                 [[thread_position_in_grid]]
+) {
+    const uint i = gid.x;
+    const uint h = gid.y;
+    const uint t = gid.z;
+    const uint half_rotary = rotary_dim / 2u;
+    if (i >= half_rotary) return;
+    if (h >= num_heads) return;
+
+    const uint axis =
+        ((i % 3u) == 1u && i < mrope_limits.x) ? 1u :
+        (((i % 3u) == 2u && i < mrope_limits.y) ? 2u : 0u);
+    const float pos = float(mrope_triples[t * 3u + axis]);
+    device half* head_ptr = data + t * token_stride_elems + h * head_dim;
+    prefill_rope_apply_neox_pair(head_ptr, i, half_rotary, rotary_dim,
+                                 pos, theta_base);
+}
+
 struct PrefillAttentionParams {
     uint startPosition;
     uint queryCount;

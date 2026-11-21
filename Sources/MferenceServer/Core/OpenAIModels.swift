@@ -22,9 +22,90 @@ public struct OpenAIErrorEnvelope: Codable, Equatable, Sendable {
     }
 }
 
+public struct OpenAIImageURLPayload: Codable, Equatable, Sendable {
+    public let url: String
+    public let detail: String?
+
+    public init(url: String, detail: String? = nil) {
+        self.url = url
+        self.detail = detail
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let rawURL = try? decoder.singleValueContainer().decode(String.self) {
+            self.url = rawURL
+            self.detail = nil
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.url = try container.decode(String.self, forKey: .url)
+        self.detail = try container.decodeIfPresent(String.self, forKey: .detail)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case url
+        case detail
+    }
+}
+
+public struct OpenAIFilePayload: Codable, Equatable, Sendable {
+    public let file_data: String?
+    public let url: String?
+    public let filename: String?
+
+    public init(file_data: String? = nil, url: String? = nil, filename: String? = nil) {
+        self.file_data = file_data
+        self.url = url
+        self.filename = filename
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let raw = try? decoder.singleValueContainer().decode(String.self) {
+            self.file_data = raw
+            self.url = nil
+            self.filename = nil
+            return
+        }
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.file_data = try container.decodeIfPresent(String.self, forKey: .file_data)
+        self.url = try container.decodeIfPresent(String.self, forKey: .url)
+        self.filename = try container.decodeIfPresent(String.self, forKey: .filename)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case file_data
+        case url
+        case filename
+    }
+}
+
 public struct OpenAITextPart: Codable, Equatable, Sendable {
     public let type: String
     public let text: String?
+    public let image_url: OpenAIImageURLPayload?
+    public let input_image: OpenAIImageURLPayload?
+    public let url: String?
+    public let file: OpenAIFilePayload?
+    public let file_data: String?
+    public let file_url: String?
+
+    public init(type: String,
+                text: String? = nil,
+                image_url: OpenAIImageURLPayload? = nil,
+                input_image: OpenAIImageURLPayload? = nil,
+                url: String? = nil,
+                file: OpenAIFilePayload? = nil,
+                file_data: String? = nil,
+                file_url: String? = nil) {
+        self.type = type
+        self.text = text
+        self.image_url = image_url
+        self.input_image = input_image
+        self.url = url
+        self.file = file
+        self.file_data = file_data
+        self.file_url = file_url
+    }
 }
 
 public enum OpenAIMessageContent: Codable, Equatable, Sendable {
@@ -48,18 +129,83 @@ public enum OpenAIMessageContent: Codable, Equatable, Sendable {
         }
     }
 
+    private static func registerVisualMarkers(
+        fromURLOrDataURI rawURL: String,
+        errorCode: String,
+        kindLabel: String
+    ) throws -> String {
+        do {
+            let pages = try Qwen36VisionImageStore.shared.registerVisualInput(fromURLOrDataURI: rawURL)
+            return Qwen36VisionImageStore.formatMarkers(for: pages)
+        } catch {
+            throw ServerRequestError.invalid(
+                message: "invalid \(kindLabel) content part: \(error)",
+                param: "messages",
+                code: errorCode)
+        }
+    }
+
     func textValue() throws -> String {
         switch self {
         case .text(let text):
             return text
         case .parts(let parts):
-            guard parts.allSatisfy({ $0.type == "text" && $0.text != nil }) else {
-                throw ServerRequestError.invalid(
-                    message: "only text content parts are supported",
-                    param: "messages",
-                    code: "unsupported_content")
+            var pieces: [String] = []
+            pieces.reserveCapacity(parts.count)
+            for part in parts {
+                switch part.type {
+                case "text", "input_text":
+                    guard let text = part.text else {
+                        throw ServerRequestError.invalid(
+                            message: "text content part is missing text",
+                            param: "messages",
+                            code: "unsupported_content")
+                    }
+                    pieces.append(text)
+                case "image_url", "input_image", "image":
+                    guard let rawURL = part.image_url?.url ?? part.input_image?.url ?? part.url,
+                          !rawURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                        throw ServerRequestError.invalid(
+                            message: "image content part is missing image_url",
+                            param: "messages",
+                            code: "invalid_image")
+                    }
+                    pieces.append(try Self.registerVisualMarkers(
+                        fromURLOrDataURI: rawURL,
+                        errorCode: "invalid_image",
+                        kindLabel: "image"))
+                case "file", "input_file":
+                    guard let rawFile = part.file?.file_data ?? part.file?.url ?? part.file_data ?? part.file_url else {
+                        throw ServerRequestError.invalid(
+                            message: "file content part is missing file_data or url",
+                            param: "messages",
+                            code: "invalid_file")
+                    }
+                    let trimmed = rawFile.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty else {
+                        throw ServerRequestError.invalid(
+                            message: "file content part is empty",
+                            param: "messages",
+                            code: "invalid_file")
+                    }
+                    let normalizedSource: String
+                    if trimmed.hasPrefix("data:") || trimmed.hasPrefix("file://") || FileManager.default.fileExists(atPath: trimmed) {
+                        normalizedSource = trimmed
+                    } else {
+                        normalizedSource = "data:application/pdf;base64,\(trimmed)"
+                    }
+                    pieces.append(try Self.registerVisualMarkers(
+                        fromURLOrDataURI: normalizedSource,
+                        errorCode: "invalid_file",
+                        kindLabel: "file"))
+                default:
+                    throw ServerRequestError.invalid(
+                        message: "unsupported content part type '\(part.type)'",
+                        param: "messages",
+                        code: "unsupported_content")
+                }
             }
-            return parts.compactMap(\.text).joined()
+            return pieces.joined()
         }
     }
 }

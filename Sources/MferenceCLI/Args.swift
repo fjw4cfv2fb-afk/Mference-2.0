@@ -53,6 +53,7 @@ public struct Args: Equatable, Sendable {
     public var kvTopKPages: Int
     /// Resident pool per full-attention layer in pages; nil = auto by RAM.
     public var kvPoolPages: Int?
+    public var imagePaths: [String]
 
     public init(model: String,
                 prompt: String? = nil,
@@ -76,7 +77,8 @@ public struct Args: Equatable, Sendable {
                 kvPaged: String = "auto",
                 kvTopKPages: Int = 60,
                 kvPoolPages: Int? = nil,
-                reasoningEffort: QwenReasoningEffort? = nil) {
+                reasoningEffort: QwenReasoningEffort? = nil,
+                imagePaths: [String] = []) {
         self.reasoningEffort = reasoningEffort
         self.model = model
         self.prompt = prompt
@@ -97,6 +99,7 @@ public struct Args: Equatable, Sendable {
         self.kvPaged = kvPaged
         self.kvTopKPages = kvTopKPages
         self.kvPoolPages = kvPoolPages
+        self.imagePaths = imagePaths
         self.seed = seed
         self.stops = stops
         self.quiet = quiet
@@ -141,6 +144,7 @@ extension Args {
 
     options:
       --system <string>         System message for --chat (repeatable).
+      --image <path>            Attach image or PDF file for vision-capable models (repeatable; alias --pdf).
       --max-new <int>           Generated-token limit (default 1024).
       --max-context <int>       Context limit in tokens (default 4096).
       --kv-paged <on|off|auto>  Paged KV cache with SSD spill + Quest sparse
@@ -212,6 +216,7 @@ extension Args {
         var kvTopKPages = 60
         var kvPoolPages: Int? = nil
         var reasoningEffort: QwenReasoningEffort?
+        var imagePaths: [String] = []
 
         var index = 0
         while index < argv.count {
@@ -345,6 +350,8 @@ extension Args {
                 rdadvise = value
             case "--stop":
                 stops.append(try takeValue(argv, &index, flag: flag))
+            case "--image", "--pdf":
+                imagePaths.append(try takeValue(argv, &index, flag: flag))
             default:
                 throw ArgsError.unknownFlag(flag)
             }
@@ -366,6 +373,9 @@ extension Args {
         if prompt == nil && messagesFile == nil && !chat { throw ArgsError.modeMissing }
         if systemPrompt != nil && !chat {
             throw ArgsError.invalidValue(flag: "--system", value: "requires --chat")
+        }
+        if !imagePaths.isEmpty && chat {
+            throw ArgsError.invalidValue(flag: "--image", value: "is not supported with --chat")
         }
         if temperature > 0, topK == nil, let topP, topP < 1 {
             throw ArgsError.invalidValue(
@@ -394,7 +404,8 @@ extension Args {
                     kvPaged: kvPaged,
                     kvTopKPages: kvTopKPages,
                     kvPoolPages: kvPoolPages,
-                    reasoningEffort: reasoningEffort)
+                    reasoningEffort: reasoningEffort,
+                    imagePaths: imagePaths)
     }
 
     private static func takeValue(_ argv: [String],

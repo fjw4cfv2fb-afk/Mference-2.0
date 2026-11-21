@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+@testable import Mference
 @testable import MferenceAppCore
 
 @Suite struct AppPromptAttachmentTests {
@@ -117,5 +118,27 @@ import Testing
             AppPromptAttachment.self,
             from: JSONEncoder().encode(attachment))
         #expect(decoded == attachment)
+    }
+
+    @Test func composePreservesVisionMarkerWithoutTruncation() {
+        let marker = Qwen36VisionImageStore.makeMarker(
+            imageID: 3,
+            sha256: "deadbeef-147456",
+            gridH: 24,
+            gridW: 24,
+            numVisualTokens: 144)
+        let attachment = AppPromptAttachment(
+            fileName: "chart.png",
+            formatLabel: "Image",
+            extractedText: marker)
+
+        let prompt = AppPromptContext.compose(
+            userPrompt: "Describe this chart.",
+            attachments: [attachment],
+            maximumAttachmentCharacters: 0)
+
+        #expect(prompt.contains(marker))
+        #expect(prompt.contains("Describe this chart."))
+        #expect(!prompt.contains("was truncated"))
     }
 }

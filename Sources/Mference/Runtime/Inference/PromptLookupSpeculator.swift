@@ -196,7 +196,12 @@ public final class PromptLookupSpeculator: SpeculativeDrafter {
     }
 
     private func isPromptInstructionOrPlaceholder(_ token: Int32) -> Bool {
+        if token < 0 { return true }
         switch token {
+        case Qwen36VisionImageStore.visionStartTokenID,
+             Qwen36VisionImageStore.visionEndTokenID,
+             Qwen36VisionImageStore.imagePadTokenID:
+            return true
         case 27, 29, 361: // '<', '>'
             return false // Allow comparison operators in mathematical reasoning!
         case 30, 907, 1546, 2940: // '?', ' ?'

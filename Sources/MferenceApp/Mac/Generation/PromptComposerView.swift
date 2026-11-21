@@ -403,6 +403,9 @@ struct PromptComposerView: View {
         if imageExtensions.contains(ext) {
             return try extractImageText(from: url, fileName: customFileName)
         }
+        if ext == "pdf" {
+            return try extractPDFDocument(from: url, fileName: customFileName)
+        }
 
         do {
             let doc = try DocumentTextExtractor.extract(from: url)
@@ -424,36 +427,101 @@ struct PromptComposerView: View {
             }
         }
 
-        guard let image = NSImage(contentsOf: url),
-              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            throw DocumentTextExtractionError.unreadableFile(fileName)
-        }
-
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
-
-        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        let marker: String
         do {
-            try handler.perform([request])
+            marker = try AppPromptVisionSupport.registerImageMarker(from: url)
         } catch {
             throw DocumentTextExtractionError.unreadableFile(fileName)
         }
 
-        let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
-        let text = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard !text.isEmpty else {
-            throw DocumentTextExtractionError.noExtractableText(fileName)
+        var ocrText = ""
+        if let image = NSImage(contentsOf: url),
+           let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
+            let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+            if (try? handler.perform([request])) != nil {
+                let lines = (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }
+                ocrText = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            }
         }
 
         let maxChars = DocumentTextExtractor.maximumExtractedCharacters
-        let clipped = String(text.prefix(maxChars))
+        let clippedOCR = String(ocrText.prefix(maxChars))
+        let combined = clippedOCR.isEmpty ? marker : "\(marker)\n\(clippedOCR)"
         return ExtractedPromptDocument(
             fileName: fileName,
-            formatLabel: "Image OCR",
-            text: clipped,
-            wasTruncated: clipped.count < text.count)
+            formatLabel: clippedOCR.isEmpty ? "Image" : "Image + OCR",
+            text: combined,
+            wasTruncated: clippedOCR.count < ocrText.count)
+    }
+
+    nonisolated private static func extractPDFDocument(from url: URL, fileName: String) throws -> ExtractedPromptDocument {
+        let didAccess = url.startAccessingSecurityScopedResource()
+        defer {
+            if didAccess {
+                url.stopAccessingSecurityScopedResource()
+            }
+        }
+
+        var visionResult: AppPromptPDFVisionResult?
+        var visionError: Error?
+        do {
+            visionResult = try AppPromptVisionSupport.registerPDFMarkers(from: url)
+        } catch {
+            visionError = error
+        }
+
+        var textDoc: ExtractedPromptDocument?
+        var textError: Error?
+        do {
+            textDoc = try DocumentTextExtractor.extract(from: url)
+        } catch {
+            textError = error
+        }
+
+        if visionResult == nil && textDoc == nil {
+            throw textError ?? visionError ?? DocumentTextExtractionError.unreadableFile(fileName)
+        }
+
+        let markerBlock = visionResult?.markers.joined(separator: "\n") ?? ""
+        var textBlock = textDoc?.text ?? ""
+        if let visionResult, visionResult.wasPageTruncated {
+            let note = "[Visual rendering included pages 1-\(visionResult.markers.count) of \(visionResult.totalPageCount) total PDF pages.]"
+            textBlock = textBlock.isEmpty ? note : "\(textBlock)\n\n\(note)"
+        }
+
+        let combined: String
+        let formatLabel: String
+        switch (!markerBlock.isEmpty, !textBlock.isEmpty) {
+        case (true, true):
+            combined = "\(markerBlock)\n\n\(textBlock)"
+            if let visionResult, visionResult.wasPageTruncated {
+                formatLabel = "PDF + Vision (\(visionResult.markers.count)/\(visionResult.totalPageCount)p)"
+            } else {
+                formatLabel = "PDF + Vision"
+            }
+        case (true, false):
+            combined = markerBlock
+            if let visionResult, visionResult.wasPageTruncated {
+                formatLabel = "PDF Vision (\(visionResult.markers.count)/\(visionResult.totalPageCount)p)"
+            } else {
+                formatLabel = "PDF Vision"
+            }
+        case (false, true):
+            combined = textBlock
+            formatLabel = textDoc?.formatLabel ?? "PDF"
+        case (false, false):
+            throw textError ?? visionError ?? DocumentTextExtractionError.unreadableFile(fileName)
+        }
+
+        let wasTruncated = (textDoc?.wasTruncated ?? false) || (visionResult?.wasPageTruncated ?? false)
+        return ExtractedPromptDocument(
+            fileName: fileName,
+            formatLabel: formatLabel,
+            text: combined,
+            wasTruncated: wasTruncated)
     }
 
     nonisolated private static func extractTextDocument(from url: URL, fileName: String) throws -> ExtractedPromptDocument {

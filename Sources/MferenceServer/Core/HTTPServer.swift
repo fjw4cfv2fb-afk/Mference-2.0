@@ -14,7 +14,7 @@ enum ServerModelMode: Sendable {
 }
 
 public actor MferenceHTTPServer {
-    public static let maximumBodyBytes = 1_048_576
+    public static let maximumBodyBytes = 32 * 1_048_576
 
     private let group: MultiThreadedEventLoopGroup
     private let mode: ServerModelMode

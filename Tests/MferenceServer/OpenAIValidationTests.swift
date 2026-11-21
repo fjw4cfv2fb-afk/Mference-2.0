@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
 @testable import Mference
 @testable import MferenceServerCore
@@ -800,6 +802,96 @@ struct ServerArgumentTests {
                 ])
             }
         }
+    }
+
+    @Test func acceptsBase64ImageURLContentParts() throws {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.noneSkipLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue
+        let ctx = CGContext(
+            data: nil, width: 32, height: 32, bitsPerComponent: 8, bytesPerRow: 128,
+            space: colorSpace, bitmapInfo: bitmapInfo)!
+        ctx.setFillColor(red: 0, green: 0, blue: 1, alpha: 1)
+        ctx.fill(CGRect(x: 0, y: 0, width: 32, height: 32))
+        let cgImg = ctx.makeImage()!
+        let pngData = CFDataCreateMutable(nil, 0)!
+        let dest = CGImageDestinationCreateWithData(pngData, "public.png" as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, cgImg, nil)
+        #expect(CGImageDestinationFinalize(dest))
+        let b64 = (pngData as Data).base64EncodedString()
+
+        let json = """
+        {
+          "model": "qwen36-mtp",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,\(b64)"}},
+                {"type": "text", "text": "Describe this image"}
+              ]
+            }
+          ]
+        }
+        """
+        let request = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(json.utf8))
+        let validated = try OpenAIRequestValidator.validate(request, modelID: "qwen36-mtp")
+        #expect(validated.messages.count == 1)
+        let content = validated.messages[0].content ?? ""
+        #expect(Qwen36VisionImageStore.containsMarker(in: content))
+        #expect(content.hasSuffix("Describe this image"))
+    }
+
+    @Test func acceptsPDFFileAndImageURLContentParts() throws {
+        let outData = NSMutableData()
+        var mediaBox = CGRect(x: 0, y: 0, width: 96, height: 96)
+        let consumer = CGDataConsumer(data: outData as CFMutableData)!
+        let ctx = CGContext(consumer: consumer, mediaBox: &mediaBox, nil)!
+        ctx.beginPDFPage(nil)
+        ctx.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+        ctx.fill(mediaBox)
+        ctx.endPDFPage()
+        ctx.closePDF()
+        let pdfB64 = (outData as Data).base64EncodedString()
+
+        let fileJSON = """
+        {
+          "model": "qwen36-mtp",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {"type": "file", "file": {"file_data": "data:application/pdf;base64,\(pdfB64)", "filename": "test.pdf"}},
+                {"type": "text", "text": "Summarize PDF"}
+              ]
+            }
+          ]
+        }
+        """
+        let req1 = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(fileJSON.utf8))
+        let val1 = try OpenAIRequestValidator.validate(req1, modelID: "qwen36-mtp")
+        let content1 = val1.messages[0].content ?? ""
+        #expect(Qwen36VisionImageStore.containsMarker(in: content1))
+        #expect(content1.hasSuffix("Summarize PDF"))
+
+        let imageURLJSON = """
+        {
+          "model": "qwen36-mtp",
+          "messages": [
+            {
+              "role": "user",
+              "content": [
+                {"type": "image_url", "image_url": {"url": "data:application/pdf;base64,\(pdfB64)"}},
+                {"type": "text", "text": "Inspect page"}
+              ]
+            }
+          ]
+        }
+        """
+        let req2 = try JSONDecoder().decode(OpenAIChatRequest.self, from: Data(imageURLJSON.utf8))
+        let val2 = try OpenAIRequestValidator.validate(req2, modelID: "qwen36-mtp")
+        let content2 = val2.messages[0].content ?? ""
+        #expect(Qwen36VisionImageStore.containsMarker(in: content2))
+        #expect(content2.hasSuffix("Inspect page"))
     }
 }
 

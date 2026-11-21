@@ -485,14 +485,90 @@ public struct MFTokenizer: @unchecked Sendable {
     /// the same regardless of upstream defaults. ChatML has no BOS, so `addBOS`
     /// is a no-op for that dialect.
     public func encode(_ text: String, addBOS: Bool = true) -> [Int32] {
-        let base = tokenizer.encode(text: text, addSpecialTokens: false).map(Int32.init)
+        let base: [Int32]
+        if Qwen36VisionImageStore.containsMarker(in: text) {
+            base = encodeWithVisualMarkers(text)
+        } else {
+            base = tokenizer.encode(text: text, addSpecialTokens: false).map(Int32.init)
+        }
         guard addBOS, let bosPrefixID else { return base }
         return [bosPrefixID] + base
     }
 
+    private func encodeWithVisualMarkers(_ text: String) -> [Int32] {
+        var result: [Int32] = []
+        for segment in Qwen36VisionImageStore.splitMarkers(in: text) {
+            switch segment {
+            case .text(let chunk):
+                if !chunk.isEmpty {
+                    result.append(contentsOf: tokenizer.encode(text: chunk, addSpecialTokens: false).map(Int32.init))
+                }
+            case .marker(let parsed):
+                if let resolved = try? Qwen36VisionImageStore.shared.resolve(marker: parsed) {
+                    result.append(contentsOf: Self.visualTokenSequence(for: resolved))
+                } else {
+                    let raw = Qwen36VisionImageStore.makeMarker(
+                        imageID: parsed.imageID,
+                        sha256: parsed.sha256,
+                        gridH: parsed.gridH,
+                        gridW: parsed.gridW,
+                        numVisualTokens: parsed.numVisualTokens)
+                    result.append(contentsOf: tokenizer.encode(text: raw, addSpecialTokens: false).map(Int32.init))
+                }
+            }
+        }
+        return result
+    }
+
+    private static func visualTokenSequence(for image: Qwen36RegisteredImage) -> [Int32] {
+        var tokens: [Int32] = []
+        tokens.reserveCapacity(image.numVisualTokens + 2)
+        tokens.append(Qwen36VisionImageStore.visionStartTokenID)
+        for row in 0..<image.numVisualTokens {
+            tokens.append(Qwen36VisionImageStore.makeVisualTokenID(imageID: image.imageID, row: row))
+        }
+        tokens.append(Qwen36VisionImageStore.visionEndTokenID)
+        return tokens
+    }
+
+    private static func expandVisualPlaceholders(
+        in rawTokens: [Int32],
+        images: [Qwen36RegisteredImage]
+    ) throws -> [Int32] {
+        let vStart = Qwen36VisionImageStore.visionStartTokenID
+        let vPad = Qwen36VisionImageStore.imagePadTokenID
+        let vEnd = Qwen36VisionImageStore.visionEndTokenID
+        var expanded: [Int32] = []
+        expanded.reserveCapacity(rawTokens.count + images.reduce(0) { $0 + $1.numVisualTokens })
+        var i = 0
+        var imageIdx = 0
+        while i < rawTokens.count {
+            if imageIdx < images.count,
+               i + 2 < rawTokens.count,
+               rawTokens[i] == vStart,
+               rawTokens[i + 1] == vPad,
+               rawTokens[i + 2] == vEnd {
+                expanded.append(contentsOf: visualTokenSequence(for: images[imageIdx]))
+                imageIdx += 1
+                i += 3
+            } else {
+                expanded.append(rawTokens[i])
+                i += 1
+            }
+        }
+        guard imageIdx == images.count else {
+            throw MFTokenizerError.invalidChatTemplate(
+                "failed to align vision placeholders (\(imageIdx)/\(images.count))")
+        }
+        return expanded
+    }
+
     /// Decode token IDs to text. `skipSpecialTokens` strips BOS/EOS/turn markers from the output.
     public func decode(_ ids: [Int32], skipSpecialTokens: Bool = true) -> String {
-        tokenizer.decode(tokens: ids.map(Int.init), skipSpecialTokens: skipSpecialTokens)
+        let mapped = ids.contains(where: { $0 < 0 })
+            ? ids.map { $0 < 0 ? Int(Qwen36VisionImageStore.imagePadTokenID) : Int($0) }
+            : ids.map(Int.init)
+        return tokenizer.decode(tokens: mapped, skipSpecialTokens: skipSpecialTokens)
     }
 
     // MARK: - Chat template
@@ -793,10 +869,27 @@ public struct MFTokenizer: @unchecked Sendable {
         guard tokenizer.hasChatTemplate else {
             throw MFTokenizerError.missingToolTemplate
         }
+        var resolvedImages: [Qwen36RegisteredImage] = []
+        let visionPlaceholder = "<|vision_start|><|image_pad|><|vision_end|>"
         let upstreamMessages: [Tokenizers.Message] = try messages.map { message in
+            var renderedContent = message.content
+            if let raw = renderedContent, Qwen36VisionImageStore.containsMarker(in: raw) {
+                var rewritten = ""
+                for segment in Qwen36VisionImageStore.splitMarkers(in: raw) {
+                    switch segment {
+                    case .text(let chunk):
+                        rewritten += chunk
+                    case .marker(let parsed):
+                        let image = try Qwen36VisionImageStore.shared.resolve(marker: parsed)
+                        resolvedImages.append(image)
+                        rewritten += visionPlaceholder
+                    }
+                }
+                renderedContent = rewritten
+            }
             var value: Tokenizers.Message = [
                 "role": message.role.rawValue,
-                "content": message.content,
+                "content": renderedContent,
             ]
             if !message.toolCalls.isEmpty {
                 value["tool_calls"] = try message.toolCalls.map { call -> [String: any Sendable] in
@@ -831,7 +924,7 @@ public struct MFTokenizer: @unchecked Sendable {
                 ] as [String: any Sendable],
             ]
         }
-        return try tokenizer.applyChatTemplate(
+        let rawTokens = try tokenizer.applyChatTemplate(
             messages: upstreamMessages,
             chatTemplate: nil,
             addGenerationPrompt: true,
@@ -845,6 +938,8 @@ public struct MFTokenizer: @unchecked Sendable {
                 : ["enable_thinking": !isBaseQwen38 && generationPromptStartsInThinking,
                    "preserve_thinking": true]
         ).map(Int32.init)
+        guard !resolvedImages.isEmpty else { return rawTokens }
+        return try Self.expandVisualPlaceholders(in: rawTokens, images: resolvedImages)
     }
 
     // MARK: - DeepSeek native tool chat
