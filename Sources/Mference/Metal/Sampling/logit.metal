@@ -127,6 +127,101 @@ void logit_softcap_softmax(
     }
 }
 
+constant constexpr uint kLogitSoftmaxParallelGroups = 64u;
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void logit_softcap_softmax_pass1(
+    device const half*  logits     [[buffer(0)]],
+    device       float* partial_m  [[buffer(1)]],
+    device       float* partial_d  [[buffer(2)]],
+    constant     uint&  V          [[buffer(3)]],
+    constant     float& softcap    [[buffer(4)]],
+    uint  tg_idx           [[threadgroup_position_in_grid]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]],
+    uint  simdgroups       [[simdgroups_per_threadgroup]]
+) {
+    threadgroup float tg_m[kLogitMaxSimdGroups];
+    threadgroup float tg_d[kLogitMaxSimdGroups];
+
+    float m = -INFINITY;
+    float d = 0.0f;
+    const uint stride = kLogitSoftmaxParallelGroups * 256u;
+    for (uint i = tg_idx * 256u + lid; i < V; i += stride) {
+        float z  = softcap_value(float(logits[i]), softcap);
+        float mn = max(m, z);
+        float scale = (m == -INFINITY) ? 0.0f : logit_softmax_exp(m - mn);
+        d = d * scale + logit_softmax_exp(z - mn);
+        m = mn;
+    }
+
+    float m_simd = simd_max(m);
+    float d_simd = simd_sum((m == -INFINITY) ? 0.0f : d * logit_softmax_exp(m - m_simd));
+
+    if (simd_lane_id == 0u) {
+        tg_m[simd_group_id] = m_simd;
+        tg_d[simd_group_id] = d_simd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0u) {
+        float mp = (simd_lane_id < simdgroups) ? tg_m[simd_lane_id] : -INFINITY;
+        float dp = (simd_lane_id < simdgroups) ? tg_d[simd_lane_id] : 0.0f;
+        float m_all = simd_max(mp);
+        float d_all = simd_sum((mp == -INFINITY) ? 0.0f : dp * logit_softmax_exp(mp - m_all));
+        if (simd_lane_id == 0u) {
+            partial_m[tg_idx] = m_all;
+            partial_d[tg_idx] = d_all;
+        }
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void logit_softcap_softmax_pass2(
+    device const half*  logits     [[buffer(0)]],
+    device       half*  probs      [[buffer(1)]],
+    device const float* partial_m  [[buffer(2)]],
+    device const float* partial_d  [[buffer(3)]],
+    constant     uint&  V          [[buffer(4)]],
+    constant     float& softcap    [[buffer(5)]],
+    uint  tg_idx           [[threadgroup_position_in_grid]],
+    uint  lid              [[thread_position_in_threadgroup]],
+    uint  simd_lane_id     [[thread_index_in_simdgroup]],
+    uint  simd_group_id    [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float final_m;
+    threadgroup float final_inv_d;
+
+    if (simd_group_id == 0u) {
+        const float m0 = partial_m[simd_lane_id];
+        const float d0 = partial_d[simd_lane_id];
+        const float m1 = partial_m[simd_lane_id + 32u];
+        const float d1 = partial_d[simd_lane_id + 32u];
+        const float mn = max(m0, m1);
+        const float c0 = (m0 == -INFINITY) ? 0.0f : d0 * logit_softmax_exp(m0 - mn);
+        const float c1 = (m1 == -INFINITY) ? 0.0f : d1 * logit_softmax_exp(m1 - mn);
+        const float dp = c0 + c1;
+        const float mp = mn;
+
+        const float m_all = simd_max(mp);
+        const float d_all = simd_sum((mp == -INFINITY) ? 0.0f : dp * logit_softmax_exp(mp - m_all));
+        if (simd_lane_id == 0u) {
+            final_m = m_all;
+            final_inv_d = 1.0f / d_all;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float m_final = final_m;
+    const float inv_d_final = final_inv_d;
+    const uint stride = kLogitSoftmaxParallelGroups * 256u;
+    for (uint i = tg_idx * 256u + lid; i < V; i += stride) {
+        float z = softcap_value(float(logits[i]), softcap);
+        probs[i] = half(logit_softmax_exp(z - m_final) * inv_d_final);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // K9: sample
 //
@@ -553,6 +648,7 @@ void sample_topk64_final(
     constant float& temperature [[buffer(4)]],
     constant float& top_p [[buffer(5)]],
     constant uint64_t& seed [[buffer(6)]],
+    constant uint& top_k [[buffer(7)]],
     uint lid [[thread_position_in_threadgroup]]) {
     threadgroup float values[1024];
     threadgroup uint indices[1024];
@@ -565,8 +661,9 @@ void sample_topk64_final(
     sample_topk64_sort_tile(values, indices, lid);
 
     if (lid == 0) {
+        uint max_k = min(max(top_k, 1u), 64u);
         uint kept = 0;
-        while (kept < 64
+        while (kept < max_k
                && indices[kept] != 0xFFFFFFFFu
                && isfinite(values[kept])) {
             kept += 1;
@@ -1009,6 +1106,85 @@ void lm_head_greedy_int4_rows_reduce_multix(
         i_all = simd_min(i_all);
         if (simd_lane_id == 0) {
             out_tokens[t] = (i_all == 0xFFFFFFFFu) ? 0u : i_all;
+        }
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+void lm_head_logits_int4_rows_multix(
+    device const half*    x_normed     [[buffer(0)]],   // [T, D]
+    device const uint8_t* W            [[buffer(1)]],
+    device const bfloat*  scales       [[buffer(2)]],
+    device const bfloat*  biases       [[buffer(3)]],
+    device       half*    out_logits   [[buffer(4)]],   // [T, V]
+    constant     uint&    D            [[buffer(5)]],
+    constant     uint&    V            [[buffer(6)]],
+    constant     uint&    T_param      [[buffer(7)]],
+    uint  tg_idx         [[threadgroup_position_in_grid]],
+    uint  simd_lane_id   [[thread_index_in_simdgroup]],
+    uint  simd_group_id  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint T = lmhead_multix_fc_t(T_param);
+    const uint row = tg_idx * kLMHeadRowsPerTG + simd_group_id;
+    if (row >= V) return;
+
+    const uint n_groups  = D / kLMHeadGroupSize;
+    const uint row_bytes = D / 2u;
+    device const uint8_t* W_row = W      + uint(row) * row_bytes;
+    device const bfloat*  s_row = scales + uint(row) * n_groups;
+    device const bfloat*  b_row = biases + uint(row) * n_groups;
+
+    float accs[kLMHeadMultiXMaxT];
+    for (uint t = 0; t < kLMHeadMultiXMaxT; ++t) { accs[t] = 0.0f; }
+
+    const uint full_blocks = n_groups / 4u;
+    for (uint blk = 0; blk < full_blocks; ++blk) {
+        const uint byte_base = blk * 128u + simd_lane_id * 4u;
+        device const ushort* wp = (device const ushort*)(W_row + byte_base);
+        const uint w4 = uint(wp[0]) | (uint(wp[1]) << 16);
+        const uint g  = blk * 4u + (simd_lane_id >> 3);
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        const uint elem = byte_base * 2u;
+        const uint b0 =  w4        & 0xFFu;
+        const uint b1 = (w4 >> 8)  & 0xFFu;
+        const uint b2 = (w4 >> 16) & 0xFFu;
+        const uint b3 = (w4 >> 24) & 0xFFu;
+        for (uint t = 0; t < T; ++t) {
+            device const half* xt = x_normed + t * D;
+            const half4 xa = *((device const half4*)(xt + elem));
+            const half4 xb = *((device const half4*)(xt + elem + 4u));
+            const float e0 = float(xa.x), e1 = float(xa.y), e2 = float(xa.z), e3 = float(xa.w);
+            const float e4 = float(xb.x), e5 = float(xb.y), e6 = float(xb.z), e7 = float(xb.w);
+            float dot = 0.0f;
+            dot = fma(float(b0 & 0x0Fu), e0, dot); dot = fma(float(b0 >> 4), e1, dot);
+            dot = fma(float(b1 & 0x0Fu), e2, dot); dot = fma(float(b1 >> 4), e3, dot);
+            dot = fma(float(b2 & 0x0Fu), e4, dot); dot = fma(float(b2 >> 4), e5, dot);
+            dot = fma(float(b3 & 0x0Fu), e6, dot); dot = fma(float(b3 >> 4), e7, dot);
+            const float sum = e0 + e1 + e2 + e3 + e4 + e5 + e6 + e7;
+            accs[t] = fma(s, dot, accs[t]);
+            accs[t] = fma(b, sum, accs[t]);
+        }
+    }
+    for (uint g = full_blocks * 4u; g < n_groups; ++g) {
+        const float s = float(s_row[g]);
+        const float b = float(b_row[g]);
+        const uint8_t byte = W_row[g * (kLMHeadGroupSize / 2) + simd_lane_id];
+        for (uint t = 0; t < T; ++t) {
+            device const half* xt = x_normed + t * D;
+            const float x0 = float(xt[g * kLMHeadGroupSize + simd_lane_id * 2u]);
+            const float x1 = float(xt[g * kLMHeadGroupSize + simd_lane_id * 2u + 1u]);
+            float dot = fma(float(uint(byte & 0x0Fu)), x0, 0.0f);
+            dot = fma(float(uint(byte >> 4)), x1, dot);
+            const float sum = x0 + x1;
+            accs[t] = fma(s, dot, accs[t]);
+            accs[t] = fma(b, sum, accs[t]);
+        }
+    }
+    for (uint t = 0; t < T; ++t) {
+        const float z = simd_sum(accs[t]);
+        if (simd_lane_id == 0u) {
+            out_logits[t * V + row] = half(z);
         }
     }
 }

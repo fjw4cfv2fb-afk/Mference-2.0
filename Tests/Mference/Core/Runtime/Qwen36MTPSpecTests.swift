@@ -530,6 +530,95 @@ struct Qwen36MTPSpecTests {
     }
 
     @Test
+    func lowMemoryAdaptiveThrottling_stepsK2ToK1ToK0CooldownAndPhaseWakeup() async throws {
+        let (dir, shard) = try makeAttachedToy()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.removeItem(at: shard)
+        }
+
+        let ctx = try MetalContext()
+        let model = try Model.load(directoryURL: dir, device: ctx.device, expecting: .qwen36Toy())
+        let spec = try #require(try Qwen36MTPSpeculator.probe(
+            model: model, context: ctx, config: model.config, maxContext: 64))
+        spec.adaptiveDraftEnabled = true
+
+        // 1. Inside <think>, initial default EMA [0.85, 0.75] starts at K = 2 on low-memory profile
+        //    so high-accept workloads do not start behind.
+        spec.notifyTokens(tokens: [248068][...], startPosition: 0)
+        #expect(spec.currentPhase == .thinking)
+        #expect(spec.recommendedDraftCount(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true) == 2)
+
+        // 2. A brief 3-miss cluster drops fast EMA to K = 1, while slowP0EMA (~0.66) prevents
+        //    premature K = 0 flapping; subsequent K = 1 hits with p0 < 0.84 stay smoothly at K = 1.
+        for idx in 0..<3 {
+            spec.recordAccepted(drafts: [10, 11], emitted: [20], position: 1 + idx, verifyNanos: 1_000)
+        }
+        #expect(spec.recommendedDraftCount(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true) == 1)
+        for idx in 0..<4 {
+            spec.recordAccepted(drafts: [10], emitted: [10, 11], position: 10 + idx * 2, verifyNanos: 1_000)
+            #expect(spec.recommendedDraftCount(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true) == 1)
+        }
+
+        // 3. Sustained misses (12+ rounds, slowP0EMA < 0.50) trigger 24-token K = 0 cooldown, then probe K = 1.
+        for idx in 0..<12 {
+            spec.recordAccepted(drafts: [10], emitted: [20], position: 20 + idx, verifyNanos: 1_000)
+        }
+        for _ in 0..<24 {
+            let k = spec.stepThrottleAndResolveDraftK(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true)
+            #expect(k == 0)
+        }
+        #expect(spec.throttledTokensSkipped == 24)
+        let probeK = spec.stepThrottleAndResolveDraftK(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true)
+        #expect(probeK == 1)
+
+        // 4. Re-entering K = 0 after >= 8 probe misses, then transitioning to structured code immediately wakes K = 2.
+        for idx in 0..<8 {
+            spec.recordAccepted(drafts: [10], emitted: [20], position: 60 + idx, verifyNanos: 1_000)
+        }
+        #expect(spec.stepThrottleAndResolveDraftK(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true) == 0)
+        spec.notifyPhaseTransition(.structuredCodeOrTool)
+        let wokenK = spec.stepThrottleAndResolveDraftK(maxSlotSupportedK: 2, lowMemorySlotProfile: true, allowThrottleToZero: true)
+        #expect(wokenK == 2)
+    }
+
+    @Test
+    func lowMemoryThrottleToZero_matchesPlainGreedyBitExact() async throws {
+        let (dir, shard) = try makeAttachedToy()
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            try? FileManager.default.removeItem(at: shard)
+        }
+
+        let ctx = try MetalContext()
+        let model = try Model.load(directoryURL: dir, device: ctx.device, expecting: .qwen36Toy())
+        let logits = try makeLogits(ctx, vocab: model.config.vocabSize)
+        let prompt: [Int32] = [1, 2, 3, 4]
+        let steps = 40
+
+        let plain = try RealForwardRunner(model: model, context: ctx, maxContext: 64)
+        plain.speculator = nil
+        let baseline = try await generateGreedy(runner: plain, logits: logits, prompt: prompt, steps: steps)
+
+        let runner = try makeSpecRunner(model: model, context: ctx, maxContext: 64)
+        runner.specAdaptiveDraftOverride = true
+        runner.specLowMemoryProfileOverride = true
+        let mtp = try #require(runner.mtp as? Qwen36MTPSpeculator)
+        // Force poison drafts on rounds 0..<14 so slowP0EMA drops below 0.50 and triggers the 24-token K = 0
+        // cooldown, followed by resumed K = 1 probing over steps 36..<40.
+        mtp.draftOverride = { round, k in
+            if round < 14 {
+                return Array(repeating: Int32(model.config.vocabSize - 1), count: k)
+            }
+            return [Int32(bitPattern: baseline.last!)]
+        }
+
+        let throttledOut = try await generateGreedy(runner: runner, logits: logits, prompt: prompt, steps: steps)
+        #expect(throttledOut == baseline)
+        #expect(mtp.throttledTokensSkipped >= 24)
+    }
+
+    @Test
     func repetitionLoopDetector_identifiesRepeatingSuffixCycles() {
         // Non-repeating sequence -> nil
         #expect(RepetitionLoopDetector.detectLoop(in: [1, 2, 3, 4, 5, 6], minRepeats: 3) == nil)

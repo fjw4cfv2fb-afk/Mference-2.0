@@ -9,6 +9,12 @@ extension RealForwardRunner: RuntimeMemoryReporting {
     }
 }
 
+extension RealForwardRunner: SampledSpeculativeLogitProducer {
+    var supportsSampledSpeculation: Bool {
+        speculator != nil && useMultiXEnabled
+    }
+}
+
 /// Faults detected at the Inkling output head. Both cases mean an
 /// intermediate went non-finite somewhere in the 42-layer stack; the head is
 /// simply the first place that can see it cheaply.
@@ -272,6 +278,22 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private let verifyActs: MTLBuffer
     private let verifyNormedHidden: MTLBuffer
     private let verifyTokensBuf: MTLBuffer
+    private let verifyHitSchedules: MTLBuffer
+    private let verifyMissSchedules: MTLBuffer
+    private let verifyHitSplitEnabled: Bool
+    private let verifySkipDeadGuardEnabled: Bool
+    private var verifyExpertSeenStamp: [UInt32]
+    private var verifyPlanStamp: UInt32 = 0
+    private var verifyExpertPlanIndex: [Int]
+    private var verifyExpertSlotOffset: [UInt32]
+    private var verifyExpertIsMiss: [Bool]
+    private var verifyUniqueExpertsScratch: [Int]
+    private var verifyAllHitExpertsScratch: [Int]
+    private var verifySlotMapWindowSteps: Int = 0
+    private var verifySlotMapWindowAllHits: Int = 0
+    private var verifyArmOptimisticGuardedInCB: Bool = true
+    private var verifyLogitsBuf: MTLBuffer?
+    private var prefillMPPActBuf: MTLBuffer?
     // Qwen 3.6 decode scratch (nil on architectures that never use it).
     private let qPackedScratch: MTLBuffer?   // [2 * N_HEADS * head_dim] packed [q ; gate]
     private let attnGateScratch: MTLBuffer?  // [N_HEADS * head_dim]
@@ -354,6 +376,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     private var nextBasePrefixCheckpointPosition: Int?
     private var gdnStagingStateBuffer: MTLBuffer?
     private var gdnStagingTailBuffer: MTLBuffer?
+    private let gdnSpillStore = GDNSnapshotSpillStore()
+    private let enableGDNSpill = ProcessInfo.processInfo.environment["MFERENCE_GDN_SPILL"] != "0"
+    private let useFusedGDNVerify = ProcessInfo.processInfo.environment["MFERENCE_GDN_VERIFY_FUSED"] != "0"
+    private var turnBoundaryGDNPositions: Set<Int> = []
     /// Lazily built layer-major DeepSeek-V4 prefill; see
     /// `RealForwardRunner+DSV4Prefill.swift`.
     private var dsv4Prefill: DSV4ChunkedPrefill?
@@ -375,6 +401,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     public var specAdaptiveDraftOverride: Bool? = nil
     /// Optional dynamic cap on adaptive draft depth `K` (e.g. under memory pressure or long context).
     public var specMaxDraftSlotCapOverride: Int? = nil
+    /// Test override to force low-memory (`<= 32`-slot) adaptive MTP throttling regardless of synthetic expert count.
+    var specLowMemoryProfileOverride: Bool? = nil
 
     public func notifyMTPPhaseTransition(structuredCodeOrTool: Bool) {
         guard let qwen36Spec = speculator as? Qwen36MTPSpeculator else { return }
@@ -460,6 +488,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
     /// Cached per-runner environment switches so hot-path decode/verify steps
     /// never rebuild `ProcessInfo.processInfo.environment`.
     private let useMultiXEnabled: Bool
+    private let prefillMPPMoEEnabled: Bool
     private let debugLoggingEnabled: Bool
     private let phaseLoggingEnabled: Bool
     private let defaultSpecDraftK: Int
@@ -656,6 +685,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.maxContext = maxContext
         let env = ProcessInfo.processInfo.environment
         self.useMultiXEnabled = env["MFERENCE_USE_MULTIX"] != "0"
+        self.prefillMPPMoEEnabled = env["MFERENCE_PREFILL_MPP_MOE"] != "0"
+        self.verifyHitSplitEnabled = env["MFERENCE_VERIFY_HIT_SPLIT"] != "0"
+        self.verifySkipDeadGuardEnabled = env["MFERENCE_VERIFY_SKIP_DEAD_GUARD"] != "0"
         self.debugLoggingEnabled = env["MFERENCE_DEBUG"] == "1"
         self.phaseLoggingEnabled = env["MFERENCE_PHASES"] == "1"
         self.defaultSpecDraftK = env["MFERENCE_SPEC_K"].flatMap(Int.init)
@@ -666,7 +698,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         // variable still overrides in either direction; other families keep
         // `off` until they have their own accepted A/B.
         if env["MFERENCE_SPEC_PREFETCH"] == nil,
-           (model.config.family == .deepseekV4Flash || model.config.family == .qwen36) {
+           model.config.family == .deepseekV4Flash {
             self.speculativePrefetchMode = .shadow
         }
         self.useFusedGreedyHead = runtimeConfiguration.headPath == .fusedRows
@@ -850,6 +882,20 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         self.verifyActs = try buf(maxVerifyTokens * paddedTopK * cfg.moeIntermediateSize)
         self.verifyNormedHidden = try buf(maxVerifyTokens * D)
         self.verifyTokensBuf = try buf(maxVerifyTokens, MemoryLayout<UInt32>.size)
+        self.verifyHitSchedules = try buf(cfg.numLayers * MoE.slotmapScheduleStride, 1)
+        self.verifyMissSchedules = try buf(cfg.numLayers * MoE.slotmapScheduleStride, 1)
+        let expertTableCapacity = max(256, cfg.numExperts)
+        self.verifyExpertSeenStamp = [UInt32](repeating: 0, count: expertTableCapacity)
+        self.verifyExpertPlanIndex = [Int](repeating: 0, count: expertTableCapacity)
+        let maxVerifyRoutes = max(MoE.slotmapScheduleMaxEntries, maxVerifyTokens * paddedTopK)
+        self.verifyExpertSlotOffset = [UInt32](repeating: 0, count: maxVerifyRoutes)
+        self.verifyExpertIsMiss = [Bool](repeating: false, count: maxVerifyRoutes)
+        var uniqueScratch = [Int]()
+        uniqueScratch.reserveCapacity(maxVerifyRoutes)
+        self.verifyUniqueExpertsScratch = uniqueScratch
+        var allHitScratch = [Int]()
+        allHitScratch.reserveCapacity(maxVerifyRoutes)
+        self.verifyAllHitExpertsScratch = allHitScratch
 
         // Qwen 3.6 decode scratch — allocated once here, never in the hot path.
         if cfg.attnOutputGate {
@@ -1130,7 +1176,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if model.config.family == .qwen36 {
             let visionURL = model.directoryURL.appendingPathComponent("vision_weights.bin")
             if FileManager.default.fileExists(atPath: visionURL.path) {
-                self.visionEncoder = Qwen36VisionEncoder(weightsURL: visionURL)
+                self.visionEncoder = Qwen36VisionEncoder(weightsURL: visionURL, context: ctx)
             }
             do {
                 self.speculator = try Self.probeQwen36Speculator(
@@ -1186,6 +1232,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         kv?.reset()
         gdnState?.reset()
         gdnSnapshots.removeAll()
+        gdnSpillStore.clear(removeDirectory: false)
+        turnBoundaryGDNPositions.removeAll()
         pinnedGDNCheckpointPosition = nil
         verifyArenaRoundBase = -1
         verifyArenaCaptured = 0
@@ -1341,6 +1389,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
         kv.advance(by: snapshot.position)
         gdnSnapshots = snapshot.gdnSnapshots
+        gdnSpillStore.clear(removeDirectory: false)
+        turnBoundaryGDNPositions.removeAll()
         pinnedGDNCheckpointPosition = snapshot.pinnedGDNCheckpointPosition
         verifyArenaRoundBase = -1
         verifyArenaCaptured = 0
@@ -1370,6 +1420,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             return kvPos
         }
         var best = gdnSnapshots.keys.filter { $0 <= maxPosition }.max()
+        if enableGDNSpill, let spilledBest = gdnSpillStore.latestPosition(atOrBefore: maxPosition) {
+            best = max(best ?? spilledBest, spilledBest)
+        }
         if verifyArenaRoundBase >= 0, verifyArenaCaptured > 0 {
             let lo = verifyArenaRoundBase + 1
             let hi = min(maxPosition, verifyArenaRoundBase + verifyArenaCaptured)
@@ -1382,6 +1435,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
     public func recordContinuationCheckpoint() {
         guard let gdnState, let pos = kv?.position, pos > 0 else { return }
+        turnBoundaryGDNPositions.insert(pos)
         storeGDNSnapshot(gdnState.makeSnapshot(), at: pos, pinned: false)
     }
 
@@ -1390,13 +1444,18 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if pinned {
             pinnedGDNCheckpointPosition = position
         }
-        // Keep the pinned base-prefix snapshot plus at most the 2 most recent turn/chunk snapshots.
+        // Keep the pinned base-prefix snapshot plus at most the 2 most recent turn/chunk snapshots in RAM.
+        // Evicted turn-boundary checkpoints spill to SSD (uncached I/O) so multi-turn rewinds remain available.
         let unpinnedSorted = gdnSnapshots.keys
             .filter { $0 != pinnedGDNCheckpointPosition }
             .sorted()
         if unpinnedSorted.count > 2 {
             for oldKey in unpinnedSorted.prefix(unpinnedSorted.count - 2) {
-                gdnSnapshots.removeValue(forKey: oldKey)
+                if let evicted = gdnSnapshots.removeValue(forKey: oldKey),
+                   enableGDNSpill,
+                   turnBoundaryGDNPositions.contains(oldKey) {
+                    gdnSpillStore.spill(evicted, at: oldKey)
+                }
             }
         }
     }
@@ -1416,6 +1475,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             if let gdnState {
                 if let snapshot = gdnSnapshots[expectedPosition] {
                     gdnState.restore(snapshot)
+                } else if enableGDNSpill, let spilled = gdnSpillStore.load(at: expectedPosition) {
+                    gdnState.restore(spilled)
+                    storeGDNSnapshot(spilled, at: expectedPosition, pinned: false)
                 } else {
                     let slot = expectedPosition - 1 - verifyArenaRoundBase
                     if verifyArenaRoundBase >= 0, slot >= 0, slot < verifyArenaCaptured {
@@ -1429,6 +1491,10 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             kv.rewind(to: expectedPosition)
             for key in gdnSnapshots.keys where key > expectedPosition && key != pinnedGDNCheckpointPosition {
                 gdnSnapshots.removeValue(forKey: key)
+            }
+            gdnSpillStore.prune(after: expectedPosition)
+            turnBoundaryGDNPositions = turnBoundaryGDNPositions.filter {
+                $0 <= expectedPosition || $0 == pinnedGDNCheckpointPosition
             }
         }
         verifyArenaRoundBase = -1
@@ -1493,7 +1559,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
               FileManager.default.fileExists(atPath: visionURL.path) else {
             throw Qwen36VisionImageError.visionSidecarMissing(visionURL.path)
         }
-        let encoder = Qwen36VisionEncoder(weightsURL: visionURL)
+        let encoder = Qwen36VisionEncoder(weightsURL: visionURL, context: ctx)
         self.visionEncoder = encoder
         return encoder
     }
@@ -1681,6 +1747,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         rdadviseAdaptiveState.reset()
         rdadviseAdaptivePosition = -1
         rdadviseAdaptivePositionBytes = 0
+        verifySlotMapWindowSteps = 0
+        verifySlotMapWindowAllHits = 0
+        verifyArmOptimisticGuardedInCB = true
     }
 
     public private(set) var totalIoNanos: UInt64 = 0
@@ -1996,7 +2065,8 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         if previousTokenExperts.count != cfg.numLayers {
             previousTokenExperts = [[Int]](repeating: [], count: cfg.numLayers)
         }
-        previousTokenExperts[layer] = experts
+        previousTokenExperts[layer].removeAll(keepingCapacity: true)
+        previousTokenExperts[layer].append(contentsOf: experts)
     }
 
     /// Attributes one layer's expert-I/O window against the GPU work that was
@@ -2131,40 +2201,83 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
         }
     }
 
-    private func runVerifyRound(token: Int32, position: Int, draftCount: Int = 1) async throws {
-        guard let speculator, useFusedGreedyHead else { return }
-        let boundedCount = min(4, max(1, draftCount))
-        verifyArenaRoundBase = -1
-        verifyArenaCaptured = 0
-
-        // 1. Draft K candidate tokens from speculator
-        let drafts = try speculator.draft(bonus: token, position: position, count: boundedCount)
-        guard !drafts.isEmpty else {
-            try await produceToken(token: token, position: position, into: greedyTokenBuf,
-                                   emitHead: true, outputMode: .greedyIfAvailable)
-            return
+    private func ensureVerifyLogitsBuffer(tokens: Int) throws -> MTLBuffer {
+        let bytes = max(tokens, 4) * cfg.vocabSize * MemoryLayout<Float16>.stride
+        if let existing = verifyLogitsBuf, existing.length >= bytes {
+            return existing
         }
-
-        // 2. Prepare batched candidate slice: [bonus] + drafts
-        let verifyTokens: [Int32] = [token] + drafts
-        let scratch = try ensurePrefillScratch(config: .defaultChunked)
-        if hasActiveMRoPE {
-            recordLinearMRoPEPositions(startPosition: position, count: verifyTokens.count)
+        guard let buf = ctx.device.makeBuffer(length: bytes, options: .storageModeShared) else {
+            throw ModelError.residentBufferWrapFailed
         }
+        buf.label = "verify.logits"
+        verifyLogitsBuf = buf
+        return buf
+    }
 
-        // 3. Run batched verify forward pass through trunk
-        let verifyStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-        let targets = try await executePrefillChunk(
-            tokens: verifyTokens[...],
-            startPosition: position,
-            outputMode: .greedyIfAvailable,
-            logits: greedyTokenBuf,
-            scratch: scratch,
-            config: .defaultChunked,
-            writeFinalHead: true,
-            isVerifyPass: true)
-        let verifyNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - verifyStart
+    private func ensurePrefillMPPActBuffer(bytes: Int) throws -> MTLBuffer {
+        let needed = max(bytes, 1)
+        if let existing = prefillMPPActBuf, existing.length >= needed {
+            return existing
+        }
+        guard let buf = ctx.device.makeBuffer(length: needed, options: .storageModePrivate) else {
+            throw ModelError.residentBufferWrapFailed
+        }
+        buf.label = "prefill.mppGroupedAct"
+        prefillMPPActBuf = buf
+        return buf
+    }
 
+    private func resolveDraftK(for speculator: any SpeculativeDrafter,
+                               maxCap: Int = 4,
+                               allowZero: Bool = false) -> Int {
+        let draftK: Int
+        if let explicitOverride = specDraftCountOverride {
+            draftK = min(maxCap, max(1, explicitOverride))
+        } else if let qwen36Spec = speculator as? Qwen36MTPSpeculator {
+            if let adaptiveOverride = specAdaptiveDraftOverride {
+                qwen36Spec.adaptiveDraftEnabled = adaptiveOverride
+            }
+            if qwen36Spec.adaptiveDraftEnabled {
+                var slotCap: Int
+                let slots = model.routedExpertCacheSlotCount(layer: 0)
+                if cfg.topKExperts > 0, let slots {
+                    let rawCap = max(1, (slots / cfg.topKExperts) - 1)
+                    // Cap adaptive draft depth at K = 2 on <= 32-slot caches so 4-token MoE verify
+                    // does not amplify expert-cache streaming latency; allow K = 3 at 48+ slots.
+                    slotCap = slots >= 48 ? min(3, rawCap) : min(2, rawCap)
+                } else {
+                    slotCap = 2
+                }
+                if let dynamicCap = specMaxDraftSlotCapOverride {
+                    slotCap = max(1, min(slotCap, dynamicCap))
+                }
+                let lowMemoryProfile = specLowMemoryProfileOverride
+                    ?? (slots != nil && slots! <= 32 && cfg.numExperts >= 64)
+                let resolved = qwen36Spec.stepThrottleAndResolveDraftK(
+                    maxSlotSupportedK: min(maxCap, slotCap),
+                    lowMemorySlotProfile: lowMemoryProfile,
+                    allowThrottleToZero: allowZero && lowMemoryProfile)
+                if resolved == 0 && allowZero {
+                    return 0
+                }
+                draftK = resolved
+            } else {
+                draftK = min(maxCap, max(1, defaultSpecDraftK))
+            }
+        } else {
+            draftK = min(maxCap, max(1, defaultSpecDraftK))
+        }
+        return min(maxCap, max(1, draftK))
+    }
+
+    private func finishVerifyRound(token: Int32,
+                                   position: Int,
+                                   speculator: any SpeculativeDrafter,
+                                   verifyTokens: [Int32],
+                                   drafts: [Int32],
+                                   targets: [UInt32],
+                                   scratch: PrefillChunkScratchBuffers,
+                                   verifyNanos: UInt64) throws -> UInt32 {
         verifyArenaRoundBase = position
         verifyArenaCaptured = min(verifyTokens.count - 1, 4)
 
@@ -2181,7 +2294,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
 
         let mtp = speculator as? Qwen36MTPSpeculator
 
-        // 5. Rollback if any draft rejected
+        // Rollback if any draft rejected.
         if accepted < drafts.count {
             kv?.rewind(to: position + accepted + 1)
             if hasActiveMRoPE {
@@ -2191,7 +2304,7 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             verifyArenaCaptured = min(accepted + 1, 4)
         }
 
-        // 6. Synchronize accepted target hidden states + KV into MTP speculator.
+        // Synchronize accepted target hidden states + KV into MTP speculator.
         if let mtp {
             let wroteVerifyNormed = useMultiXEnabled
                 && verifyTokens.count <= LMHeadGreedyMultiX.maxTokens
@@ -2216,9 +2329,193 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      acceptedCount: accepted)
         }
 
-        // 7. Update stats and queue pending tokens
         speculator.recordAccepted(drafts: drafts, emitted: emitted, position: position, verifyNanos: verifyNanos)
-        lastGreedyToken = emitted[0]
+        return emitted[0]
+    }
+
+    private func runVerifyRound(token: Int32, position: Int, draftCount: Int = 1) async throws {
+        guard let speculator, useFusedGreedyHead else { return }
+        let boundedCount = min(4, max(1, draftCount))
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
+
+        let drafts = try speculator.draft(bonus: token, position: position, count: boundedCount)
+        guard !drafts.isEmpty else {
+            try await produceToken(token: token, position: position, into: greedyTokenBuf,
+                                   emitHead: true, outputMode: .greedyIfAvailable)
+            return
+        }
+
+        let verifyTokens: [Int32] = [token] + drafts
+        let scratch = try ensurePrefillScratch(config: .defaultChunked)
+        if hasActiveMRoPE {
+            recordLinearMRoPEPositions(startPosition: position, count: verifyTokens.count)
+        }
+
+        let verifyStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        let targets = try await executePrefillChunk(
+            tokens: verifyTokens[...],
+            startPosition: position,
+            outputMode: .greedyIfAvailable,
+            logits: greedyTokenBuf,
+            scratch: scratch,
+            config: .defaultChunked,
+            writeFinalHead: true,
+            isVerifyPass: true)
+        let verifyNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - verifyStart
+
+        lastGreedyToken = try finishVerifyRound(
+            token: token,
+            position: position,
+            speculator: speculator,
+            verifyTokens: verifyTokens,
+            drafts: drafts,
+            targets: targets,
+            scratch: scratch,
+            verifyNanos: verifyNanos)
+    }
+
+    private func runVerifyRoundSampled(token: Int32,
+                                       position: Int,
+                                       draftCount: Int,
+                                       generatedIndex: Int,
+                                       history: [Int32],
+                                       config: GenerationConfig,
+                                       sampler: Sampler,
+                                       probs: MTLBuffer) async throws -> UInt32? {
+        guard let speculator, useMultiXEnabled else { return nil }
+        let boundedCount = min(3, max(1, draftCount))
+        verifyArenaRoundBase = -1
+        verifyArenaCaptured = 0
+
+        let drafts = try speculator.draft(bonus: token, position: position, count: boundedCount)
+        guard !drafts.isEmpty else { return nil }
+
+        let verifyTokens: [Int32] = [token] + drafts
+        let scratch = try ensurePrefillScratch(config: .defaultChunked)
+        let logitsBuf = try ensureVerifyLogitsBuffer(tokens: verifyTokens.count)
+        if hasActiveMRoPE {
+            recordLinearMRoPEPositions(startPosition: position, count: verifyTokens.count)
+        }
+
+        let verifyStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        if config.repetitionPenalty == 1.0 {
+            let rowStrideBytes = cfg.vocabSize * MemoryLayout<Float16>.stride
+            let tokensCount = verifyTokens.count
+            _ = try await executePrefillChunk(
+                tokens: verifyTokens[...],
+                startPosition: position,
+                outputMode: .logits,
+                logits: logitsBuf,
+                scratch: scratch,
+                config: .defaultChunked,
+                writeFinalHead: true,
+                isVerifyPass: true,
+                verifyLogitsOut: logitsBuf,
+                postVerifyLogitsEncode: { [verifyTokensBuf] headCB in
+                    sampler.sampleBatch(commandBuffer: headCB,
+                                        logitsBatch: logitsBuf,
+                                        rowStrideBytes: rowStrideBytes,
+                                        probs: probs,
+                                        baseHistory: [],
+                                        draftTokens: drafts,
+                                        config: config,
+                                        basePosition: generatedIndex,
+                                        outTokens: verifyTokensBuf,
+                                        count: tokensCount)
+                })
+        } else {
+            _ = try await executePrefillChunk(
+                tokens: verifyTokens[...],
+                startPosition: position,
+                outputMode: .logits,
+                logits: logitsBuf,
+                scratch: scratch,
+                config: .defaultChunked,
+                writeFinalHead: true,
+                isVerifyPass: true,
+                verifyLogitsOut: logitsBuf)
+
+            guard let sampleCB = ctx.queue.makeCommandBuffer() else {
+                throw ModelError.residentBufferWrapFailed
+            }
+            sampler.sampleBatch(commandBuffer: sampleCB,
+                                logitsBatch: logitsBuf,
+                                rowStrideBytes: cfg.vocabSize * MemoryLayout<Float16>.stride,
+                                probs: probs,
+                                baseHistory: history,
+                                draftTokens: drafts,
+                                config: config,
+                                basePosition: generatedIndex,
+                                outTokens: verifyTokensBuf,
+                                count: verifyTokens.count)
+            sampleCB.commit()
+            waitForCompletion(sampleCB)
+            if let error = sampleCB.error {
+                throw error
+            }
+        }
+        let verifyNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - verifyStart
+
+        let ptr = verifyTokensBuf.contents().bindMemory(to: UInt32.self, capacity: verifyTokens.count)
+        let targets = (0..<verifyTokens.count).map { ptr[$0] }
+        return try finishVerifyRound(
+            token: token,
+            position: position,
+            speculator: speculator,
+            verifyTokens: verifyTokens,
+            drafts: drafts,
+            targets: targets,
+            scratch: scratch,
+            verifyNanos: verifyNanos)
+    }
+
+    func produceSampled(token: Int32,
+                        position: Int,
+                        generatedIndex: Int,
+                        history: [Int32],
+                        config: GenerationConfig,
+                        sampler: Sampler,
+                        probs: MTLBuffer,
+                        fallbackLogits: MTLBuffer) async throws -> Int32? {
+        try prefillChunkState.requireClean(operation: "produceSampled")
+        speculator?.notifyTokens(tokens: [token][...], startPosition: position)
+        if let speculator, useMultiXEnabled {
+            if let queued = try speculator.consumePending(token: token, position: position) {
+                return Int32(bitPattern: queued)
+            }
+            if speculator.canRunRound(position: position) {
+                let draftK = resolveDraftK(for: speculator, maxCap: 3, allowZero: true)
+                if draftK > 0 {
+                    do {
+                        if let tokenOut = try await runVerifyRoundSampled(
+                            token: token,
+                            position: position,
+                            draftCount: draftK,
+                            generatedIndex: generatedIndex,
+                            history: history,
+                            config: config,
+                            sampler: sampler,
+                            probs: probs) {
+                            return Int32(bitPattern: tokenOut)
+                        }
+                    } catch {
+                        if phaseLoggingEnabled {
+                            print("[spec sampled round error]: \(error)")
+                        }
+                    }
+                }
+            }
+        }
+        if let kvPos = kv?.position, kvPos > position {
+            try prepareForContinuation(expectedPosition: position)
+        }
+        try await produceToken(token: token,
+                               position: position,
+                               into: fallbackLogits,
+                               emitHead: true,
+                               outputMode: .logits)
+        return nil
     }
 
     public func produce(token: Int32, position: Int, into logits: MTLBuffer) async throws {
@@ -2230,39 +2527,15 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 return
             }
             if speculator.canRunRound(position: position) {
-                let draftK: Int
-                if let explicitOverride = specDraftCountOverride {
-                    draftK = min(4, max(1, explicitOverride))
-                } else if let qwen36Spec = speculator as? Qwen36MTPSpeculator {
-                    if let adaptiveOverride = specAdaptiveDraftOverride {
-                        qwen36Spec.adaptiveDraftEnabled = adaptiveOverride
-                    }
-                    if qwen36Spec.adaptiveDraftEnabled {
-                        var slotCap: Int
-                        if cfg.topKExperts > 0, let slots = model.routedExpertCacheSlotCount(layer: 0) {
-                            let rawCap = max(1, (slots / cfg.topKExperts) - 1)
-                            // Cap adaptive draft depth at K = 2 on <= 32-slot caches so 4-token MoE verify
-                            // does not amplify expert-cache streaming latency; allow K = 3 at 48+ slots.
-                            slotCap = slots >= 48 ? min(3, rawCap) : min(2, rawCap)
-                        } else {
-                            slotCap = 2
+                let draftK = resolveDraftK(for: speculator, maxCap: 4, allowZero: true)
+                if draftK > 0 {
+                    do {
+                        try await runVerifyRound(token: token, position: position, draftCount: draftK)
+                        return
+                    } catch {
+                        if phaseLoggingEnabled {
+                            print("[spec round error]: \(error)")
                         }
-                        if let dynamicCap = specMaxDraftSlotCapOverride {
-                            slotCap = max(1, min(slotCap, dynamicCap))
-                        }
-                        draftK = qwen36Spec.recommendedDraftCount(maxSlotSupportedK: slotCap)
-                    } else {
-                        draftK = min(4, max(1, defaultSpecDraftK))
-                    }
-                } else {
-                    draftK = min(4, max(1, defaultSpecDraftK))
-                }
-                do {
-                    try await runVerifyRound(token: token, position: position, draftCount: draftK)
-                    return
-                } catch {
-                    if phaseLoggingEnabled {
-                        print("[spec round error]: \(error)")
                     }
                 }
             }
@@ -2560,7 +2833,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                      scratch: PrefillChunkScratchBuffers,
                                      config: PrefillRuntimeConfig,
                                      writeFinalHead: Bool,
-                                     isVerifyPass: Bool = false) async throws -> [UInt32] {
+                                     isVerifyPass: Bool = false,
+                                     verifyLogitsOut: MTLBuffer? = nil,
+                                     postVerifyLogitsEncode: ((MTLCommandBuffer) -> Void)? = nil) async throws -> [UInt32] {
         guard !tokens.isEmpty else { return [] }
         guard kv != nil else {
             throw PrefillError.chunkedUnsupported("chunked prefill attention requires FP16 KV")
@@ -2826,7 +3101,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
             try prefillWillEncodeLayer?(L)
             try Task.checkCancellation()
             model.beginOpeningRoutedExpertStreamer(layer: L)
-            issueSpeculativePrefetch(layer: L + 1)
+            if !isVerifyPass || speculativeExpertPredictor != nil {
+                issueSpeculativePrefetch(layer: L + 1)
+            }
             let views = layerViews[L]
             let isLinear = cfg.layerIsLinear(L)
             let isFull = cfg.fullAttentionLayerMask[L] == 1
@@ -2931,67 +3208,94 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     let fp16Stride = MemoryLayout<Float16>.stride
                     let stateBytes = gdnState.stateBytesPerLayer
                     let tailBytes = gdnState.convTailBytesPerLayer
-                    var allFused = true
-                    for i in 0..<t {
-                        gdn.encodeConvTailUpdate(commandBuffer: cb,
-                                                 tail: tail,
-                                                 qkvRows: scratch.q,
-                                                 qkvRowsOffset: i * la.qkvDim * fp16Stride,
-                                                 rows: 1)
-                        let usedFused = gdn.encodeDeltaGatedDecode(
-                            commandBuffer: cb,
-                            convOut: scratch.gdnConvOut,
-                            convOutOffset: i * la.qkvDim * fp16Stride,
-                            aProj: scratch.gdnA,
-                            aProjOffset: i * la.numVHeads * fp16Stride,
-                            bProj: scratch.gdnB,
-                            bProjOffset: i * la.numVHeads * fp16Stride,
-                            aLog: aLog.buffer,
-                            aLogOffset: Int(aLog.offset),
-                            dtBias: dtBias.buffer,
-                            dtBiasOffset: Int(dtBias.offset),
-                            state: gdnState.stateBuffer(layer: L),
-                            z: scratch.gdnZ,
-                            zOffset: i * la.valueDim * fp16Stride,
-                            weight: gatedNormW.buffer,
-                            weightOffset: Int(gatedNormW.offset),
-                            out: scratch.attentionOutput,
-                            outOffset: i * la.valueDim * fp16Stride)
-                        if !usedFused {
-                            allFused = false
-                            gdn.encodeDeltaStepPrefill(commandBuffer: cb,
-                                                       convOut: scratch.gdnConvOut,
-                                                       convOutOffset: i * la.qkvDim * fp16Stride,
-                                                       aProj: scratch.gdnA,
-                                                       aProjOffset: i * la.numVHeads * fp16Stride,
-                                                       bProj: scratch.gdnB,
-                                                       bProjOffset: i * la.numVHeads * fp16Stride,
-                                                       aLog: aLog.buffer,
-                                                       aLogOffset: Int(aLog.offset),
-                                                       dtBias: dtBias.buffer,
-                                                       dtBiasOffset: Int(dtBias.offset),
-                                                       state: gdnState.stateBuffer(layer: L),
-                                                       y: scratch.gdnY,
-                                                       yOffset: i * la.valueDim * fp16Stride,
-                                                       rows: 1)
-                        }
-                        if i < t - 1 {
-                            gdn.encodeStateSnapshot(
-                                commandBuffer: cb,
-                                srcState: gdnState.stateBuffer(layer: L),
-                                srcStateOffset: 0,
-                                dstState: verifyStateArena,
-                                dstStateOffset: (i * numLinearLayers + ordinal) * stateBytes,
-                                srcTail: tail,
-                                srcTailOffset: 0,
-                                dstTail: verifyTailArena,
-                                dstTailOffset: (i * numLinearLayers + ordinal) * tailBytes,
-                                stateBytes: stateBytes,
-                                tailBytes: tailBytes)
-                        }
-                    }
-                    if allFused {
+                    if useFusedGDNVerify,
+                       gdn.encodeVerifyQwen(
+                           commandBuffer: cb,
+                           tail: tail,
+                           qkvRows: scratch.q,
+                           tailArena: verifyTailArena,
+                           tailArenaOffset: ordinal * tailBytes,
+                           tailSlotStrideHalfs: numLinearLayers * (tailBytes / fp16Stride),
+                           convOut: scratch.gdnConvOut,
+                           aProj: scratch.gdnA,
+                           bProj: scratch.gdnB,
+                           aLog: aLog.buffer,
+                           aLogOffset: Int(aLog.offset),
+                           dtBias: dtBias.buffer,
+                           dtBiasOffset: Int(dtBias.offset),
+                           state: gdnState.stateBuffer(layer: L),
+                           stateArena: verifyStateArena,
+                           stateArenaOffset: ordinal * stateBytes,
+                           stateSlotStrideFloats: numLinearLayers * (stateBytes / MemoryLayout<Float>.stride),
+                           z: scratch.gdnZ,
+                           weight: gatedNormW.buffer,
+                           weightOffset: Int(gatedNormW.offset),
+                           out: scratch.attentionOutput,
+                           rows: t) {
                         skipGlobalGatedNorm = true
+                    } else {
+                        var allFused = true
+                        for i in 0..<t {
+                            gdn.encodeConvTailUpdate(commandBuffer: cb,
+                                                     tail: tail,
+                                                     qkvRows: scratch.q,
+                                                     qkvRowsOffset: i * la.qkvDim * fp16Stride,
+                                                     rows: 1)
+                            let usedFused = gdn.encodeDeltaGatedDecode(
+                                commandBuffer: cb,
+                                convOut: scratch.gdnConvOut,
+                                convOutOffset: i * la.qkvDim * fp16Stride,
+                                aProj: scratch.gdnA,
+                                aProjOffset: i * la.numVHeads * fp16Stride,
+                                bProj: scratch.gdnB,
+                                bProjOffset: i * la.numVHeads * fp16Stride,
+                                aLog: aLog.buffer,
+                                aLogOffset: Int(aLog.offset),
+                                dtBias: dtBias.buffer,
+                                dtBiasOffset: Int(dtBias.offset),
+                                state: gdnState.stateBuffer(layer: L),
+                                z: scratch.gdnZ,
+                                zOffset: i * la.valueDim * fp16Stride,
+                                weight: gatedNormW.buffer,
+                                weightOffset: Int(gatedNormW.offset),
+                                out: scratch.attentionOutput,
+                                outOffset: i * la.valueDim * fp16Stride)
+                            if !usedFused {
+                                allFused = false
+                                gdn.encodeDeltaStepPrefill(commandBuffer: cb,
+                                                           convOut: scratch.gdnConvOut,
+                                                           convOutOffset: i * la.qkvDim * fp16Stride,
+                                                           aProj: scratch.gdnA,
+                                                           aProjOffset: i * la.numVHeads * fp16Stride,
+                                                           bProj: scratch.gdnB,
+                                                           bProjOffset: i * la.numVHeads * fp16Stride,
+                                                           aLog: aLog.buffer,
+                                                           aLogOffset: Int(aLog.offset),
+                                                           dtBias: dtBias.buffer,
+                                                           dtBiasOffset: Int(dtBias.offset),
+                                                           state: gdnState.stateBuffer(layer: L),
+                                                           y: scratch.gdnY,
+                                                           yOffset: i * la.valueDim * fp16Stride,
+                                                           rows: 1)
+                            }
+                            if i < t - 1 {
+                                gdn.encodeStateSnapshot(
+                                    commandBuffer: cb,
+                                    srcState: gdnState.stateBuffer(layer: L),
+                                    srcStateOffset: 0,
+                                    dstState: verifyStateArena,
+                                    dstStateOffset: (i * numLinearLayers + ordinal) * stateBytes,
+                                    srcTail: tail,
+                                    srcTailOffset: 0,
+                                    dstTail: verifyTailArena,
+                                    dstTailOffset: (i * numLinearLayers + ordinal) * tailBytes,
+                                    stateBytes: stateBytes,
+                                    tailBytes: tailBytes)
+                            }
+                        }
+                        if allFused {
+                            skipGlobalGatedNorm = true
+                        }
                     }
                 } else {
                     gdn.encodeConvTailUpdate(commandBuffer: cb,
@@ -3428,60 +3732,95 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         yStrideElements: D)
                 }
 
-                if let binding = verifySlotMapBinding {
-                    for r in 0..<t {
-                        moe.encodeSlotMapGuardedFFN(
-                            commandBuffer: cb,
-                            slab: binding.slab,
-                            slotOffsets: verifySlotOffsets,
-                            slotOffsetsOffset: layerSlotOffset + r * cfg.topKExperts * MemoryLayout<UInt32>.stride,
-                            allHit: verifyAllHit,
-                            allHitOffset: layerAllHitOffset,
-                            routedOffsets: layerOffsets[L],
-                            x: scratch.routedX,
-                            xOffset: r * D * MemoryLayout<Float16>.stride,
-                            acts: verifyActs,
-                            actsOffset: r * cfg.topKExperts * Int(FmoE) * MemoryLayout<Float16>.stride,
-                            routingWeights: scratch.routeWeights,
-                            routingWeightsOffset: r * cfg.topKExperts * MemoryLayout<Float16>.stride,
-                            residual: scratch.h1,
-                            residualOffset: r * D * MemoryLayout<Float16>.stride,
-                            y: scratch.h2,
-                            yOffset: r * D * MemoryLayout<Float16>.stride,
-                            hidden: scratch.hidden,
-                            hiddenOffset: r * D * MemoryLayout<Float16>.stride,
-                            d: UInt32(D),
-                            f: FmoE,
-                            topK: UInt32(cfg.topKExperts))
-                    }
+                let armedOptimisticFFNInCB = !verifySkipDeadGuardEnabled || verifyArmOptimisticGuardedInCB
+                if armedOptimisticFFNInCB, let binding = verifySlotMapBinding {
+                    moe.encodeSlotMapGuardedFFNBatch(
+                        commandBuffer: cb,
+                        slab: binding.slab,
+                        slotOffsets: verifySlotOffsets,
+                        slotOffsetsOffset: layerSlotOffset,
+                        allHit: verifyAllHit,
+                        allHitOffset: layerAllHitOffset,
+                        routedOffsets: layerOffsets[L],
+                        x: scratch.routedX,
+                        acts: verifyActs,
+                        routingWeights: scratch.routeWeights,
+                        residual: scratch.h1,
+                        y: scratch.h2,
+                        hidden: scratch.hidden,
+                        d: UInt32(D),
+                        f: FmoE,
+                        topK: UInt32(cfg.topKExperts),
+                        queryCount: t)
                 }
 
                 let tRouterStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                trackGpuInterval(cb)
                 cb.commit()
                 waitForRouterSignal(routerSignal, fallback: cb)
                 let tRouterWait = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tRouterStart
 
                 let hitVal = verifyAllHit.contents().advanced(by: layerAllHitOffset).load(as: UInt32.self)
+                verifySlotMapWindowSteps &+= 1
+                if !Self.slotMapForceMiss && hitVal == 1 {
+                    verifySlotMapWindowAllHits &+= 1
+                }
+                if verifySlotMapWindowSteps >= 40 {
+                    verifyArmOptimisticGuardedInCB =
+                        (verifySlotMapWindowAllHits * 100 >= verifySlotMapWindowSteps * 8)
+                    verifySlotMapWindowSteps = 0
+                    verifySlotMapWindowAllHits = 0
+                }
                 let routeCount = t * cfg.topKExperts
                 let idPtr = scratch.routeIDs.contents().bindMemory(to: UInt32.self, capacity: routeCount)
 
                 if !Self.slotMapForceMiss, hitVal == 1 {
-                    // All routed experts hit in slot-map cache!
-                    var hitExperts = [Int]()
-                    hitExperts.reserveCapacity(routeCount)
-                    for i in 0..<routeCount {
-                        hitExperts.append(min(Int(idPtr[i]), cfg.numExperts - 1))
+                    if !armedOptimisticFFNInCB, let binding = verifySlotMapBinding {
+                        guard let allHitCB = ctx.queue.makeCommandBuffer() else {
+                            throw ModelError.residentBufferWrapFailed
+                        }
+                        moe.encodeSlotMapGuardedFFNBatch(
+                            commandBuffer: allHitCB,
+                            slab: binding.slab,
+                            slotOffsets: verifySlotOffsets,
+                            slotOffsetsOffset: layerSlotOffset,
+                            allHit: verifyAllHitAlwaysOne,
+                            allHitOffset: 0,
+                            routedOffsets: layerOffsets[L],
+                            x: scratch.routedX,
+                            acts: verifyActs,
+                            routingWeights: scratch.routeWeights,
+                            residual: scratch.h1,
+                            y: scratch.h2,
+                            hidden: scratch.hidden,
+                            d: UInt32(D),
+                            f: FmoE,
+                            topK: UInt32(cfg.topKExperts),
+                            queryCount: t)
+                        trackGpuInterval(allHitCB)
+                        allHitCB.commit()
                     }
-                    settleSpeculation(layer: L, actualExperts: hitExperts)
-                    recordRoutedExperts(hitExperts, layer: L)
+                    // All routed experts hit in slot-map cache!
+                    verifyAllHitExpertsScratch.removeAll(keepingCapacity: true)
+                    for i in 0..<routeCount {
+                        verifyAllHitExpertsScratch.append(min(Int(idPtr[i]), cfg.numExperts - 1))
+                    }
+                    if !pendingSpeculations.isEmpty {
+                        settleSpeculation(layer: L, actualExperts: verifyAllHitExpertsScratch)
+                    }
+                    if speculativePrefetchMode != .off || speculativeExpertPredictor != nil {
+                        recordRoutedExperts(verifyAllHitExpertsScratch, layer: L)
+                    }
                     if let streamer = try? model.routedExpertStreamer(layer: L) {
-                        streamer.noteAllHitUse(experts: hitExperts)
+                        streamer.noteAllHitUse(experts: verifyAllHitExpertsScratch)
                     }
                     if Self.phaseInstrumentationEnabled {
                         totalRoutedLayerSteps &+= 1
                         totalAllHitLayerSteps &+= 1
                     }
-                    issueSpeculativePrefetch(layer: L + 1)
+                    if speculativeExpertPredictor != nil {
+                        issueSpeculativePrefetch(layer: L + 1)
+                    }
                     if L + 1 < cfg.numLayers {
                         guard let nextCB = ctx.queue.makeCommandBuffer() else {
                             throw ModelError.residentBufferWrapFailed
@@ -3494,89 +3833,167 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 guard let binding = verifySlotMapBinding else { continue }
 
                 let tPlanStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                // Gather ALL unique routed experts required across all tokens in this verify step
-                var allExperts = [Int]()
-                allExperts.reserveCapacity(routeCount)
+                // Gather ALL unique routed experts required across all tokens in zero-alloc scratch.
+                verifyPlanStamp &+= 1
+                if verifyPlanStamp == 0 {
+                    for idx in verifyExpertSeenStamp.indices {
+                        verifyExpertSeenStamp[idx] = 0
+                    }
+                    verifyPlanStamp = 1
+                }
+                verifyUniqueExpertsScratch.removeAll(keepingCapacity: true)
+                let numExperts = cfg.numExperts
+                let stamp = verifyPlanStamp
                 for i in 0..<routeCount {
-                    let e = min(Int(idPtr[i]), cfg.numExperts - 1)
-                    if !allExperts.contains(e) {
-                        allExperts.append(e)
+                    let e = min(Int(idPtr[i]), numExperts - 1)
+                    if verifyExpertSeenStamp[e] != stamp {
+                        verifyExpertSeenStamp[e] = stamp
+                        verifyExpertPlanIndex[e] = verifyUniqueExpertsScratch.count
+                        verifyUniqueExpertsScratch.append(e)
                     }
                 }
-                settleSpeculation(layer: L, actualExperts: allExperts)
-                recordRoutedExperts(allExperts, layer: L)
+                if !pendingSpeculations.isEmpty {
+                    settleSpeculation(layer: L, actualExperts: verifyUniqueExpertsScratch)
+                }
+                if speculativePrefetchMode != .off || speculativeExpertPredictor != nil {
+                    recordRoutedExperts(verifyUniqueExpertsScratch, layer: L)
+                }
 
-                guard let plan = try model.planRoutedExperts(layer: L, experts: allExperts) else {
+                guard let plan = try model.planRoutedExperts(layer: L, experts: verifyUniqueExpertsScratch) else {
                     continue
-                }
-
-                // Map each expert to its planned slot
-                var expertToSlot = [Int: Int]()
-                for (idx, expert) in plan.experts.enumerated() {
-                    expertToSlot[expert] = plan.assignedSlots[idx]
-                }
-
-                let slotOffsetsPtr = verifySlotOffsets.contents()
-                    .advanced(by: layerSlotOffset)
-                    .bindMemory(to: UInt32.self, capacity: routeCount)
-                for i in 0..<routeCount {
-                    let e = min(Int(idPtr[i]), cfg.numExperts - 1)
-                    guard let slot = expertToSlot[e] else {
-                        preconditionFailure("Missing assigned slot for expert \(e)")
-                    }
-                    slotOffsetsPtr[i] = UInt32(slot) * UInt32(binding.slotStride)
                 }
                 let tPlanNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tPlanStart
 
-                let tEncodeStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                guard let fillCB = ctx.queue.makeCommandBuffer() else {
-                    throw ModelError.residentBufferWrapFailed
-                }
-
+                // Issue async SSD reads BEFORE command-buffer schedule writing / encoding so NVMe DMA starts immediately.
+                let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
                 var eagerSeq: UInt64?
-                if !plan.misses.isEmpty, let event = eagerFetchEvent {
+                if !plan.misses.isEmpty, eagerFetchEvent != nil {
                     eagerFetchIssued &+= 1
-                    eagerSeq = eagerFetchIssued
-                    fillCB.encodeWaitForEvent(event, value: eagerFetchIssued)
+                    let seq = eagerFetchIssued
+                    eagerSeq = seq
+                    try model.fillRoutedExpertsAsync(plan: plan) { [weak self] success in
+                        self?.eagerFetchCompleted(seq, success: success, layer: L)
+                    }
+                }
+                let tIoNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
+
+                let tEncodeStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+                let uniqueCount = plan.experts.count
+                let slotStrideU32 = UInt32(binding.slotStride)
+                for u in 0..<uniqueCount {
+                    verifyExpertSlotOffset[u] = UInt32(plan.assignedSlots[u]) &* slotStrideU32
+                    verifyExpertIsMiss[u] = false
+                }
+                for missIdx in plan.misses {
+                    verifyExpertIsMiss[missIdx] = true
                 }
 
-                for r in 0..<t {
-                    moe.encodeSlotMapGuardedFFN(
+                if verifyHitSplitEnabled && moe.slotmapBatchEnabled &&
+                    t >= 2 && t <= MoE.slotmapScheduleMaxBatchT &&
+                    routeCount <= MoE.slotmapScheduleMaxEntries && cfg.topKExperts <= 8 {
+                    let topK = cfg.topKExperts
+                    let schedOffset = L * MoE.slotmapScheduleStride
+                    let (hitUnique, missUnique) = MoE.buildSplitSlotMapSchedules(
+                        queryCount: t,
+                        topK: topK,
+                        hitSchedulePtr: verifyHitSchedules.contents().advanced(by: schedOffset),
+                        missSchedulePtr: verifyMissSchedules.contents().advanced(by: schedOffset)
+                    ) { r, k in
+                        let e = min(Int(idPtr[r * topK + k]), numExperts - 1)
+                        let u = verifyExpertPlanIndex[e]
+                        return (slotOffset: verifyExpertSlotOffset[u], isMiss: verifyExpertIsMiss[u])
+                    }
+
+                    if hitUnique > 0 && missUnique > 0 {
+                        guard let hitCB = ctx.queue.makeCommandBuffer() else {
+                            throw ModelError.residentBufferWrapFailed
+                        }
+                        moe.encodeSlotMapScheduledPhase1And2(
+                            commandBuffer: hitCB,
+                            slab: binding.slab,
+                            schedule: verifyHitSchedules,
+                            scheduleOffset: schedOffset,
+                            uniqueCount: hitUnique,
+                            allHit: verifyAllHitAlwaysOne,
+                            allHitOffset: 0,
+                            routedOffsets: layerOffsets[L],
+                            x: scratch.routedX,
+                            acts: verifyActs,
+                            routingWeights: scratch.routeWeights,
+                            d: UInt32(D),
+                            f: FmoE,
+                            topK: UInt32(topK),
+                            queryCount: t)
+                        trackGpuInterval(hitCB)
+                        hitCB.commit()
+                    }
+
+                    guard let fillCB = ctx.queue.makeCommandBuffer() else {
+                        throw ModelError.residentBufferWrapFailed
+                    }
+                    if missUnique > 0, let seq = eagerSeq, let event = eagerFetchEvent {
+                        fillCB.encodeWaitForEvent(event, value: seq)
+                    }
+                    let useMissSchedule = missUnique > 0
+                    moe.encodeSlotMapScheduledMissAndReduce(
                         commandBuffer: fillCB,
                         slab: binding.slab,
-                        slotOffsets: verifySlotOffsets,
-                        slotOffsetsOffset: layerSlotOffset + r * cfg.topKExperts * MemoryLayout<UInt32>.stride,
+                        schedule: useMissSchedule ? verifyMissSchedules : verifyHitSchedules,
+                        scheduleOffset: schedOffset,
+                        uniqueCount: useMissSchedule ? missUnique : hitUnique,
                         allHit: verifyAllHitAlwaysOne,
                         allHitOffset: 0,
                         routedOffsets: layerOffsets[L],
                         x: scratch.routedX,
-                        xOffset: r * D * MemoryLayout<Float16>.stride,
                         acts: verifyActs,
-                        actsOffset: r * cfg.topKExperts * Int(FmoE) * MemoryLayout<Float16>.stride,
                         routingWeights: scratch.routeWeights,
-                        routingWeightsOffset: r * cfg.topKExperts * MemoryLayout<Float16>.stride,
                         residual: scratch.h1,
-                        residualOffset: r * D * MemoryLayout<Float16>.stride,
                         y: scratch.h2,
-                        yOffset: r * D * MemoryLayout<Float16>.stride,
                         hidden: scratch.hidden,
-                        hiddenOffset: r * D * MemoryLayout<Float16>.stride,
                         d: UInt32(D),
                         f: FmoE,
-                        topK: UInt32(cfg.topKExperts))
-                }
-                fillCB.commit()
-                let tEncodeNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tEncodeStart
-
-                let tIoStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
-                if let seq = eagerSeq {
-                    try model.fillRoutedExpertsAsync(plan: plan) { [weak self] success in
-                        self?.eagerFetchCompleted(seq, success: success, layer: L)
+                        topK: UInt32(topK),
+                        queryCount: t)
+                    trackGpuInterval(fillCB)
+                    fillCB.commit()
+                } else {
+                    let slotOffsetsPtr = verifySlotOffsets.contents()
+                        .advanced(by: layerSlotOffset)
+                        .bindMemory(to: UInt32.self, capacity: routeCount)
+                    for i in 0..<routeCount {
+                        let e = min(Int(idPtr[i]), numExperts - 1)
+                        slotOffsetsPtr[i] = verifyExpertSlotOffset[verifyExpertPlanIndex[e]]
                     }
-                } else if let streamer = try? model.routedExpertStreamer(layer: L) {
-                    streamer.noteAllHitUse(experts: allExperts)
+
+                    guard let fillCB = ctx.queue.makeCommandBuffer() else {
+                        throw ModelError.residentBufferWrapFailed
+                    }
+                    if let seq = eagerSeq, let event = eagerFetchEvent {
+                        fillCB.encodeWaitForEvent(event, value: seq)
+                    }
+                    moe.encodeSlotMapGuardedFFNBatch(
+                        commandBuffer: fillCB,
+                        slab: binding.slab,
+                        slotOffsets: verifySlotOffsets,
+                        slotOffsetsOffset: layerSlotOffset,
+                        allHit: verifyAllHitAlwaysOne,
+                        allHitOffset: 0,
+                        routedOffsets: layerOffsets[L],
+                        x: scratch.routedX,
+                        acts: verifyActs,
+                        routingWeights: scratch.routeWeights,
+                        residual: scratch.h1,
+                        y: scratch.h2,
+                        hidden: scratch.hidden,
+                        d: UInt32(D),
+                        f: FmoE,
+                        topK: UInt32(cfg.topKExperts),
+                        queryCount: t,
+                        maxUniqueExperts: uniqueCount)
+                    trackGpuInterval(fillCB)
+                    fillCB.commit()
                 }
-                let tIoNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tIoStart
+                let tEncodeNanos = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tEncodeStart
 
                 if debugLoggingEnabled && L < 3 {
                     print("[verify L\(L)]: rWait=\(String(format: "%.2f", Double(tRouterWait)/1e6))ms plan=\(String(format: "%.2f", Double(tPlanNanos)/1e6))ms enc=\(String(format: "%.2f", Double(tEncodeNanos)/1e6))ms ioIssue=\(String(format: "%.2f", Double(tIoNanos)/1e6))ms misses=\(plan.misses.count)")
@@ -3585,7 +4002,9 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                 if Self.phaseInstrumentationEnabled {
                     totalRoutedLayerSteps &+= 1
                 }
-                issueSpeculativePrefetch(layer: L + 1)
+                if speculativeExpertPredictor != nil {
+                    issueSpeculativePrefetch(layer: L + 1)
+                }
                 if L + 1 < cfg.numLayers {
                     guard let nextCB = ctx.queue.makeCommandBuffer() else {
                         throw ModelError.residentBufferWrapFailed
@@ -3858,26 +4277,66 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         guard let tileCB = ctx.queue.makeCommandBuffer() else {
                             throw ModelError.residentBufferWrapFailed
                         }
-                        let argumentBuffer = try prefillGroupedMoE.makeStreamedArgumentBuffer(
-                            device: ctx.device,
-                            binding: fetch.binding)
-                        _ = prefillGroupedMoE.encodeStreamedBatched(
-                            commandBuffer: tileCB,
-                            hidden: scratch.routedX,
-                            sortedPairs: metadata.sortedPairs,
-                            routePartials: scratch.routePartials,
-                            gateUpActScratch: scratch.routedGateUpActScratch,
-                            downScratch: scratch.routedDownScratch,
-                            argumentBuffer: argumentBuffer,
-                            binding: fetch.binding,
-                            params: streamedParams,
-                            pairMicrobatchRows: scratch.layout.routedPairMicrobatchRows)
-                        let retainedArgBuffer = argumentBuffer.buffer
+                        var retainedArgBuffer: MTLBuffer?
+                        let mppEligible = prefillMPPMoEEnabled
+                            && cfg.hiddenActivation == "silu"
+                            && cfg.swigluLimit == 0
+                            && t >= 256
+                            && D % 64 == 0
+                            && cfg.moeIntermediateSize % 64 == 0
+                            && fetch.binding.views.count <= 16
+                            && prefillMPPGroupedMoE.isAvailable
+                        if mppEligible {
+                            let firstGroup = Int(tile.groupStart)
+                            let endGroup = firstGroup + Int(tile.groupCount)
+                            let maxPairs = routes.groups[firstGroup..<endGroup]
+                                .map { Int($0.pairCount) }.max() ?? 0
+                            if maxPairs >= 16 {
+                                let actBytes = Int(tile.pairCount) * cfg.moeIntermediateSize * MemoryLayout<Float16>.stride
+                                let actBuf = try ensurePrefillMPPActBuffer(bytes: actBytes)
+                                let mppArgument = try prefillMPPGroupedMoE.makeArgumentBuffer(
+                                    device: ctx.device,
+                                    binding: fetch.binding)
+                                var mppParams = streamedParams
+                                mppParams.pairStart = tile.groupStart
+                                mppParams.pairCount = tile.groupCount
+                                if prefillMPPGroupedMoE.encode(
+                                    commandBuffer: tileCB,
+                                    hidden: scratch.routedX,
+                                    sortedPairs: metadata.sortedPairs,
+                                    groups: metadata.groups,
+                                    activation: actBuf,
+                                    routePartials: scratch.routePartials,
+                                    argumentBuffer: mppArgument,
+                                    binding: fetch.binding,
+                                    params: mppParams,
+                                    maxPairsPerGroup: maxPairs) {
+                                    retainedArgBuffer = mppArgument.buffer
+                                }
+                            }
+                        }
+                        if retainedArgBuffer == nil {
+                            let argumentBuffer = try prefillGroupedMoE.makeStreamedArgumentBuffer(
+                                device: ctx.device,
+                                binding: fetch.binding)
+                            _ = prefillGroupedMoE.encodeStreamedBatched(
+                                commandBuffer: tileCB,
+                                hidden: scratch.routedX,
+                                sortedPairs: metadata.sortedPairs,
+                                routePartials: scratch.routePartials,
+                                gateUpActScratch: scratch.routedGateUpActScratch,
+                                downScratch: scratch.routedDownScratch,
+                                argumentBuffer: argumentBuffer,
+                                binding: fetch.binding,
+                                params: streamedParams,
+                                pairMicrobatchRows: scratch.layout.routedPairMicrobatchRows)
+                            retainedArgBuffer = argumentBuffer.buffer
+                        }
                         tileCB.commit()
                         pendingTiles.append(PendingPrefillTile(tileIndex: tileIndex,
                                                                commandBuffer: tileCB,
                                                                fetch: fetch,
-                                                               argumentBuffer: retainedArgBuffer))
+                                                               argumentBuffer: retainedArgBuffer!))
                         while pendingTiles.count > schedulerConfig.maxPendingDepth {
                             try drainOldestPendingTile()
                         }
@@ -3967,26 +4426,51 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                                        t: UInt32(t),
                                        d: UInt32(D),
                                        eps: eps)
-                verifyMultiXHead.encode(commandBuffer: headCB,
-                                       xNormed: verifyNormedHidden,
-                                       weights: lm.buffer,
-                                       weightsOffset: Int(lm.offset),
-                                       scales: lm.buffer,
-                                       scalesOffset: Int(lm.scaleOffset),
-                                       biases: lm.buffer,
-                                       biasesOffset: Int(lm.biasOffset),
-                                       outTokens: verifyTokensBuf,
-                                       d: D,
-                                       vocab: cfg.vocabSize,
-                                       tokens: t)
-                headCB.commit()
-                waitForCompletion(headCB)
-                if let error = headCB.error {
-                    throw error
-                }
-                let ptr = verifyTokensBuf.contents().bindMemory(to: UInt32.self, capacity: t)
-                for r in 0..<t {
-                    verifyResults.append(ptr[r])
+                if let verifyLogitsOut {
+                    verifyMultiXHead.encodeLogits(commandBuffer: headCB,
+                                                  xNormed: verifyNormedHidden,
+                                                  weights: lm.buffer,
+                                                  weightsOffset: Int(lm.offset),
+                                                  scales: lm.buffer,
+                                                  scalesOffset: Int(lm.scaleOffset),
+                                                  biases: lm.buffer,
+                                                  biasesOffset: Int(lm.biasOffset),
+                                                  outLogits: verifyLogitsOut,
+                                                  d: D,
+                                                  vocab: cfg.vocabSize,
+                                                  tokens: t)
+                    postVerifyLogitsEncode?(headCB)
+                    trackGpuInterval(headCB)
+                    headCB.commit()
+                    waitForCompletion(headCB)
+                    try throwIfEagerFillFailed()
+                    if let error = headCB.error {
+                        throw error
+                    }
+                } else {
+                    verifyMultiXHead.encode(commandBuffer: headCB,
+                                           xNormed: verifyNormedHidden,
+                                           weights: lm.buffer,
+                                           weightsOffset: Int(lm.offset),
+                                           scales: lm.buffer,
+                                           scalesOffset: Int(lm.scaleOffset),
+                                           biases: lm.buffer,
+                                           biasesOffset: Int(lm.biasOffset),
+                                           outTokens: verifyTokensBuf,
+                                           d: D,
+                                           vocab: cfg.vocabSize,
+                                           tokens: t)
+                    trackGpuInterval(headCB)
+                    headCB.commit()
+                    waitForCompletion(headCB)
+                    try throwIfEagerFillFailed()
+                    if let error = headCB.error {
+                        throw error
+                    }
+                    let ptr = verifyTokensBuf.contents().bindMemory(to: UInt32.self, capacity: t)
+                    for r in 0..<t {
+                        verifyResults.append(ptr[r])
+                    }
                 }
             } else if isVerifyPass {
                 for r in 0..<t {
@@ -4009,8 +4493,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                         d: UInt32(D),
                         vocab: UInt32(cfg.vocabSize),
                         rmsEps: eps)
+                    trackGpuInterval(headCB)
                     headCB.commit()
                     waitForCompletion(headCB)
+                    if r == 0 {
+                        try throwIfEagerFillFailed()
+                    }
                     if let error = headCB.error {
                         throw error
                     }
@@ -4093,6 +4581,12 @@ public final class RealForwardRunner: ChunkedPrefillRunner, ContextWindowReporti
                     lastGreedyToken = greedyTokenBuf.contents().load(as: UInt32.self)
                 }
             }
+        } else if isVerifyPass {
+            if let syncCB = ctx.queue.makeCommandBuffer() {
+                syncCB.commit()
+                waitForCompletion(syncCB)
+            }
+            try throwIfEagerFillFailed()
         }
 
         if !isVerifyPass {

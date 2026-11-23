@@ -103,7 +103,9 @@ extension Model {
         try ensureLayerOpened(layer)
         switch expertBackend(layer) {
         case .pread(let streamer):
-            let validSlots = Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
+            let validSlots: Set<Int> = avoidingSlots.isEmpty
+                ? []
+                : Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
             return RoutedExpertFetchPlan(
                 layer: layer,
                 cachePlan: streamer.planExpertsCached(experts: experts,
@@ -122,7 +124,9 @@ extension Model {
         try ensureLayerOpened(layer)
         switch expertBackend(layer) {
         case .pread(let streamer):
-            let validSlots = Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
+            let validSlots: Set<Int> = avoidingSlots.isEmpty
+                ? []
+                : Set(avoidingSlots.filter { $0 >= 0 && $0 < streamer.slotCount })
             guard let cachePlan = streamer.planExpertsCachedIfPossible(
                 experts: experts,
                 avoidingSlots: validSlots)

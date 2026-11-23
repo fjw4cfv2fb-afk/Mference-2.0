@@ -55,6 +55,7 @@ final class MoE {
     private let realDecodeF: UInt32
     private let realDecodeTopK: UInt32
     private let realDecodeNumExperts: UInt32
+    private let device: MTLDevice
 
     private let routerGemvPSO: MTLComputePipelineState
     private let routerGemvSpecializedPSO: MTLComputePipelineState
@@ -78,6 +79,18 @@ final class MoE {
     private let phase2SlotmapWidePSO: MTLComputePipelineState
     private let phase2SlotmapWideSpecializedPSO: MTLComputePipelineState
     private let residualAddGuardedPSO: MTLComputePipelineState
+    private let slotmapDedupBatchPSO: MTLComputePipelineState
+    private let phase1SlotmapMultiXPSO: MTLComputePipelineState
+    private let phase1SlotmapMultiXSpecializedPSO: MTLComputePipelineState
+    private let phase2SlotmapMultiXPSO: MTLComputePipelineState
+    private let phase2SlotmapMultiXSpecializedPSO: MTLComputePipelineState
+    private let phase2ReduceResidualBatchPSO: MTLComputePipelineState
+    static let slotmapScheduleMaxBatchT = 8
+    static let slotmapScheduleMaxEntries = 64
+    static let slotmapScheduleStride = 2048 // 64-byte aligned; MoESlotMapUniqueSchedule is 1028 B
+    private let slotmapScheduleBuf: MTLBuffer
+    let slotmapBatchEnabled: Bool
+    private var slotmapBatchPartialsBuf: MTLBuffer?
     private let phase1SubsetU16PSO: MTLComputePipelineState
     private let phase1SubsetU16SpecializedPSO: MTLComputePipelineState
     private let phase2ReduceK8PSO: MTLComputePipelineState
@@ -107,6 +120,7 @@ final class MoE {
         self.realDecodeF = specializedF
         self.realDecodeTopK = specializedTopK
         self.realDecodeNumExperts = specializedNumExperts
+        self.device = context.device
         var activationConstants: [MetalFunctionConstant] = siluActivation
             ? [MetalFunctionConstant(index: 4, value: .bool(true))]
             : []
@@ -179,6 +193,17 @@ final class MoE {
         self.phase2SlotmapWideSpecializedPSO = try context.pipeline(
             "moe_phase2_down_reduce_slotmap_wide", constants: moeConstants)
         self.residualAddGuardedPSO = try context.pipeline("residual_add_fp16_guarded")
+        self.slotmapDedupBatchPSO = try context.pipeline("moe_slotmap_dedup_batch")
+        self.phase1SlotmapMultiXPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_slotmap_multix", constants: activationConstants)
+        self.phase1SlotmapMultiXSpecializedPSO = try context.pipeline(
+            "moe_phase1_gate_up_act_slotmap_multix", constants: moeConstants)
+        self.phase2SlotmapMultiXPSO = try context.pipeline(
+            "moe_phase2_down_slotmap_multix")
+        self.phase2SlotmapMultiXSpecializedPSO = try context.pipeline(
+            "moe_phase2_down_slotmap_multix", constants: moeConstants)
+        self.phase2ReduceResidualBatchPSO = try context.pipeline(
+            "moe_phase2_reduce_residual_slotmap_batch")
         self.phase1SubsetU16PSO = try context.pipeline(
             "moe_phase1_gate_up_act_subset_u16load", constants: activationConstants)
         self.phase1SubsetU16SpecializedPSO = try context.pipeline(
@@ -209,10 +234,16 @@ final class MoE {
         self.routedArgEncoder = phase1Function.makeArgumentEncoder(bufferIndex: 0)
         guard let reusable = context.device.makeBuffer(
             length: routedArgEncoder.encodedLength,
-            options: .storageModeShared) else {
+            options: .storageModeShared),
+              let scheduleBuf = context.device.makeBuffer(
+                length: 2048,
+                options: .storageModePrivate) else {
             throw MetalError.noDevice
         }
+        scheduleBuf.label = "moe.slotmap.schedule"
         self.reusableRoutedArgBuffer = reusable
+        self.slotmapScheduleBuf = scheduleBuf
+        self.slotmapBatchEnabled = ProcessInfo.processInfo.environment["MFERENCE_SLOTMAP_BATCH"] != "0"
     }
 
     func encodeRouterGemma4(commandBuffer: MTLCommandBuffer,
@@ -704,6 +735,408 @@ final class MoE {
             MTLSize(width: (Int(d) + 255) / 256, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
         encoder.endEncoding()
+    }
+
+    /// Batched S3 guarded routed FFN for MTP verify / accept passes (`queryCount`
+    /// contiguous tokens, `<= 8` tokens and `topK <= 8`). Deduplicates shared
+    /// expert slot offsets on GPU so phase-1 and phase-2 read each shared expert
+    /// weight matrix once per round while preserving bit-identical rank-order
+    /// arithmetic to looping `encodeSlotMapGuardedFFN` over `0..<queryCount`.
+    func encodeSlotMapGuardedFFNBatch(commandBuffer: MTLCommandBuffer,
+                                      slab: MTLBuffer,
+                                      slabOffset: Int = 0,
+                                      slotOffsets: MTLBuffer,
+                                      slotOffsetsOffset: Int = 0,
+                                      allHit: MTLBuffer,
+                                      allHitOffset: Int = 0,
+                                      routedOffsets: MoEExpertOffsets,
+                                      x: MTLBuffer,
+                                      xOffset: Int = 0,
+                                      acts: MTLBuffer,
+                                      actsOffset: Int = 0,
+                                      routingWeights: MTLBuffer,
+                                      routingWeightsOffset: Int = 0,
+                                      residual: MTLBuffer,
+                                      residualOffset: Int = 0,
+                                      y: MTLBuffer,
+                                      yOffset: Int = 0,
+                                      hidden: MTLBuffer,
+                                      hiddenOffset: Int = 0,
+                                      d: UInt32,
+                                      f: UInt32,
+                                      topK: UInt32,
+                                      queryCount: Int,
+                                      maxUniqueExperts: Int? = nil) {
+        guard queryCount > 0 else { return }
+        if !slotmapBatchEnabled || queryCount == 1 || queryCount > 8 || topK > 8 {
+            let halfBytes = MemoryLayout<Float16>.stride
+            let u32Bytes = MemoryLayout<UInt32>.stride
+            let routeCount = Int(topK)
+            for r in 0..<queryCount {
+                encodeSlotMapGuardedFFN(
+                    commandBuffer: commandBuffer,
+                    slab: slab,
+                    slabOffset: slabOffset,
+                    slotOffsets: slotOffsets,
+                    slotOffsetsOffset: slotOffsetsOffset + r * routeCount * u32Bytes,
+                    allHit: allHit,
+                    allHitOffset: allHitOffset,
+                    routedOffsets: routedOffsets,
+                    x: x,
+                    xOffset: xOffset + r * Int(d) * halfBytes,
+                    acts: acts,
+                    actsOffset: actsOffset + r * routeCount * Int(f) * halfBytes,
+                    routingWeights: routingWeights,
+                    routingWeightsOffset: routingWeightsOffset + r * routeCount * halfBytes,
+                    residual: residual,
+                    residualOffset: residualOffset + r * Int(d) * halfBytes,
+                    y: y,
+                    yOffset: yOffset + r * Int(d) * halfBytes,
+                    hidden: hidden,
+                    hiddenOffset: hiddenOffset + r * Int(d) * halfBytes,
+                    d: d,
+                    f: f,
+                    topK: topK)
+            }
+            return
+        }
+
+        precondition(Self.routedComputeWidths.contains(topK))
+        var k = topK
+        var tCount = UInt32(queryCount)
+        let partials = ensureSlotmapBatchPartialsBuf(queryCount: queryCount, topK: Int(topK), d: Int(d))
+        let maxHeight = max(1, min(queryCount * Int(topK), maxUniqueExperts ?? (queryCount * Int(topK))))
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            preconditionFailure("slot-map guarded FFN batch: no compute encoder")
+        }
+        encoder.setComputePipelineState(slotmapDedupBatchPSO)
+        encoder.setBuffer(slotOffsets, offset: slotOffsetsOffset, index: 0)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 1)
+        encoder.setBuffer(slotmapScheduleBuf, offset: 0, index: 2)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&tCount, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1))
+
+        encoder.memoryBarrier(scope: .buffers)
+
+        encodeSlotMapMultiXPhase1And2Stages(
+            encoder: encoder,
+            slab: slab, slabOffset: slabOffset,
+            schedule: slotmapScheduleBuf, scheduleOffset: 0,
+            uniqueCount: maxHeight,
+            allHit: allHit, allHitOffset: allHitOffset,
+            routedOffsets: routedOffsets,
+            x: x, xOffset: xOffset,
+            acts: acts, actsOffset: actsOffset,
+            routingWeights: routingWeights, routingWeightsOffset: routingWeightsOffset,
+            partials: partials,
+            d: d, f: f, topK: topK)
+
+        encoder.memoryBarrier(scope: .buffers)
+
+        encodeSlotMapReduceResidualStage(
+            encoder: encoder,
+            partials: partials,
+            residual: residual, residualOffset: residualOffset,
+            y: y, yOffset: yOffset,
+            hidden: hidden, hiddenOffset: hiddenOffset,
+            allHit: allHit, allHitOffset: allHitOffset,
+            d: d, topK: topK, queryCount: queryCount)
+        encoder.endEncoding()
+    }
+
+    /// Writes `hitSchedule` and `missSchedule` (`MoESlotMapUniqueSchedule` layout
+    /// in `moe.metal`) in exact rank/token order so Phase 1 and Phase 2 for cached
+    /// experts can execute ahead of async SSD reads while misses are fetched.
+    static func buildSplitSlotMapSchedules(
+        queryCount: Int,
+        topK: Int,
+        hitSchedulePtr: UnsafeMutableRawPointer,
+        missSchedulePtr: UnsafeMutableRawPointer,
+        routeEntry: (_ r: Int, _ k: Int) -> (slotOffset: UInt32, isMiss: Bool)
+    ) -> (hitUnique: Int, missUnique: Int) {
+        precondition(queryCount > 0 && queryCount <= slotmapScheduleMaxBatchT)
+        precondition(queryCount * topK <= slotmapScheduleMaxEntries)
+
+        // Exact byte offsets of MoESlotMapUniqueSchedule in moe.metal:
+        //   0:   uint unique_count
+        //   4:   uint slot_offset[64]   (256 bytes)
+        //   260: uint token_mask[64]    (256 bytes)
+        //   516: uint8_t k_slot[64 * 8] (512 bytes)
+        let hitSlots = hitSchedulePtr.advanced(by: 4).assumingMemoryBound(to: UInt32.self)
+        let hitMasks = hitSchedulePtr.advanced(by: 260).assumingMemoryBound(to: UInt32.self)
+        let hitKSlots = hitSchedulePtr.advanced(by: 516).assumingMemoryBound(to: UInt8.self)
+
+        let missSlots = missSchedulePtr.advanced(by: 4).assumingMemoryBound(to: UInt32.self)
+        let missMasks = missSchedulePtr.advanced(by: 260).assumingMemoryBound(to: UInt32.self)
+        let missKSlots = missSchedulePtr.advanced(by: 516).assumingMemoryBound(to: UInt8.self)
+
+        var hitUnique = 0
+        var missUnique = 0
+
+        @inline(__always)
+        func appendRoute(
+            slots: UnsafeMutablePointer<UInt32>,
+            masks: UnsafeMutablePointer<UInt32>,
+            kSlots: UnsafeMutablePointer<UInt8>,
+            unique: inout Int,
+            slotOffset: UInt32,
+            r: Int,
+            k: Int
+        ) {
+            let rBit = UInt32(1) << UInt32(r)
+            for u in 0..<unique {
+                if slots[u] == slotOffset && (masks[u] & rBit) == 0 {
+                    masks[u] |= rBit
+                    kSlots[u * slotmapScheduleMaxBatchT + r] = UInt8(k)
+                    return
+                }
+            }
+            if unique < slotmapScheduleMaxEntries {
+                slots[unique] = slotOffset
+                masks[unique] = rBit
+                kSlots[unique * slotmapScheduleMaxBatchT + r] = UInt8(k)
+                unique += 1
+            }
+        }
+
+        for r in 0..<queryCount {
+            for k in 0..<topK {
+                let entry = routeEntry(r, k)
+                if entry.isMiss {
+                    appendRoute(slots: missSlots, masks: missMasks, kSlots: missKSlots,
+                                unique: &missUnique, slotOffset: entry.slotOffset, r: r, k: k)
+                } else {
+                    appendRoute(slots: hitSlots, masks: hitMasks, kSlots: hitKSlots,
+                                unique: &hitUnique, slotOffset: entry.slotOffset, r: r, k: k)
+                }
+            }
+        }
+
+        hitSchedulePtr.storeBytes(of: UInt32(hitUnique), as: UInt32.self)
+        missSchedulePtr.storeBytes(of: UInt32(missUnique), as: UInt32.self)
+        return (hitUnique, missUnique)
+    }
+
+    private func encodeSlotMapMultiXPhase1And2Stages(
+        encoder: MTLComputeCommandEncoder,
+        slab: MTLBuffer,
+        slabOffset: Int,
+        schedule: MTLBuffer,
+        scheduleOffset: Int,
+        uniqueCount: Int,
+        allHit: MTLBuffer,
+        allHitOffset: Int,
+        routedOffsets: MoEExpertOffsets,
+        x: MTLBuffer,
+        xOffset: Int,
+        acts: MTLBuffer,
+        actsOffset: Int,
+        routingWeights: MTLBuffer,
+        routingWeightsOffset: Int,
+        partials: MTLBuffer,
+        d: UInt32,
+        f: UInt32,
+        topK: UInt32
+    ) {
+        var offsets = routedOffsets
+        var dimension = d
+        var intermediate = f
+        var k = topK
+        let specialized = useRealDecodeConstants(d: d, f: f, topK: topK)
+
+        encoder.useResource(slab, usage: .read)
+        encoder.setComputePipelineState(
+            specialized ? phase1SlotmapMultiXSpecializedPSO : phase1SlotmapMultiXPSO)
+        encoder.setBuffer(slab, offset: slabOffset, index: 0)
+        encoder.setBuffer(schedule, offset: scheduleOffset, index: 1)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+        encoder.setBuffer(x, offset: xOffset, index: 4)
+        encoder.setBuffer(acts, offset: actsOffset, index: 5)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Int(f) + 7) / 8, height: uniqueCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+
+        encoder.memoryBarrier(scope: .buffers)
+
+        encoder.setComputePipelineState(
+            specialized ? phase2SlotmapMultiXSpecializedPSO : phase2SlotmapMultiXPSO)
+        encoder.setBuffer(slab, offset: slabOffset, index: 0)
+        encoder.setBuffer(schedule, offset: scheduleOffset, index: 1)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 2)
+        encoder.setBytes(&offsets, length: MemoryLayout<MoEExpertOffsets>.stride, index: 3)
+        encoder.setBuffer(acts, offset: actsOffset, index: 4)
+        encoder.setBuffer(routingWeights, offset: routingWeightsOffset, index: 5)
+        encoder.setBuffer(partials, offset: 0, index: 6)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&intermediate, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Int(d) + 7) / 8, height: uniqueCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// Runs Phase 1 and Phase 2 for the pre-built subset of cached experts
+    /// (`hitSchedule`), overlapping with background SSD reads for misses.
+    func encodeSlotMapScheduledPhase1And2(
+        commandBuffer: MTLCommandBuffer,
+        slab: MTLBuffer,
+        slabOffset: Int = 0,
+        schedule: MTLBuffer,
+        scheduleOffset: Int = 0,
+        uniqueCount: Int,
+        allHit: MTLBuffer,
+        allHitOffset: Int = 0,
+        routedOffsets: MoEExpertOffsets,
+        x: MTLBuffer,
+        xOffset: Int = 0,
+        acts: MTLBuffer,
+        actsOffset: Int = 0,
+        routingWeights: MTLBuffer,
+        routingWeightsOffset: Int = 0,
+        d: UInt32,
+        f: UInt32,
+        topK: UInt32,
+        queryCount: Int
+    ) {
+        guard uniqueCount > 0,
+              queryCount > 0,
+              queryCount <= Self.slotmapScheduleMaxBatchT,
+              topK <= 8 else { return }
+        precondition(Self.routedComputeWidths.contains(topK))
+        let partials = ensureSlotmapBatchPartialsBuf(queryCount: queryCount, topK: Int(topK), d: Int(d))
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            preconditionFailure("slot-map scheduled phase1+2: no compute encoder")
+        }
+        encodeSlotMapMultiXPhase1And2Stages(
+            encoder: encoder,
+            slab: slab, slabOffset: slabOffset,
+            schedule: schedule, scheduleOffset: scheduleOffset,
+            uniqueCount: uniqueCount,
+            allHit: allHit, allHitOffset: allHitOffset,
+            routedOffsets: routedOffsets,
+            x: x, xOffset: xOffset,
+            acts: acts, actsOffset: actsOffset,
+            routingWeights: routingWeights, routingWeightsOffset: routingWeightsOffset,
+            partials: partials,
+            d: d, f: f, topK: topK)
+        encoder.endEncoding()
+    }
+
+    private func encodeSlotMapReduceResidualStage(
+        encoder: MTLComputeCommandEncoder,
+        partials: MTLBuffer,
+        residual: MTLBuffer,
+        residualOffset: Int,
+        y: MTLBuffer,
+        yOffset: Int,
+        hidden: MTLBuffer,
+        hiddenOffset: Int,
+        allHit: MTLBuffer,
+        allHitOffset: Int,
+        d: UInt32,
+        topK: UInt32,
+        queryCount: Int
+    ) {
+        var dimension = d
+        var k = topK
+        var tCount = UInt32(queryCount)
+        encoder.setComputePipelineState(phase2ReduceResidualBatchPSO)
+        encoder.setBuffer(partials, offset: 0, index: 0)
+        encoder.setBuffer(residual, offset: residualOffset, index: 1)
+        encoder.setBuffer(y, offset: yOffset, index: 2)
+        encoder.setBuffer(hidden, offset: hiddenOffset, index: 3)
+        encoder.setBuffer(allHit, offset: allHitOffset, index: 4)
+        encoder.setBytes(&dimension, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&k, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&tCount, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (Int(d) + 255) / 256, height: queryCount, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+    }
+
+    /// Runs Phase 1 and Phase 2 for `schedule` (when `uniqueCount > 0`) and
+    /// then performs the full-rank (`0..<topK`) residual reduction into `y` and `hidden`.
+    func encodeSlotMapScheduledMissAndReduce(
+        commandBuffer: MTLCommandBuffer,
+        slab: MTLBuffer,
+        slabOffset: Int = 0,
+        schedule: MTLBuffer,
+        scheduleOffset: Int = 0,
+        uniqueCount: Int,
+        allHit: MTLBuffer,
+        allHitOffset: Int = 0,
+        routedOffsets: MoEExpertOffsets,
+        x: MTLBuffer,
+        xOffset: Int = 0,
+        acts: MTLBuffer,
+        actsOffset: Int = 0,
+        routingWeights: MTLBuffer,
+        routingWeightsOffset: Int = 0,
+        residual: MTLBuffer,
+        residualOffset: Int = 0,
+        y: MTLBuffer,
+        yOffset: Int = 0,
+        hidden: MTLBuffer,
+        hiddenOffset: Int = 0,
+        d: UInt32,
+        f: UInt32,
+        topK: UInt32,
+        queryCount: Int
+    ) {
+        guard queryCount > 0,
+              queryCount <= Self.slotmapScheduleMaxBatchT,
+              topK <= 8 else { return }
+        precondition(Self.routedComputeWidths.contains(topK))
+        let partials = ensureSlotmapBatchPartialsBuf(queryCount: queryCount, topK: Int(topK), d: Int(d))
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            preconditionFailure("slot-map scheduled miss+reduce: no compute encoder")
+        }
+        if uniqueCount > 0 {
+            encodeSlotMapMultiXPhase1And2Stages(
+                encoder: encoder,
+                slab: slab, slabOffset: slabOffset,
+                schedule: schedule, scheduleOffset: scheduleOffset,
+                uniqueCount: uniqueCount,
+                allHit: allHit, allHitOffset: allHitOffset,
+                routedOffsets: routedOffsets,
+                x: x, xOffset: xOffset,
+                acts: acts, actsOffset: actsOffset,
+                routingWeights: routingWeights, routingWeightsOffset: routingWeightsOffset,
+                partials: partials,
+                d: d, f: f, topK: topK)
+            encoder.memoryBarrier(scope: .buffers)
+        }
+        encodeSlotMapReduceResidualStage(
+            encoder: encoder,
+            partials: partials,
+            residual: residual, residualOffset: residualOffset,
+            y: y, yOffset: yOffset,
+            hidden: hidden, hiddenOffset: hiddenOffset,
+            allHit: allHit, allHitOffset: allHitOffset,
+            d: d, topK: topK, queryCount: queryCount)
+        encoder.endEncoding()
+    }
+
+    private func ensureSlotmapBatchPartialsBuf(queryCount: Int, topK: Int, d: Int) -> MTLBuffer {
+        let allocRoutes = max(queryCount, 4) * topK
+        let needed = allocRoutes * d * MemoryLayout<Float>.stride
+        if let existing = slotmapBatchPartialsBuf, existing.length >= needed {
+            return existing
+        }
+        guard let buf = device.makeBuffer(length: needed, options: .storageModePrivate) else {
+            preconditionFailure("slot-map batch partials allocation failed (\(needed) bytes)")
+        }
+        buf.label = "moe.slotmap.batchPartials"
+        slotmapBatchPartialsBuf = buf
+        return buf
     }
 
     func encodeRoutedPersistentPhase2Reduce(

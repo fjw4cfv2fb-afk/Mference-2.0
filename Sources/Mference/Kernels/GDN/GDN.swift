@@ -14,10 +14,12 @@ final class GDN {
     private let convDecodePSO: MTLComputePipelineState
     private let convPrefillPSO: MTLComputePipelineState
     private let convTailUpdatePSO: MTLComputePipelineState
+    private let convTailVerifyPSO: MTLComputePipelineState?
     private let qkNormPSO: MTLComputePipelineState
     private let deltaDecodePSO: MTLComputePipelineState
     private let qwenDeltaDecodePSO: MTLComputePipelineState?
     private let qwenDeltaGatedDecodePSO: MTLComputePipelineState?
+    private let qwenDeltaGatedVerifyPSOs: [Int: MTLComputePipelineState]
     private let deltaPrefillPSO: MTLComputePipelineState
     private let qwenDeltaPrefillPSO: MTLComputePipelineState?
     private let gatedNormPSO: MTLComputePipelineState
@@ -64,6 +66,7 @@ final class GDN {
         self.convDecodePSO = try context.pipeline("gdn_conv_mix_decode")
         self.convPrefillPSO = try context.pipeline("gdn_conv_mix_prefill")
         self.convTailUpdatePSO = try context.pipeline("gdn_conv_tail_update")
+        self.convTailVerifyPSO = try? context.pipeline("gdn_conv_tail_verify")
         self.qkNormPSO = try context.pipeline("gdn_qk_norm")
         self.deltaDecodePSO = try context.pipeline("gdn_delta_step_decode")
         let isQwenGeometry = config.numKHeads == 16
@@ -87,6 +90,20 @@ final class GDN {
                 maxTotalThreadsPerThreadgroup: 256)
         } else {
             self.qwenDeltaGatedDecodePSO = nil
+        }
+        if useQwenDecodeSpecialization && isQwenGeometry {
+            var verifyMap: [Int: MTLComputePipelineState] = [:]
+            for t in 2...4 {
+                if let pso = try? context.pipeline(
+                    "gdn_delta_gated_verify_qwen_t\(t)",
+                    constants: outputGate.constants,
+                    maxTotalThreadsPerThreadgroup: 256) {
+                    verifyMap[t] = pso
+                }
+            }
+            self.qwenDeltaGatedVerifyPSOs = verifyMap
+        } else {
+            self.qwenDeltaGatedVerifyPSOs = [:]
         }
         self.deltaPrefillPSO = try context.pipeline("gdn_delta_step_prefill")
         self.qwenDeltaPrefillPSO = useQwenDecodeSpecialization && isQwenGeometry
@@ -341,6 +358,79 @@ final class GDN {
         encoder.setBuffer(weight, offset: weightOffset, index: 7)
         encoder.setBuffer(out, offset: outOffset, index: 8)
         setHeadDims(encoder, startingAt: 9)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: config.numVHeads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+        return true
+    }
+
+    /// Fused multi-token Qwen verify pass (`rows` in `2...4`): updates conv `tail`
+    /// while capturing `0..<rows-1` tail snapshots into `tailArena`, then runs
+    /// the register-resident multi-step recurrence + gated RMS norm while
+    /// writing intermediate states directly into `stateArena` and final state
+    /// to `state`. Bit-identical (0 ULP) to sequential decode + snapshots.
+    @discardableResult
+    func encodeVerifyQwen(commandBuffer: MTLCommandBuffer,
+                          tail: MTLBuffer,
+                          qkvRows: MTLBuffer, qkvRowsOffset: Int = 0,
+                          tailArena: MTLBuffer, tailArenaOffset: Int,
+                          tailSlotStrideHalfs: Int,
+                          convOut: MTLBuffer, convOutOffset: Int = 0,
+                          aProj: MTLBuffer, aProjOffset: Int = 0,
+                          bProj: MTLBuffer, bProjOffset: Int = 0,
+                          aLog: MTLBuffer, aLogOffset: Int,
+                          dtBias: MTLBuffer, dtBiasOffset: Int,
+                          state: MTLBuffer,
+                          stateArena: MTLBuffer, stateArenaOffset: Int,
+                          stateSlotStrideFloats: Int,
+                          z: MTLBuffer, zOffset: Int = 0,
+                          weight: MTLBuffer, weightOffset: Int,
+                          out: MTLBuffer, outOffset: Int = 0,
+                          rows: Int) -> Bool {
+        guard (2...4).contains(rows),
+              config.convKernelSize >= 2 && config.convKernelSize <= 9,
+              let tailVerifyPSO = convTailVerifyPSO,
+              let deltaVerifyPSO = qwenDeltaGatedVerifyPSOs[rows] else {
+            return false
+        }
+        guard let tailEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            return false
+        }
+        tailEncoder.setComputePipelineState(tailVerifyPSO)
+        tailEncoder.setBuffer(tail, offset: 0, index: 0)
+        tailEncoder.setBuffer(qkvRows, offset: qkvRowsOffset, index: 1)
+        tailEncoder.setBuffer(tailArena, offset: tailArenaOffset, index: 2)
+        var channels = UInt32(config.qkvDim)
+        var taps = UInt32(config.convKernelSize)
+        var rowCount = UInt32(rows)
+        var tailStride = UInt32(tailSlotStrideHalfs)
+        tailEncoder.setBytes(&channels, length: MemoryLayout<UInt32>.size, index: 3)
+        tailEncoder.setBytes(&taps, length: MemoryLayout<UInt32>.size, index: 4)
+        tailEncoder.setBytes(&rowCount, length: MemoryLayout<UInt32>.size, index: 5)
+        tailEncoder.setBytes(&tailStride, length: MemoryLayout<UInt32>.size, index: 6)
+        dispatch1D(tailEncoder, pipeline: tailVerifyPSO, threads: config.qkvDim)
+        tailEncoder.endEncoding()
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            return false
+        }
+        encoder.setComputePipelineState(deltaVerifyPSO)
+        encoder.setBuffer(convOut, offset: convOutOffset, index: 0)
+        encoder.setBuffer(aProj, offset: aProjOffset, index: 1)
+        encoder.setBuffer(bProj, offset: bProjOffset, index: 2)
+        encoder.setBuffer(aLog, offset: aLogOffset, index: 3)
+        encoder.setBuffer(dtBias, offset: dtBiasOffset, index: 4)
+        encoder.setBuffer(state, offset: 0, index: 5)
+        encoder.setBuffer(stateArena, offset: stateArenaOffset, index: 6)
+        encoder.setBuffer(z, offset: zOffset, index: 7)
+        encoder.setBuffer(weight, offset: weightOffset, index: 8)
+        encoder.setBuffer(out, offset: outOffset, index: 9)
+        setHeadDims(encoder, startingAt: 10)
+        var rowStride = UInt32(config.qkvDim)
+        var stateStride = UInt32(stateSlotStrideFloats)
+        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.size, index: 14)
+        encoder.setBytes(&stateStride, length: MemoryLayout<UInt32>.size, index: 15)
         encoder.dispatchThreadgroups(
             MTLSize(width: config.numVHeads, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))

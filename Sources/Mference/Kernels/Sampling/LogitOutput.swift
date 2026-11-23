@@ -11,25 +11,70 @@ import Metal
 /// kernel signature instead of being hardcoded so that downstream callers
 /// (and tests) can disable it by passing a very large number.
 final class LogitSoftcapSoftmax {
+    private static let parallelGroups = 64
+
     private let pso: MTLComputePipelineState
+    private let pass1PSO: MTLComputePipelineState
+    private let pass2PSO: MTLComputePipelineState
+    private let partialM: MTLBuffer
+    private let partialD: MTLBuffer
 
     init(context: MetalContext) throws {
         self.pso = try context.pipeline("logit_softcap_softmax")
+        self.pass1PSO = try context.pipeline("logit_softcap_softmax_pass1")
+        self.pass2PSO = try context.pipeline("logit_softcap_softmax_pass2")
+        let bytes = Self.parallelGroups * MemoryLayout<Float>.stride
+        guard let pm = context.device.makeBuffer(length: bytes, options: .storageModePrivate),
+              let pd = context.device.makeBuffer(length: bytes, options: .storageModePrivate) else {
+            throw MetalError.noDevice
+        }
+        pm.label = "logit.softmax.partialM"
+        pd.label = "logit.softmax.partialD"
+        self.partialM = pm
+        self.partialD = pd
     }
 
     /// Encodes the kernel onto `commandBuffer`. `logits` and `probs` are FP16
     /// buffers of length `v`. Gemma 4 uses `softcap=30.0`.
     func encode(commandBuffer: MTLCommandBuffer,
                        logits: MTLBuffer,
+                       logitsOffset: Int = 0,
                        probs: MTLBuffer,
                        v: UInt32,
                        softcap: Float = 30.0) {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
-        enc.setComputePipelineState(pso)
-        enc.setBuffer(logits, offset: 0, index: 0)
-        enc.setBuffer(probs,  offset: 0, index: 1)
         var vVar       = v
         var softcapVar = softcap
+
+        if v >= 4096 {
+            let tgSize = MTLSize(width: 256, height: 1, depth: 1)
+            let groups = MTLSize(width: Self.parallelGroups, height: 1, depth: 1)
+
+            enc.setComputePipelineState(pass1PSO)
+            enc.setBuffer(logits, offset: logitsOffset, index: 0)
+            enc.setBuffer(partialM, offset: 0, index: 1)
+            enc.setBuffer(partialD, offset: 0, index: 2)
+            enc.setBytes(&vVar,       length: MemoryLayout<UInt32>.size, index: 3)
+            enc.setBytes(&softcapVar, length: MemoryLayout<Float>.size,  index: 4)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tgSize)
+
+            enc.memoryBarrier(scope: .buffers)
+
+            enc.setComputePipelineState(pass2PSO)
+            enc.setBuffer(logits, offset: logitsOffset, index: 0)
+            enc.setBuffer(probs,  offset: 0, index: 1)
+            enc.setBuffer(partialM, offset: 0, index: 2)
+            enc.setBuffer(partialD, offset: 0, index: 3)
+            enc.setBytes(&vVar,       length: MemoryLayout<UInt32>.size, index: 4)
+            enc.setBytes(&softcapVar, length: MemoryLayout<Float>.size,  index: 5)
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tgSize)
+            enc.endEncoding()
+            return
+        }
+
+        enc.setComputePipelineState(pso)
+        enc.setBuffer(logits, offset: logitsOffset, index: 0)
+        enc.setBuffer(probs,  offset: 0, index: 1)
         enc.setBytes(&vVar,       length: MemoryLayout<UInt32>.size, index: 2)
         enc.setBytes(&softcapVar, length: MemoryLayout<Float>.size,  index: 3)
 
@@ -63,6 +108,7 @@ final class Sample {
     func encode(commandBuffer: MTLCommandBuffer,
                        probs: MTLBuffer,
                        outToken: MTLBuffer,
+                       outTokenOffset: Int = 0,
                        v: UInt32,
                        temperature: Float = 1.0,
                        topK: UInt32 = 0,
@@ -72,7 +118,7 @@ final class Sample {
         guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
         enc.setComputePipelineState(pso)
         enc.setBuffer(probs,    offset: 0, index: 0)
-        enc.setBuffer(outToken, offset: 0, index: 1)
+        enc.setBuffer(outToken, offset: outTokenOffset, index: 1)
         var vVar    = v
         var tVar    = temperature
         var kVar    = topK
@@ -162,7 +208,9 @@ final class SampleTopK64 {
     public func encode(commandBuffer: MTLCommandBuffer,
                        probs: MTLBuffer,
                        outToken: MTLBuffer,
+                       outTokenOffset: Int = 0,
                        temperature: Float,
+                       topK: UInt32 = 64,
                        topP: Float,
                        seed: UInt64) {
         let threads = MTLSize(width: 256, height: 1, depth: 1)
@@ -196,15 +244,17 @@ final class SampleTopK64 {
             enc.setComputePipelineState(finalPSO)
             enc.setBuffer(stage2Values, offset: 0, index: 0)
             enc.setBuffer(stage2Indices, offset: 0, index: 1)
-            enc.setBuffer(outToken, offset: 0, index: 2)
+            enc.setBuffer(outToken, offset: outTokenOffset, index: 2)
             var count = UInt32(stage2Count)
             var temp = temperature
             var p = topP
             var rngSeed = seed
+            var k = min(max(topK, 1), 64)
             enc.setBytes(&count, length: MemoryLayout<UInt32>.size, index: 3)
             enc.setBytes(&temp, length: MemoryLayout<Float>.size, index: 4)
             enc.setBytes(&p, length: MemoryLayout<Float>.size, index: 5)
             enc.setBytes(&rngSeed, length: MemoryLayout<UInt64>.size, index: 6)
+            enc.setBytes(&k, length: MemoryLayout<UInt32>.size, index: 7)
             enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                      threadsPerThreadgroup: threads)
             enc.endEncoding()

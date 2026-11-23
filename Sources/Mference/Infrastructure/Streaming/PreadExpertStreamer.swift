@@ -92,6 +92,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
     private var speculativeInFlight: [Bool]
     private var useClock = 0
     private let cacheLock = NSLock()
+    private enum NoCachePolicy { case auto, alwaysOn, alwaysOff }
+    private let noCachePolicy: NoCachePolicy
+    private let noCacheLock = NSLock()
+    private var currentNoCache: Bool
 
     public init(layout: StreamLayout,
                 device: MTLDevice,
@@ -107,8 +111,17 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         guard openedFD >= 0 else {
             throw StreamerError.openFailed(path: layout.path, errno: errno)
         }
-        if ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"] == "1" {
+        let noCacheEnv = ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"]
+        if noCacheEnv == "1" {
+            self.noCachePolicy = .alwaysOn
             _ = fcntl(openedFD, F_NOCACHE, 1)
+            self.currentNoCache = true
+        } else if noCacheEnv == "0" {
+            self.noCachePolicy = .alwaysOff
+            self.currentNoCache = false
+        } else {
+            self.noCachePolicy = .auto
+            self.currentNoCache = false
         }
         self.fd = openedFD
 
@@ -216,7 +229,6 @@ public final class PreadExpertStreamer: @unchecked Sendable {
                                      avoidingSlots rawAvoidingSlots: Set<Int>) -> ExpertCachePlan? {
         precondition(experts.count <= slotCount,
                      "expert cache needs at least \(experts.count) slots")
-        let avoidingSlots = Set(rawAvoidingSlots.filter { $0 >= 0 && $0 < slotCount })
 
         cacheLock.lock()
         defer { cacheLock.unlock() }
@@ -229,7 +241,8 @@ public final class PreadExpertStreamer: @unchecked Sendable {
             let expert = experts[index]
             if expert >= 0 && expert < layout.expertsPerLayer {
                 let slot = Int(slotOfPointer[expert])
-                if slot >= 0 && slot < slotCount && !reserved[slot] {
+                if slot < 0 { continue }
+                if slot < slotCount && !reserved[slot] {
                     assignedSlots[index] = slot
                     reserved[slot] = true
                     continue
@@ -242,8 +255,11 @@ public final class PreadExpertStreamer: @unchecked Sendable {
                 break
             }
         }
-        for slot in avoidingSlots where !reserved[slot] {
-            reserved[slot] = true
+        if !rawAvoidingSlots.isEmpty {
+            for slot in rawAvoidingSlots
+                where slot >= 0 && slot < slotCount && !reserved[slot] {
+                reserved[slot] = true
+            }
         }
         // A slot a speculative read is still filling must not be handed to the
         // real plan: its buffer is being written from another thread. Callers
@@ -298,12 +314,10 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         guard !plan.misses.isEmpty else {
             return expertCachePlanBuffers(plan)
         }
-        // Large prefill tiles (>8 experts) sweep nearly the entire expert file
+        // Large prefill tiles (>24 experts) sweep nearly the entire expert file
         // and would thrash the macOS Unified Buffer Cache on 16 GB hosts; decode
-        // plans (<=8 experts) benefit from OS page-cache retention.
-        if ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"] != "0" {
-            _ = fcntl(fd, F_NOCACHE, plan.experts.count > 8 ? 1 : 0)
-        }
+        // and MTP verify plans (<=24 experts) benefit from OS page-cache retention.
+        setNoCacheIfNeeded(plan.experts.count > 24)
 
         let missFileOffsets = try plan.misses.map { index in
             try fileOffsetForExpert(plan.experts[index])
@@ -408,6 +422,16 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         return reservation
     }
 
+    private func setNoCacheIfNeeded(_ desired: Bool) {
+        guard noCachePolicy == .auto else { return }
+        noCacheLock.lock()
+        if currentNoCache != desired {
+            _ = fcntl(fd, F_NOCACHE, desired ? 1 : 0)
+            currentNoCache = desired
+        }
+        noCacheLock.unlock()
+    }
+
     /// Runs a reservation from `reserveSpeculativeSlots` and publishes the
     /// results. Slots whose read failed stay empty rather than claiming to hold
     /// an expert; the in-flight mark is always cleared. Returns the bytes read.
@@ -416,8 +440,23 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         _ reservation: [(expert: Int, slot: Int)]
     ) -> UInt64 {
         guard !reservation.isEmpty else { return 0 }
-        if ProcessInfo.processInfo.environment["MFERENCE_EXPERT_NOCACHE"] != "1" {
-            _ = fcntl(fd, F_NOCACHE, 0)
+        setNoCacheIfNeeded(false)
+        if reservation.count == 1 {
+            let entry = reservation[0]
+            var readOK = false
+            if let fileOffset = try? fileOffsetForExpert(entry.expert),
+               (try? readFull(into: slotPointers[entry.slot],
+                              fileOffset: fileOffset,
+                              count: Int(layout.expertStride))) != nil {
+                readOK = true
+            }
+            cacheLock.lock()
+            if readOK {
+                setSlotExpert(entry.slot, to: entry.expert)
+            }
+            speculativeInFlight[entry.slot] = false
+            cacheLock.unlock()
+            return readOK ? layout.expertStride : 0
         }
         let fileOffsets = reservation.map { entry in
             (try? fileOffsetForExpert(entry.expert)) ?? UInt64.max
@@ -425,6 +464,25 @@ public final class PreadExpertStreamer: @unchecked Sendable {
         let readable = reservation.indices.filter { fileOffsets[$0] != UInt64.max }
         let runs = Self.coalescedReadRuns(offsets: readable.map { fileOffsets[$0] },
                                           stride: layout.expertStride)
+        if runs.count == 1 {
+            let entries = runs[0].map { readable[$0] }
+            let destinations = entries.map { self.slotPointers[reservation[$0].slot] }
+            let readOK = (try? self.readScattered(
+                into: destinations,
+                fileOffset: fileOffsets[entries[0]],
+                strideBytes: Int(self.layout.expertStride))) != nil
+            cacheLock.lock()
+            if readOK {
+                for index in entries {
+                    setSlotExpert(reservation[index].slot, to: reservation[index].expert)
+                }
+            }
+            for entry in reservation {
+                speculativeInFlight[entry.slot] = false
+            }
+            cacheLock.unlock()
+            return readOK ? UInt64(entries.count) * layout.expertStride : 0
+        }
         let loadedLock = NSLock()
         nonisolated(unsafe) var loaded: [Int] = []
         DispatchQueue.concurrentPerform(iterations: runs.count) { runIndex in

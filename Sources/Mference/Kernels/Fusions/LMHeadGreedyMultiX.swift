@@ -11,6 +11,7 @@ final class LMHeadGreedyMultiX {
     private static let rowSummaryStride = 2
 
     private let rowGreedyByTokens: [MTLComputePipelineState] // index = T - 1
+    private let rowLogitsByTokens: [MTLComputePipelineState] // index = T - 1
     private let rowReducer: MTLComputePipelineState
     private let summariesBuffer: MTLBuffer
     private let maxVocab: Int
@@ -29,6 +30,23 @@ final class LMHeadGreedyMultiX {
             values.setConstantValue(&use, type: .bool, index: 48)
             let function = try library.makeFunction(
                 name: "lm_head_greedy_int4_rows_chunk_raw_multix",
+                constantValues: values)
+            let descriptor = MTLComputePipelineDescriptor()
+            descriptor.computeFunction = function
+            descriptor.maxTotalThreadsPerThreadgroup = 256
+            var reflection: MTLAutoreleasedComputePipelineReflection?
+            return try context.device.makeComputePipelineState(descriptor: descriptor,
+                                                               options: [],
+                                                               reflection: &reflection)
+        }
+        self.rowLogitsByTokens = try (1...Self.maxTokens).map { tokens in
+            let values = MTLFunctionConstantValues()
+            var t = UInt32(tokens)
+            var use = true
+            values.setConstantValue(&t, type: .uint, index: 47)
+            values.setConstantValue(&use, type: .bool, index: 48)
+            let function = try library.makeFunction(
+                name: "lm_head_logits_int4_rows_multix",
                 constantValues: values)
             let descriptor = MTLComputePipelineDescriptor()
             descriptor.computeFunction = function
@@ -102,6 +120,45 @@ final class LMHeadGreedyMultiX {
             encoder.dispatchThreadgroups(
                 MTLSize(width: tokens, height: 1, depth: 1),
                 threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+            encoder.endEncoding()
+        }
+    }
+
+    /// `xNormed` holds `tokens` rows of final-norm output, `[T, d]` FP16.
+    /// Writes `[T, vocab]` FP16 logits bit-identically to single-token `DequantInt4GEMV`.
+    func encodeLogits(commandBuffer: MTLCommandBuffer,
+                      xNormed: MTLBuffer, xNormedOffset: Int = 0,
+                      weights: MTLBuffer, weightsOffset: Int = 0,
+                      scales: MTLBuffer, scalesOffset: Int = 0,
+                      biases: MTLBuffer, biasesOffset: Int = 0,
+                      outLogits: MTLBuffer, outLogitsOffset: Int = 0,
+                      d: Int, vocab: Int, tokens: Int) {
+        precondition(vocab <= maxVocab, "vocab \(vocab) exceeds wrapper maxVocab \(maxVocab)")
+        precondition(d % Quantization.groupSize == 0,
+                     "d must be a multiple of \(Quantization.groupSize)")
+        precondition(tokens > 0 && tokens <= Self.maxTokens,
+                     "token count \(tokens) outside 1...\(Self.maxTokens)")
+        precondition(weightsOffset % 2 == 0,
+                     "lm_head multix needs a 2-aligned weightsOffset")
+        let rowGroups = (vocab + Self.rowsPerThreadgroup - 1) / Self.rowsPerThreadgroup
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.setComputePipelineState(rowLogitsByTokens[tokens - 1])
+            encoder.setBuffer(xNormed, offset: xNormedOffset, index: 0)
+            encoder.setBuffer(weights, offset: weightsOffset, index: 1)
+            encoder.setBuffer(scales, offset: scalesOffset, index: 2)
+            encoder.setBuffer(biases, offset: biasesOffset, index: 3)
+            encoder.setBuffer(outLogits, offset: outLogitsOffset, index: 4)
+            var dValue = UInt32(d)
+            var vocabValue = UInt32(vocab)
+            var tValue = UInt32(tokens)
+            encoder.setBytes(&dValue, length: MemoryLayout<UInt32>.size, index: 5)
+            encoder.setBytes(&vocabValue, length: MemoryLayout<UInt32>.size, index: 6)
+            encoder.setBytes(&tValue, length: MemoryLayout<UInt32>.size, index: 7)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: rowGroups, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32 * Self.rowsPerThreadgroup,
+                                               height: 1, depth: 1))
             encoder.endEncoding()
         }
     }

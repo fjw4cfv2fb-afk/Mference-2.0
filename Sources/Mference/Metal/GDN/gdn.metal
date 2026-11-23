@@ -881,3 +881,271 @@ kernel void gdn_state_snapshot(
     }
 }
 
+// ----------------------------------------------------------------------------
+// Fused multi-token GDN conv tail update + intermediate tail arena snapshots
+// for speculative verify passes (T >= 2). Bit-identical to T sequential calls
+// to `gdn_conv_tail_update(rows=1)` interleaved with `gdn_state_snapshot` for
+// steps 0 ..< T-1.
+// ----------------------------------------------------------------------------
+kernel void gdn_conv_tail_verify(
+    device half*       tail                [[buffer(0)]], // [K-1, C]
+    device const half* qkv                 [[buffer(1)]], // [T, C]
+    device half*       tailArena           [[buffer(2)]], // layer slot 0 base
+    constant uint&     channels            [[buffer(3)]],
+    constant uint&     taps                [[buffer(4)]],
+    constant uint&     rows                [[buffer(5)]],
+    constant uint&     tailSlotStrideHalfs [[buffer(6)]],
+    uint ch [[thread_position_in_grid]]
+) {
+    const uint C = channels;
+    const uint history = taps - 1u;
+    const uint T = rows;
+    if (ch >= C || history == 0u || history > 8u || T == 0u) return;
+
+    half old[8];
+    for (uint r = 0u; r < history; ++r) {
+        old[r] = tail[r * C + ch];
+    }
+
+    for (uint step = 0u; step < T; ++step) {
+        device half* dst = (step + 1u < T)
+            ? (tailArena + step * tailSlotStrideHalfs)
+            : tail;
+        for (uint r = 0u; r < history; ++r) {
+            const int src = int(step + 1u) + int(r) - int(history);
+            dst[r * C + ch] = (src >= 0)
+                ? qkv[uint(src) * C + ch]
+                : old[uint(int(history) + src)];
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Fused multi-token Qwen 3.6 GDN verify recurrence + gated RMS norm +
+// intermediate state arena snapshots (T = 2, 3, 4).
+//
+// Reads the 2 MiB FP32 state ONCE per layer into registers, steps 0..<T in
+// registers while writing intermediate states directly to `stateArena` for
+// step < T-1 and the final state to `state` for step == T-1, then performs
+// the exact 4-simdgroup per-head gated RMS norm. Bit-identical (0 ULP) to T
+// sequential `gdn_delta_gated_decode_qwen` + (T-1) `gdn_state_snapshot` calls.
+// ----------------------------------------------------------------------------
+template <uint T>
+static inline void gdn_delta_gated_verify_qwen_impl(
+    device const half*   conv_out,
+    device const half*   a_proj,
+    device const half*   b_proj,
+    device const bfloat* A_log,
+    device const bfloat* dt_bias,
+    device float*        state,
+    device float*        stateArena,
+    device const half*   z,
+    device const bfloat* weight,
+    device half*         out,
+    constant uint&       kHeads,
+    constant uint&       vHeads,
+    constant uint&       keyDim,
+    constant uint&       valueDim,
+    constant uint&       rowStride,
+    constant uint&       stateSlotStrideFloats,
+    threadgroup half*    y_half,
+    threadgroup float*   norm_partial,
+    threadgroup float*   inv_rms,
+    uint h,
+    uint simd_group,
+    uint lane
+) {
+    constexpr uint Hk = 16u;
+    constexpr uint Hv = 32u;
+    constexpr uint Dk = 128u;
+    constexpr uint Dv = 128u;
+    constexpr uint simd_groups = 8u;
+    if (h >= Hv) return;
+    if (kHeads != Hk || vHeads != Hv || keyDim != Dk || valueDim != Dv) return;
+
+    const uint hk = h / 2u;
+    const uint C = rowStride;
+    const float expA = exp(float(A_log[h]));
+    const float dtb = float(dt_bias[h]);
+
+    float g_val[T];
+    float beta_val[T];
+    #pragma clang loop unroll(full)
+    for (uint step = 0u; step < T; ++step) {
+        g_val[step] = exp(-expA * gdn_softplus(float(a_proj[step * Hv + h]) + dtb));
+        beta_val[step] = 1.0f / (1.0f + exp(-float(b_proj[step * Hv + h])));
+    }
+
+    for (uint dv = simd_group; dv < Dv; dv += simd_groups) {
+        const uint rowElemBase = (h * Dv + dv) * Dk;
+        device float* srow = state + rowElemBase;
+
+        float s[4];
+        #pragma clang loop unroll(full)
+        for (uint i = 0u; i < 4u; ++i) {
+            s[i] = srow[lane * 4u + i];
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint step = 0u; step < T; ++step) {
+            device const half* convRow = conv_out + step * C;
+            device const half* q = convRow + hk * Dk;
+            device const half* k = convRow + Hk * Dk + hk * Dk;
+            device const half* v = convRow + 2u * Hk * Dk + h * Dv;
+
+            const float g = g_val[step];
+            const float beta = beta_val[step];
+
+            float kv = 0.0f;
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; ++i) {
+                const uint idx = lane * 4u + i;
+                s[i] = s[i] * g;
+                kv = fma(s[i], float(k[idx]), kv);
+            }
+            kv = simd_sum(kv);
+
+            const float delta = (float(v[dv]) - kv) * beta;
+            float y_value = 0.0f;
+            device float* dstRow = (step + 1u < T)
+                ? (stateArena + step * stateSlotStrideFloats + rowElemBase)
+                : srow;
+            #pragma clang loop unroll(full)
+            for (uint i = 0u; i < 4u; ++i) {
+                const uint idx = lane * 4u + i;
+                s[i] = fma(float(k[idx]), delta, s[i]);
+                y_value = fma(s[i], float(q[idx]), y_value);
+                dstRow[idx] = s[i];
+            }
+            y_value = simd_sum(y_value);
+            if (lane == 0u) y_half[step * Dv + dv] = half(y_value);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group < 4u) {
+        const uint dv = simd_group * 32u + lane;
+        #pragma clang loop unroll(full)
+        for (uint step = 0u; step < T; ++step) {
+            const float y_value = float(y_half[step * Dv + dv]);
+            float sumsq = 0.0f;
+            sumsq = fma(y_value, y_value, sumsq);
+            sumsq = simd_sum(sumsq);
+            if (lane == 0u) norm_partial[step * 4u + simd_group] = sumsq;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0u && lane < T) {
+        float sumsq = 0.0f;
+        for (uint i = 0u; i < 4u; ++i) sumsq += norm_partial[lane * 4u + i];
+        inv_rms[lane] = rsqrt(sumsq / float(Dv) + kGdnRmsEps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group < 4u) {
+        const uint dv = simd_group * 32u + lane;
+        const float w_dv = float(weight[dv]);
+        #pragma clang loop unroll(full)
+        for (uint step = 0u; step < T; ++step) {
+            const uint outBase = step * (Hv * Dv) + h * Dv + dv;
+            const float normed = float(y_half[step * Dv + dv]) * inv_rms[step] * w_dv;
+            const float gate = gdn_output_gate(float(z[outBase]));
+            out[outBase] = half(normed * gate);
+        }
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+kernel void gdn_delta_gated_verify_qwen_t2(
+    device const half*   conv_out              [[buffer(0)]],
+    device const half*   a_proj                [[buffer(1)]],
+    device const half*   b_proj                [[buffer(2)]],
+    device const bfloat* A_log                 [[buffer(3)]],
+    device const bfloat* dt_bias               [[buffer(4)]],
+    device float*        state                 [[buffer(5)]],
+    device float*        stateArena            [[buffer(6)]],
+    device const half*   z                     [[buffer(7)]],
+    device const bfloat* weight                [[buffer(8)]],
+    device half*         out                   [[buffer(9)]],
+    constant uint&       kHeads                [[buffer(10)]],
+    constant uint&       vHeads                [[buffer(11)]],
+    constant uint&       keyDim                [[buffer(12)]],
+    constant uint&       valueDim              [[buffer(13)]],
+    constant uint&       rowStride             [[buffer(14)]],
+    constant uint&       stateSlotStrideFloats [[buffer(15)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup half y_half[2u * 128u];
+    threadgroup float norm_partial[2u * 4u];
+    threadgroup float inv_rms[2u];
+    gdn_delta_gated_verify_qwen_impl<2u>(
+        conv_out, a_proj, b_proj, A_log, dt_bias, state, stateArena,
+        z, weight, out, kHeads, vHeads, keyDim, valueDim, rowStride,
+        stateSlotStrideFloats, y_half, norm_partial, inv_rms, h, simd_group, lane);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+kernel void gdn_delta_gated_verify_qwen_t3(
+    device const half*   conv_out              [[buffer(0)]],
+    device const half*   a_proj                [[buffer(1)]],
+    device const half*   b_proj                [[buffer(2)]],
+    device const bfloat* A_log                 [[buffer(3)]],
+    device const bfloat* dt_bias               [[buffer(4)]],
+    device float*        state                 [[buffer(5)]],
+    device float*        stateArena            [[buffer(6)]],
+    device const half*   z                     [[buffer(7)]],
+    device const bfloat* weight                [[buffer(8)]],
+    device half*         out                   [[buffer(9)]],
+    constant uint&       kHeads                [[buffer(10)]],
+    constant uint&       vHeads                [[buffer(11)]],
+    constant uint&       keyDim                [[buffer(12)]],
+    constant uint&       valueDim              [[buffer(13)]],
+    constant uint&       rowStride             [[buffer(14)]],
+    constant uint&       stateSlotStrideFloats [[buffer(15)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup half y_half[3u * 128u];
+    threadgroup float norm_partial[3u * 4u];
+    threadgroup float inv_rms[3u];
+    gdn_delta_gated_verify_qwen_impl<3u>(
+        conv_out, a_proj, b_proj, A_log, dt_bias, state, stateArena,
+        z, weight, out, kHeads, vHeads, keyDim, valueDim, rowStride,
+        stateSlotStrideFloats, y_half, norm_partial, inv_rms, h, simd_group, lane);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]]
+kernel void gdn_delta_gated_verify_qwen_t4(
+    device const half*   conv_out              [[buffer(0)]],
+    device const half*   a_proj                [[buffer(1)]],
+    device const half*   b_proj                [[buffer(2)]],
+    device const bfloat* A_log                 [[buffer(3)]],
+    device const bfloat* dt_bias               [[buffer(4)]],
+    device float*        state                 [[buffer(5)]],
+    device float*        stateArena            [[buffer(6)]],
+    device const half*   z                     [[buffer(7)]],
+    device const bfloat* weight                [[buffer(8)]],
+    device half*         out                   [[buffer(9)]],
+    constant uint&       kHeads                [[buffer(10)]],
+    constant uint&       vHeads                [[buffer(11)]],
+    constant uint&       keyDim                [[buffer(12)]],
+    constant uint&       valueDim              [[buffer(13)]],
+    constant uint&       rowStride             [[buffer(14)]],
+    constant uint&       stateSlotStrideFloats [[buffer(15)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]
+) {
+    threadgroup half y_half[4u * 128u];
+    threadgroup float norm_partial[4u * 4u];
+    threadgroup float inv_rms[4u];
+    gdn_delta_gated_verify_qwen_impl<4u>(
+        conv_out, a_proj, b_proj, A_log, dt_bias, state, stateArena,
+        z, weight, out, kHeads, vHeads, keyDim, valueDim, rowStride,
+        stateSlotStrideFloats, y_half, norm_partial, inv_rms, h, simd_group, lane);
+}
+

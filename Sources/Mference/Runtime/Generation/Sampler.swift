@@ -124,11 +124,13 @@ final class Sampler {
     @discardableResult
     func sample(commandBuffer: MTLCommandBuffer,
                        logits: MTLBuffer,
+                       logitsOffset: Int = 0,
                        probs: MTLBuffer,
                        history: [Int32],
                        config: GenerationConfig,
                        position: Int,
-                       outToken: MTLBuffer) -> SamplePath {
+                       outToken: MTLBuffer,
+                       outTokenOffset: Int = 0) -> SamplePath {
         let v = UInt32(vocab)
 
         let appliedPenalty = config.repetitionPenalty != 1.0 && !history.isEmpty
@@ -137,26 +139,31 @@ final class Sampler {
                 ? Array(history.suffix(config.repetitionWindow))
                 : history
             applyRepetitionPenaltyInPlace(logits: logits,
+                                          logitsOffset: logitsOffset,
                                           history: effectiveHistory,
                                           penalty: config.repetitionPenalty)
         }
 
         softcap.encode(commandBuffer: commandBuffer,
-                       logits: logits, probs: probs, v: v, softcap: logitSoftcap)
+                       logits: logits, logitsOffset: logitsOffset, probs: probs, v: v, softcap: logitSoftcap)
 
         let isGreedy = config.temperature == 0
         let seed = Self.seedFor(config: config, position: position)
         if config.temperature > 0,
-           config.topK == 64 {
+           let k = config.topK,
+           (1...64).contains(k) {
             topK64Kernel.encode(commandBuffer: commandBuffer,
                                 probs: probs,
                                 outToken: outToken,
+                                outTokenOffset: outTokenOffset,
                                 temperature: config.temperature,
+                                topK: UInt32(k),
                                 topP: config.topP ?? 1.0,
                                 seed: seed)
         } else {
             sampleKernel.encode(commandBuffer: commandBuffer,
-                                probs: probs, outToken: outToken, v: v,
+                                probs: probs, outToken: outToken,
+                                outTokenOffset: outTokenOffset, v: v,
                                 temperature: isGreedy ? 0.0 : config.temperature,
                                 topK: UInt32(config.topK ?? 0),
                                 topP: config.topP ?? 1.0,
@@ -166,6 +173,37 @@ final class Sampler {
 
         if appliedPenalty { return .hostPenalty }
         return isGreedy ? .greedyGPU : .gpuSampled
+    }
+
+    func sampleBatch(commandBuffer: MTLCommandBuffer,
+                     logitsBatch: MTLBuffer,
+                     rowStrideBytes: Int,
+                     probs: MTLBuffer,
+                     baseHistory: [Int32],
+                     draftTokens: [Int32],
+                     config: GenerationConfig,
+                     basePosition: Int,
+                     outTokens: MTLBuffer,
+                     count: Int) {
+        let emptyHistory: [Int32] = []
+        let u32Stride = MemoryLayout<UInt32>.stride
+        for r in 0..<count {
+            let rowHistory: [Int32]
+            if config.repetitionPenalty != 1.0 {
+                rowHistory = r == 0 ? baseHistory : (baseHistory + draftTokens.prefix(r))
+            } else {
+                rowHistory = emptyHistory
+            }
+            _ = sample(commandBuffer: commandBuffer,
+                       logits: logitsBatch,
+                       logitsOffset: r * rowStrideBytes,
+                       probs: probs,
+                       history: rowHistory,
+                       config: config,
+                       position: basePosition + r,
+                       outToken: outTokens,
+                       outTokenOffset: r * u32Stride)
+        }
     }
 
     // MARK: - Repetition penalty (host, in place)
@@ -184,9 +222,10 @@ final class Sampler {
     /// value, penalize, and invert through atanh so the downstream
     /// softcap+softmax kernel reproduces the penalized capped logit.
     private func applyRepetitionPenaltyInPlace(logits: MTLBuffer,
+                                               logitsOffset: Int = 0,
                                                history: [Int32],
                                                penalty: Float) {
-        let ptr = logits.contents().bindMemory(to: Float16.self, capacity: vocab)
+        let ptr = logits.contents().advanced(by: logitsOffset).bindMemory(to: Float16.self, capacity: vocab)
         var seen = Set<Int32>()
         seen.reserveCapacity(history.count)
         for id in history {

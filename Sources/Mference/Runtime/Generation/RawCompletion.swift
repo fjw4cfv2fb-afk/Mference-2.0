@@ -63,6 +63,18 @@ public struct RawCompletionScratch: @unchecked Sendable {
     }
 }
 
+protocol SampledSpeculativeLogitProducer: LogitProducer {
+    var supportsSampledSpeculation: Bool { get }
+    func produceSampled(token: Int32,
+                        position: Int,
+                        generatedIndex: Int,
+                        history: [Int32],
+                        config: GenerationConfig,
+                        sampler: Sampler,
+                        probs: MTLBuffer,
+                        fallbackLogits: MTLBuffer) async throws -> Int32?
+}
+
 extension GenerationConfig {
     /// A pure-greedy config can use the fused head's GPU argmax
     /// (`RealForwardRunner.lastGreedyToken`) instead of sampling from the
@@ -99,6 +111,14 @@ public func runRawCompletion(producer: any LogitProducer,
     let fusedRunner = producer as? any FusedHeadLogitProducer
     let fusedGreedy = fusedRunner?.usesFusedGreedyHead == true && config.isPureGreedy
     fusedRunner?.setOutputMode(fusedGreedy ? .greedyIfAvailable : .logits)
+
+    var effectiveConfig = config
+    if !config.isPureGreedy && config.seed == nil {
+        effectiveConfig.seed = Sampler.seedFor(config: config, position: 0)
+    }
+    let sampledSpecRunner = (!config.isPureGreedy) ? (producer as? any SampledSpeculativeLogitProducer) : nil
+    let sampledSpecActive = sampledSpecRunner?.supportsSampledSpeculation == true
+    var pendingSampledToken: Int32? = nil
 
     let cachedPromptTokens: Int
     switch start {
@@ -227,7 +247,7 @@ public func runRawCompletion(producer: any LogitProducer,
                 tokenID = Int32(bitPattern: token)
             case .logitsWritten:
                 tokenID = sampleOnce(scratch: scratch, context: context,
-                                     history: history, config: config, position: generated)
+                                     history: history, config: effectiveConfig, position: generated)
             }
         } else if let loopTokens = pendingLoopBreakTokens {
             pendingLoopBreakTokens = nil
@@ -242,11 +262,14 @@ public func runRawCompletion(producer: any LogitProducer,
             breakConfig.repetitionWindow = 0
             tokenID = sampleOnce(scratch: scratch, context: context,
                                  history: [], config: breakConfig, position: generated)
+        } else if let sampled = pendingSampledToken {
+            tokenID = sampled
+            pendingSampledToken = nil
         } else if fusedGreedy {
             tokenID = Int32(bitPattern: fusedRunner!.lastGreedyToken)
         } else {
             tokenID = sampleOnce(scratch: scratch, context: context,
-                                 history: history, config: config, position: generated)
+                                 history: history, config: effectiveConfig, position: generated)
         }
         generated += 1
         uncommittedBoundaryTokenIDs = [tokenID]
@@ -323,21 +346,36 @@ public func runRawCompletion(producer: any LogitProducer,
         history.append(tokenID)
         if !forcedInjectionQueue.isEmpty {
             // Flush any speculative drafts so the forced `</think>\n\n` tokens advance cleanly.
-            if fusedGreedy {
+            if fusedGreedy || sampledSpecActive {
                 try (producer as? any ContinuableLogitProducer)?.prepareForContinuation(expectedPosition: position)
             }
+            pendingSampledToken = nil
             try await producer.produce(token: tokenID, position: position, into: scratch.logits)
         } else if effectiveLoopGuardRepeats >= 2,
                   let loopTokens = RepetitionLoopDetector.detectLoop(in: history, minRepeats: effectiveLoopGuardRepeats) {
             pendingLoopBreakTokens = loopTokens
+            pendingSampledToken = nil
             if fusedGreedy {
                 try (producer as? any ContinuableLogitProducer)?.prepareForContinuation(expectedPosition: position)
                 fusedRunner?.setOutputMode(.logits)
                 try await producer.produce(token: tokenID, position: position, into: scratch.logits)
                 fusedRunner?.setOutputMode(.greedyIfAvailable)
             } else {
+                if sampledSpecActive {
+                    try (producer as? any ContinuableLogitProducer)?.prepareForContinuation(expectedPosition: position)
+                }
                 try await producer.produce(token: tokenID, position: position, into: scratch.logits)
             }
+        } else if sampledSpecActive, let sampledSpecRunner {
+            pendingSampledToken = try await sampledSpecRunner.produceSampled(
+                token: tokenID,
+                position: position,
+                generatedIndex: generated,
+                history: history,
+                config: effectiveConfig,
+                sampler: scratch.sampler,
+                probs: scratch.probs,
+                fallbackLogits: scratch.logits)
         } else {
             try await producer.produce(token: tokenID, position: position, into: scratch.logits)
         }

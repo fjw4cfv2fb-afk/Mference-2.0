@@ -1,14 +1,16 @@
 import Accelerate
 import Darwin
 import Foundation
+import Metal
 import Synchronization
 
-/// Ephemeral Pure-Swift + Accelerate AMX Vision Transformer encoder for Qwen 3.6
-/// (`vision_weights.bin`).
+/// Ephemeral Pure-Swift + Accelerate AMX / Metal 4 Vision Transformer encoder
+/// for Qwen 3.6 (`vision_weights.bin`).
 ///
 /// Maps `vision_weights.bin` read-only on demand when an uncached image is
 /// encountered, executes the 27-layer ViT + `2×2` spatial merger in FP32 using
-/// Apple's AMX matrix engine (`cblas_sgemm`), caches the compact `[N_vis, 2048]`
+/// Metal 4 (`matmul2d` Neural Accelerator) when available or Apple's AMX
+/// matrix engine (`cblas_sgemm`) otherwise, caches the compact `[N_vis, 2048]`
 /// FP16 embeddings in `Qwen36VisionImageStore`, and immediately `munmap`s the
 /// weight file and frees all transient scratch buffers before the 40-layer MoE
 /// trunk prefill begins.
@@ -27,17 +29,28 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
     public static let rotaryTheta: Float = 10_000.0
 
     public let weightsURL: URL
+    private let metalContext: MetalContext?
+    private var cachedPipelines: MetalPipelines?
+    private var didProbePipelines = false
     private let encodeLock = Mutex(())
 
-    private struct TensorSpan {
+    struct TensorSpan {
         let offset: Int
         let byteLength: Int
         let shape: [Int]
         let dtype: String
     }
 
-    public init(weightsURL: URL) {
+    struct MetalPipelines {
+        let gemm: MTLComputePipelineState
+        let layerNorm: MTLComputePipelineState
+        let rope: MTLComputePipelineState
+        let attention: MTLComputePipelineState
+    }
+
+    public init(weightsURL: URL, context: MetalContext? = nil) {
         self.weightsURL = weightsURL
+        self.metalContext = context
     }
 
     public func ensureEncoded(imageID: Int) throws -> [Float16] {
@@ -57,13 +70,46 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
         }
     }
 
-    private func runEncoder(patchData: Qwen36VisionPatchData) throws -> [Float16] {
+    static func makeMetalPipelines(context: MetalContext) -> MetalPipelines? {
+        guard ProcessInfo.processInfo.environment["MFERENCE_VISION_METAL"] != "0",
+              context.device.supportsApple10TensorOps else {
+            return nil
+        }
+        guard let lib = try? MetalContext.moduleLibrary(device: context.device, module: "vision"),
+              let gemmFn = lib.makeFunction(name: "mpp_vision_bf16_gemm_f32"),
+              let lnFn = lib.makeFunction(name: "vision_layernorm_f32"),
+              let ropeFn = lib.makeFunction(name: "vision_rope_2d_f32"),
+              let attnFn = lib.makeFunction(name: "vision_attention_f32"),
+              let gemmPSO = try? context.device.makeComputePipelineState(function: gemmFn),
+              let lnPSO = try? context.device.makeComputePipelineState(function: lnFn),
+              let ropePSO = try? context.device.makeComputePipelineState(function: ropeFn),
+              let attnPSO = try? context.device.makeComputePipelineState(function: attnFn) else {
+            return nil
+        }
+        return MetalPipelines(gemm: gemmPSO, layerNorm: lnPSO, rope: ropePSO, attention: attnPSO)
+    }
+
+    private func metalPipelinesIfEnabled() -> MetalPipelines? {
+        if ProcessInfo.processInfo.environment["MFERENCE_VISION_METAL"] == "0" {
+            return nil
+        }
+        if didProbePipelines {
+            return cachedPipelines
+        }
+        didProbePipelines = true
+        guard let metalContext else { return nil }
+        cachedPipelines = Self.makeMetalPipelines(context: metalContext)
+        return cachedPipelines
+    }
+
+    func runEncoder(patchData: Qwen36VisionPatchData, forceCPU: Bool = false) throws -> [Float16] {
         let path = weightsURL.path
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else {
             throw Qwen36VisionImageError.visionSidecarMissing(path)
         }
         defer { close(fd) }
+        _ = fcntl(fd, F_NOCACHE, 1)
 
         var st = stat()
         guard fstat(fd, &st) == 0, st.st_size > 8 else {
@@ -74,7 +120,10 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
               mapped != MAP_FAILED else {
             throw Qwen36VisionImageError.visionWeightsCorrupt("mmap failed for \(path) (errno \(errno))")
         }
-        defer { munmap(mapped, fileSize) }
+        defer {
+            madvise(mapped, fileSize, MADV_DONTNEED)
+            munmap(mapped, fileSize)
+        }
         madvise(mapped, fileSize, MADV_SEQUENTIAL)
 
         let headerLenU64 = UInt64(littleEndian: mapped.loadUnaligned(as: UInt64.self))
@@ -114,7 +163,43 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
         }
 
         let dataBase = mapped.advanced(by: payloadOffset)
+        let logPhases = ProcessInfo.processInfo.environment["MFERENCE_PHASES"] == "1"
 
+        if !forceCPU, let ctx = metalContext, let pipelines = metalPipelinesIfEnabled() {
+            let t0 = logPhases ? DispatchTime.now().uptimeNanoseconds : 0
+            let out = try runEncoderMetal(
+                patchData: patchData,
+                spans: spans,
+                fd: fd,
+                payloadOffset: payloadOffset,
+                dataBase: dataBase,
+                context: ctx,
+                pipelines: pipelines)
+            if logPhases {
+                let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+                let msg = String(format: "[vision]: path=metal4 patches=%d tokens=%d elapsed=%.1fms\n",
+                                 patchData.numPatches, patchData.numVisualTokens, elapsedMs)
+                FileHandle.standardError.write(Data(msg.utf8))
+            }
+            return out
+        }
+
+        let t0 = logPhases ? DispatchTime.now().uptimeNanoseconds : 0
+        let out = try runEncoderCPU(patchData: patchData, spans: spans, dataBase: dataBase)
+        if logPhases {
+            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            let msg = String(format: "[vision]: path=cpu-amx patches=%d tokens=%d elapsed=%.1fms\n",
+                             patchData.numPatches, patchData.numVisualTokens, elapsedMs)
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
+        return out
+    }
+
+    private func runEncoderCPU(
+        patchData: Qwen36VisionPatchData,
+        spans: [String: TensorSpan],
+        dataBase: UnsafeMutableRawPointer
+    ) throws -> [Float16] {
         func requireSpan(_ name: String) throws -> TensorSpan {
             guard let span = spans[name] else {
                 throw Qwen36VisionImageError.visionWeightsCorrupt("missing tensor \(name)")
@@ -374,6 +459,542 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
         return outF16
     }
 
+    // MARK: - Metal 4 Ephemeral Vision Encoder
+
+    private struct BlockSpans {
+        let norm1W, norm1B: TensorSpan
+        let qkvW, qkvB: TensorSpan
+        let projW, projB: TensorSpan
+        let norm2W, norm2B: TensorSpan
+        let fc1W, fc1B: TensorSpan
+        let fc2W, fc2B: TensorSpan
+    }
+
+    private struct StagedBlockOffsets {
+        let norm1W, norm1B: Int
+        let qkvW, qkvB: Int
+        let projW, projB: Int
+        let norm2W, norm2B: Int
+        let fc1W, fc1B: Int
+        let fc2W, fc2B: Int
+    }
+
+    private static func preadExact(fd: Int32, dst: UnsafeMutableRawPointer, count: Int, fileOffset: Int) -> Bool {
+        var total = 0
+        while total < count {
+            let n = Darwin.pread(fd, dst.advanced(by: total), count - total, off_t(fileOffset + total))
+            if n > 0 {
+                total += n
+            } else if n < 0 && errno == EINTR {
+                continue
+            } else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func runEncoderMetal(
+        patchData: Qwen36VisionPatchData,
+        spans: [String: TensorSpan],
+        fd: Int32,
+        payloadOffset: Int,
+        dataBase: UnsafeMutableRawPointer,
+        context: MetalContext,
+        pipelines: MetalPipelines
+    ) throws -> [Float16] {
+        let nPatches = patchData.numPatches
+        let nVis = patchData.numVisualTokens
+        let d = Self.hiddenSize
+        let mlpDim = Self.intermediateSize
+        let numHeads = Self.numHeads
+        let headDim = Self.headDim
+        let f32Size = MemoryLayout<Float>.stride
+
+        guard nPatches > 0, nVis > 0, nPatches % 4 == 0,
+              patchData.patches.count == nPatches * Self.patchDim else {
+            throw Qwen36VisionImageError.visionWeightsCorrupt("invalid patch data dimensions")
+        }
+
+        func requireCheckedSpan(_ name: String, expectedBytes: Int) throws -> TensorSpan {
+            guard let span = spans[name] else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt("missing tensor \(name)")
+            }
+            guard span.dtype == "BF16" else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt("expected BF16 for \(name), got \(span.dtype)")
+            }
+            guard span.byteLength == expectedBytes else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt(
+                    "\(name) byte length \(span.byteLength) != expected \(expectedBytes)")
+            }
+            return span
+        }
+
+        func makeSharedBuffer(bytes: Int) throws -> MTLBuffer {
+            guard let buf = context.device.makeBuffer(length: max(bytes, 16), options: .storageModeShared) else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt("failed to allocate \(bytes)-byte Metal buffer")
+            }
+            return buf
+        }
+
+        @inline(__always)
+        func stageTensor(_ span: TensorSpan, into buf: MTLBuffer, cursor: inout Int) throws -> Int {
+            let aligned = (cursor + 15) & ~15
+            guard aligned + span.byteLength <= buf.length else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt("staging buffer overflow for \(span.byteLength) bytes")
+            }
+            memcpy(buf.contents().advanced(by: aligned), dataBase.advanced(by: span.offset), span.byteLength)
+            cursor = aligned + span.byteLength
+            return aligned
+        }
+
+        func waitAndVerify(_ cb: MTLCommandBuffer) throws {
+            cb.waitUntilCompleted()
+            if cb.status != .completed || cb.error != nil {
+                throw Qwen36VisionImageError.visionWeightsCorrupt(
+                    "Metal vision execution failed: \(cb.error?.localizedDescription ?? "status \(cb.status.rawValue)")")
+            }
+        }
+
+        // Pre-validate all block spans up front before staging.
+        var blockSpans: [BlockSpans] = []
+        blockSpans.reserveCapacity(Self.depth)
+        for blockIdx in 0..<Self.depth {
+            let pfx = "vision_tower.blocks.\(blockIdx)"
+            blockSpans.append(BlockSpans(
+                norm1W: try requireCheckedSpan("\(pfx).norm1.weight", expectedBytes: d * 2),
+                norm1B: try requireCheckedSpan("\(pfx).norm1.bias", expectedBytes: d * 2),
+                qkvW: try requireCheckedSpan("\(pfx).attn.qkv.weight", expectedBytes: 3 * d * d * 2),
+                qkvB: try requireCheckedSpan("\(pfx).attn.qkv.bias", expectedBytes: 3 * d * 2),
+                projW: try requireCheckedSpan("\(pfx).attn.proj.weight", expectedBytes: d * d * 2),
+                projB: try requireCheckedSpan("\(pfx).attn.proj.bias", expectedBytes: d * 2),
+                norm2W: try requireCheckedSpan("\(pfx).norm2.weight", expectedBytes: d * 2),
+                norm2B: try requireCheckedSpan("\(pfx).norm2.bias", expectedBytes: d * 2),
+                fc1W: try requireCheckedSpan("\(pfx).mlp.linear_fc1.weight", expectedBytes: mlpDim * d * 2),
+                fc1B: try requireCheckedSpan("\(pfx).mlp.linear_fc1.bias", expectedBytes: mlpDim * 2),
+                fc2W: try requireCheckedSpan("\(pfx).mlp.linear_fc2.weight", expectedBytes: d * mlpDim * 2),
+                fc2B: try requireCheckedSpan("\(pfx).mlp.linear_fc2.bias", expectedBytes: d * 2)
+            ))
+        }
+
+        func stageBlock(_ bs: BlockSpans, into buf: MTLBuffer) throws -> StagedBlockOffsets {
+            let allSpans = [
+                bs.norm1W, bs.norm1B, bs.qkvW, bs.qkvB,
+                bs.projW, bs.projB, bs.norm2W, bs.norm2B,
+                bs.fc1W, bs.fc1B, bs.fc2W, bs.fc2B,
+            ]
+            let minStart = allSpans.map(\.offset).min()!
+            let maxEnd = allSpans.map { $0.offset + $0.byteLength }.max()!
+            let slabBytes = maxEnd - minStart
+            if slabBytes <= buf.length,
+               allSpans.allSatisfy({ ($0.offset - minStart) % 4 == 0 }),
+               Self.preadExact(fd: fd, dst: buf.contents(), count: slabBytes, fileOffset: payloadOffset + minStart) {
+                return StagedBlockOffsets(
+                    norm1W: bs.norm1W.offset - minStart,
+                    norm1B: bs.norm1B.offset - minStart,
+                    qkvW: bs.qkvW.offset - minStart,
+                    qkvB: bs.qkvB.offset - minStart,
+                    projW: bs.projW.offset - minStart,
+                    projB: bs.projB.offset - minStart,
+                    norm2W: bs.norm2W.offset - minStart,
+                    norm2B: bs.norm2B.offset - minStart,
+                    fc1W: bs.fc1W.offset - minStart,
+                    fc1B: bs.fc1B.offset - minStart,
+                    fc2W: bs.fc2W.offset - minStart,
+                    fc2B: bs.fc2B.offset - minStart
+                )
+            }
+            var cursor = 0
+            return StagedBlockOffsets(
+                norm1W: try stageTensor(bs.norm1W, into: buf, cursor: &cursor),
+                norm1B: try stageTensor(bs.norm1B, into: buf, cursor: &cursor),
+                qkvW: try stageTensor(bs.qkvW, into: buf, cursor: &cursor),
+                qkvB: try stageTensor(bs.qkvB, into: buf, cursor: &cursor),
+                projW: try stageTensor(bs.projW, into: buf, cursor: &cursor),
+                projB: try stageTensor(bs.projB, into: buf, cursor: &cursor),
+                norm2W: try stageTensor(bs.norm2W, into: buf, cursor: &cursor),
+                norm2B: try stageTensor(bs.norm2B, into: buf, cursor: &cursor),
+                fc1W: try stageTensor(bs.fc1W, into: buf, cursor: &cursor),
+                fc1B: try stageTensor(bs.fc1B, into: buf, cursor: &cursor),
+                fc2W: try stageTensor(bs.fc2W, into: buf, cursor: &cursor),
+                fc2B: try stageTensor(bs.fc2B, into: buf, cursor: &cursor)
+            )
+        }
+
+        let stageBytes = 32 * 1024 * 1024
+        let stageBuf0 = try makeSharedBuffer(bytes: stageBytes)
+        var stageBuf1: MTLBuffer? = try makeSharedBuffer(bytes: stageBytes)
+
+        let hiddenBuf = try makeSharedBuffer(bytes: nPatches * d * f32Size)
+        let normBuf = try makeSharedBuffer(bytes: nPatches * d * f32Size)
+
+        // 1. Patch embedding on GPU overlapped with pos_embed load + block 0 staging.
+        let patchW = try requireCheckedSpan("vision_tower.patch_embed.proj.weight",
+                                            expectedBytes: d * Self.patchDim * 2)
+        let patchB = try requireCheckedSpan("vision_tower.patch_embed.proj.bias",
+                                            expectedBytes: d * 2)
+        let posSpan = try requireCheckedSpan("vision_tower.pos_embed.weight",
+                                             expectedBytes: Self.numPosEmbeddings * d * 2)
+
+        do {
+            let patchBuf = try makeSharedBuffer(bytes: patchData.patches.count * f32Size)
+            patchData.patches.withUnsafeBytes { raw in
+                if let src = raw.baseAddress {
+                    memcpy(patchBuf.contents(), src, raw.count)
+                }
+            }
+            var cursor0 = 0
+            let pwOff = try stageTensor(patchW, into: stageBuf0, cursor: &cursor0)
+            let pbOff = try stageTensor(patchB, into: stageBuf0, cursor: &cursor0)
+            guard let cbPatch = context.queue.makeCommandBuffer() else {
+                throw Qwen36VisionImageError.visionWeightsCorrupt("failed to allocate Metal command buffer")
+            }
+            Self.encodeGemm(
+                commandBuffer: cbPatch,
+                pipeline: pipelines.gemm,
+                x: patchBuf,
+                weight: stageBuf0, weightOffset: pwOff,
+                bias: stageBuf0, biasOffset: pbOff,
+                y: hiddenBuf,
+                m: nPatches, n: d, k: Self.patchDim,
+                flags: 1)
+            cbPatch.commit()
+
+            // Overlap CPU pos_embed BF16->F32 + rotary tables + block 0 staging with patch GEMM.
+            let posCount = Self.numPosEmbeddings * d
+            var posTable = [Float](repeating: 0, count: posCount)
+            let posSrc = dataBase.advanced(by: posSpan.offset).assumingMemoryBound(to: UInt16.self)
+            posTable.withUnsafeMutableBufferPointer { dst in
+                let p = dst.baseAddress!
+                for i in 0..<posCount {
+                    p[i] = Float(bitPattern: UInt32(posSrc[i]) << 16)
+                }
+            }
+
+            let block0Offsets = try stageBlock(blockSpans[0], into: stageBuf1!)
+            try waitAndVerify(cbPatch)
+
+            posTable.withUnsafeBufferPointer { posPtr in
+                Self.addInterpolatedPosEmbed(
+                    posPtr: posPtr.baseAddress!,
+                    gridH: patchData.gridH,
+                    gridW: patchData.gridW,
+                    into: hiddenBuf.contents().assumingMemoryBound(to: Float.self))
+            }
+
+            // 2. Run all 27 ViT blocks with double-buffered BF16 weight staging.
+            var qkvBuf: MTLBuffer? = try makeSharedBuffer(bytes: nPatches * 3 * d * f32Size)
+            var attnOutBuf: MTLBuffer? = try makeSharedBuffer(bytes: nPatches * d * f32Size)
+            var mlpMidBuf: MTLBuffer? = try makeSharedBuffer(bytes: nPatches * mlpDim * f32Size)
+
+            let (rotCos, rotSin) = Self.buildRotaryTables(gridH: patchData.gridH, gridW: patchData.gridW)
+            var rotCosBuf: MTLBuffer? = try makeSharedBuffer(bytes: rotCos.count * f32Size)
+            var rotSinBuf: MTLBuffer? = try makeSharedBuffer(bytes: rotSin.count * f32Size)
+            rotCos.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(rotCosBuf!.contents(), src, raw.count) }
+            }
+            rotSin.withUnsafeBytes { raw in
+                if let src = raw.baseAddress { memcpy(rotSinBuf!.contents(), src, raw.count) }
+            }
+
+            let scale = 1.0 / sqrtf(Float(headDim))
+            var currentOffsets = block0Offsets
+            var prevCB: MTLCommandBuffer? = nil
+
+            for blockIdx in 0..<Self.depth {
+                let activeBuf = ((blockIdx & 1) == 0) ? stageBuf1! : stageBuf0
+                let nextBuf = ((blockIdx & 1) == 0) ? stageBuf0 : stageBuf1!
+                let off = currentOffsets
+
+                guard let cb = context.queue.makeCommandBuffer() else {
+                    throw Qwen36VisionImageError.visionWeightsCorrupt("failed to allocate Metal command buffer")
+                }
+
+                Self.encodeLayerNorm(
+                    commandBuffer: cb,
+                    pipeline: pipelines.layerNorm,
+                    x: hiddenBuf,
+                    weight: activeBuf, weightOffset: off.norm1W,
+                    bias: activeBuf, biasOffset: off.norm1B,
+                    out: normBuf,
+                    rows: nPatches, dim: d, eps: Self.layerNormEps)
+                Self.encodeGemm(
+                    commandBuffer: cb,
+                    pipeline: pipelines.gemm,
+                    x: normBuf,
+                    weight: activeBuf, weightOffset: off.qkvW,
+                    bias: activeBuf, biasOffset: off.qkvB,
+                    y: qkvBuf!,
+                    m: nPatches, n: 3 * d, k: d,
+                    flags: 1)
+                Self.encodeRoPE2D(
+                    commandBuffer: cb,
+                    pipeline: pipelines.rope,
+                    qkv: qkvBuf!,
+                    cosTable: rotCosBuf!,
+                    sinTable: rotSinBuf!,
+                    seqLen: nPatches, numHeads: numHeads, headDim: headDim)
+                Self.encodeAttention(
+                    commandBuffer: cb,
+                    pipeline: pipelines.attention,
+                    qkv: qkvBuf!,
+                    out: attnOutBuf!,
+                    seqLen: nPatches, numHeads: numHeads, headDim: headDim, scale: scale)
+                Self.encodeGemm(
+                    commandBuffer: cb,
+                    pipeline: pipelines.gemm,
+                    x: attnOutBuf!,
+                    weight: activeBuf, weightOffset: off.projW,
+                    bias: activeBuf, biasOffset: off.projB,
+                    y: hiddenBuf,
+                    m: nPatches, n: d, k: d,
+                    flags: 1 | 8)
+                Self.encodeLayerNorm(
+                    commandBuffer: cb,
+                    pipeline: pipelines.layerNorm,
+                    x: hiddenBuf,
+                    weight: activeBuf, weightOffset: off.norm2W,
+                    bias: activeBuf, biasOffset: off.norm2B,
+                    out: normBuf,
+                    rows: nPatches, dim: d, eps: Self.layerNormEps)
+                Self.encodeGemm(
+                    commandBuffer: cb,
+                    pipeline: pipelines.gemm,
+                    x: normBuf,
+                    weight: activeBuf, weightOffset: off.fc1W,
+                    bias: activeBuf, biasOffset: off.fc1B,
+                    y: mlpMidBuf!,
+                    m: nPatches, n: mlpDim, k: d,
+                    flags: 1 | 2)
+                Self.encodeGemm(
+                    commandBuffer: cb,
+                    pipeline: pipelines.gemm,
+                    x: mlpMidBuf!,
+                    weight: activeBuf, weightOffset: off.fc2W,
+                    bias: activeBuf, biasOffset: off.fc2B,
+                    y: hiddenBuf,
+                    m: nPatches, n: d, k: mlpDim,
+                    flags: 1 | 8)
+                cb.commit()
+
+                if let prev = prevCB {
+                    try waitAndVerify(prev)
+                }
+                if blockIdx + 1 < Self.depth {
+                    currentOffsets = try stageBlock(blockSpans[blockIdx + 1], into: nextBuf)
+                }
+                prevCB = cb
+            }
+            if let last = prevCB {
+                try waitAndVerify(last)
+            }
+
+            // Reclaim ViT scratch before allocating merger buffers.
+            qkvBuf = nil
+            attnOutBuf = nil
+            mlpMidBuf = nil
+            rotCosBuf = nil
+            rotSinBuf = nil
+            stageBuf1 = nil
+        }
+
+        // 3. PatchMerger: LayerNorm([N_patches, 1152]) -> reshape [N_vis, 4608] -> fc1 (exact GELU) -> fc2 [N_vis, 2048]
+        let mDim = Self.mergerHiddenSize
+        let mergerNormW = try requireCheckedSpan("vision_tower.merger.norm.weight", expectedBytes: d * 2)
+        let mergerNormB = try requireCheckedSpan("vision_tower.merger.norm.bias", expectedBytes: d * 2)
+        let mergerFc1W = try requireCheckedSpan("vision_tower.merger.linear_fc1.weight", expectedBytes: mDim * mDim * 2)
+        let mergerFc1B = try requireCheckedSpan("vision_tower.merger.linear_fc1.bias", expectedBytes: mDim * 2)
+        let mergerFc2W = try requireCheckedSpan("vision_tower.merger.linear_fc2.weight", expectedBytes: Self.outHiddenSize * mDim * 2)
+        let mergerFc2B = try requireCheckedSpan("vision_tower.merger.linear_fc2.bias", expectedBytes: Self.outHiddenSize * 2)
+
+        var cursor0 = 0
+        let mnwOff = try stageTensor(mergerNormW, into: stageBuf0, cursor: &cursor0)
+        let mnbOff = try stageTensor(mergerNormB, into: stageBuf0, cursor: &cursor0)
+        let fc2wOff = try stageTensor(mergerFc2W, into: stageBuf0, cursor: &cursor0)
+        let fc2bOff = try stageTensor(mergerFc2B, into: stageBuf0, cursor: &cursor0)
+
+        let fc1Min = min(mergerFc1W.offset, mergerFc1B.offset)
+        let fc1Max = max(mergerFc1W.offset + mergerFc1W.byteLength, mergerFc1B.offset + mergerFc1B.byteLength)
+        let fc1SlabBytes = fc1Max - fc1Min
+        let fc1StageBytes = max(
+            ((mergerFc1W.byteLength + 15) & ~15) + ((mergerFc1B.byteLength + 15) & ~15),
+            fc1SlabBytes)
+        let fc1StageBuf = try makeSharedBuffer(bytes: fc1StageBytes)
+        let fc1wOff: Int
+        let fc1bOff: Int
+        if (mergerFc1W.offset - fc1Min) % 4 == 0,
+           (mergerFc1B.offset - fc1Min) % 4 == 0,
+           fc1SlabBytes <= fc1StageBuf.length,
+           Self.preadExact(fd: fd, dst: fc1StageBuf.contents(), count: fc1SlabBytes, fileOffset: payloadOffset + fc1Min) {
+            fc1wOff = mergerFc1W.offset - fc1Min
+            fc1bOff = mergerFc1B.offset - fc1Min
+        } else {
+            var cursor1 = 0
+            fc1wOff = try stageTensor(mergerFc1W, into: fc1StageBuf, cursor: &cursor1)
+            fc1bOff = try stageTensor(mergerFc1B, into: fc1StageBuf, cursor: &cursor1)
+        }
+
+        let mergerMidBuf = try makeSharedBuffer(bytes: nVis * mDim * f32Size)
+        let outF32Buf = try makeSharedBuffer(bytes: nVis * Self.outHiddenSize * f32Size)
+
+        guard let cbMerger = context.queue.makeCommandBuffer() else {
+            throw Qwen36VisionImageError.visionWeightsCorrupt("failed to allocate Metal command buffer")
+        }
+        Self.encodeLayerNorm(
+            commandBuffer: cbMerger,
+            pipeline: pipelines.layerNorm,
+            x: hiddenBuf,
+            weight: stageBuf0, weightOffset: mnwOff,
+            bias: stageBuf0, biasOffset: mnbOff,
+            out: normBuf,
+            rows: nPatches, dim: d, eps: Self.layerNormEps)
+        Self.encodeGemm(
+            commandBuffer: cbMerger,
+            pipeline: pipelines.gemm,
+            x: normBuf,
+            weight: fc1StageBuf, weightOffset: fc1wOff,
+            bias: fc1StageBuf, biasOffset: fc1bOff,
+            y: mergerMidBuf,
+            m: nVis, n: mDim, k: mDim,
+            flags: 1 | 4)
+        Self.encodeGemm(
+            commandBuffer: cbMerger,
+            pipeline: pipelines.gemm,
+            x: mergerMidBuf,
+            weight: stageBuf0, weightOffset: fc2wOff,
+            bias: stageBuf0, biasOffset: fc2bOff,
+            y: outF32Buf,
+            m: nVis, n: Self.outHiddenSize, k: mDim,
+            flags: 1)
+        cbMerger.commit()
+        try waitAndVerify(cbMerger)
+
+        let outCount = nVis * Self.outHiddenSize
+        let outPtr = outF32Buf.contents().assumingMemoryBound(to: Float.self)
+        for i in 0..<outCount {
+            if !outPtr[i].isFinite {
+                throw Qwen36VisionImageError.visionWeightsCorrupt("vision encoder produced non-finite activation")
+            }
+        }
+        var outF16 = [Float16](repeating: 0, count: outCount)
+        outF16.withUnsafeMutableBufferPointer { dst in
+            let dstPtr = dst.baseAddress!
+            for i in 0..<outCount {
+                dstPtr[i] = Float16(outPtr[i])
+            }
+        }
+        return outF16
+    }
+
+    static func encodeGemm(
+        commandBuffer: MTLCommandBuffer,
+        pipeline: MTLComputePipelineState,
+        x: MTLBuffer, xOffset: Int = 0,
+        weight: MTLBuffer, weightOffset: Int = 0,
+        bias: MTLBuffer, biasOffset: Int = 0,
+        y: MTLBuffer, yOffset: Int = 0,
+        m: Int, n: Int, k: Int,
+        flags: UInt32
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(x, offset: xOffset, index: 0)
+        encoder.setBuffer(weight, offset: weightOffset, index: 1)
+        encoder.setBuffer(bias, offset: biasOffset, index: 2)
+        encoder.setBuffer(y, offset: yOffset, index: 3)
+        var mU = UInt32(m)
+        var nU = UInt32(n)
+        var kU = UInt32(k)
+        var fU = flags
+        encoder.setBytes(&mU, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&nU, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&kU, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&fU, length: MemoryLayout<UInt32>.size, index: 7)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (n + 31) / 32, height: (m + 63) / 64, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    static func encodeLayerNorm(
+        commandBuffer: MTLCommandBuffer,
+        pipeline: MTLComputePipelineState,
+        x: MTLBuffer, xOffset: Int = 0,
+        weight: MTLBuffer, weightOffset: Int = 0,
+        bias: MTLBuffer, biasOffset: Int = 0,
+        out: MTLBuffer, outOffset: Int = 0,
+        rows: Int, dim: Int, eps: Float
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(x, offset: xOffset, index: 0)
+        encoder.setBuffer(weight, offset: weightOffset, index: 1)
+        encoder.setBuffer(bias, offset: biasOffset, index: 2)
+        encoder.setBuffer(out, offset: outOffset, index: 3)
+        var rU = UInt32(rows)
+        var dU = UInt32(dim)
+        var epsF = eps
+        encoder.setBytes(&rU, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&dU, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&epsF, length: MemoryLayout<Float>.size, index: 6)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: rows, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    static func encodeRoPE2D(
+        commandBuffer: MTLCommandBuffer,
+        pipeline: MTLComputePipelineState,
+        qkv: MTLBuffer, qkvOffset: Int = 0,
+        cosTable: MTLBuffer,
+        sinTable: MTLBuffer,
+        seqLen: Int, numHeads: Int, headDim: Int
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(qkv, offset: qkvOffset, index: 0)
+        encoder.setBuffer(cosTable, offset: 0, index: 1)
+        encoder.setBuffer(sinTable, offset: 0, index: 2)
+        var sU = UInt32(seqLen)
+        var hU = UInt32(numHeads)
+        var dU = UInt32(headDim)
+        encoder.setBytes(&sU, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&hU, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&dU, length: MemoryLayout<UInt32>.size, index: 5)
+        let cols = numHeads * (headDim / 2)
+        let tgW = min(pipeline.maxTotalThreadsPerThreadgroup, 256)
+        encoder.dispatchThreads(
+            MTLSize(width: cols, height: seqLen, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgW, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
+    static func encodeAttention(
+        commandBuffer: MTLCommandBuffer,
+        pipeline: MTLComputePipelineState,
+        qkv: MTLBuffer, qkvOffset: Int = 0,
+        out: MTLBuffer, outOffset: Int = 0,
+        seqLen: Int, numHeads: Int, headDim: Int, scale: Float
+    ) {
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(qkv, offset: qkvOffset, index: 0)
+        encoder.setBuffer(out, offset: outOffset, index: 1)
+        var sU = UInt32(seqLen)
+        var hU = UInt32(numHeads)
+        var dU = UInt32(headDim)
+        var sc = scale
+        encoder.setBytes(&sU, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&hU, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&dU, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&sc, length: MemoryLayout<Float>.size, index: 5)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: seqLen, height: numHeads, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
+        encoder.endEncoding()
+    }
+
     // MARK: - Vision Building Blocks
 
     private static func addInterpolatedPosEmbed(
@@ -381,6 +1002,23 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
         gridH: Int,
         gridW: Int,
         into hidden: inout [Float]
+    ) {
+        posTable.withUnsafeBufferPointer { posPtr in
+            hidden.withUnsafeMutableBufferPointer { hidPtr in
+                addInterpolatedPosEmbed(
+                    posPtr: posPtr.baseAddress!,
+                    gridH: gridH,
+                    gridW: gridW,
+                    into: hidPtr.baseAddress!)
+            }
+        }
+    }
+
+    private static func addInterpolatedPosEmbed(
+        posPtr pBase: UnsafePointer<Float>,
+        gridH: Int,
+        gridW: Int,
+        into hBase: UnsafeMutablePointer<Float>
     ) {
         let side = numGridPerSide
         let d = hiddenSize
@@ -394,36 +1032,30 @@ public final class Qwen36VisionEncoder: @unchecked Sendable {
             gridW > 1 ? Double(c) * Double(side - 1) / Double(gridW - 1) : 0.0
         }
 
-        posTable.withUnsafeBufferPointer { posPtr in
-            hidden.withUnsafeMutableBufferPointer { hidPtr in
-                let pBase = posPtr.baseAddress!
-                let hBase = hidPtr.baseAddress!
-                for bh in 0..<llmH {
-                    for bw in 0..<llmW {
-                        for ih in 0..<2 {
-                            for iw in 0..<2 {
-                                let p = (((bh * llmW + bw) * 2 + ih) * 2) + iw
-                                let hr = hIdxs[bh * 2 + ih]
-                                let wc = wIdxs[bw * 2 + iw]
-                                let h0 = Int(floor(hr))
-                                let w0 = Int(floor(wc))
-                                let h1 = min(h0 + 1, side - 1)
-                                let w1 = min(w0 + 1, side - 1)
-                                let dh = Float(hr - Double(h0))
-                                let dw = Float(wc - Double(w0))
-                                let w00 = (1 - dh) * (1 - dw)
-                                let w01 = (1 - dh) * dw
-                                let w10 = dh * (1 - dw)
-                                let w11 = dh * dw
-                                let p00 = pBase + (h0 * side + w0) * d
-                                let p01 = pBase + (h0 * side + w1) * d
-                                let p10 = pBase + (h1 * side + w0) * d
-                                let p11 = pBase + (h1 * side + w1) * d
-                                let out = hBase + p * d
-                                for j in 0..<d {
-                                    out[j] += w00 * p00[j] + w01 * p01[j] + w10 * p10[j] + w11 * p11[j]
-                                }
-                            }
+        for bh in 0..<llmH {
+            for bw in 0..<llmW {
+                for ih in 0..<2 {
+                    for iw in 0..<2 {
+                        let p = (((bh * llmW + bw) * 2 + ih) * 2) + iw
+                        let hr = hIdxs[bh * 2 + ih]
+                        let wc = wIdxs[bw * 2 + iw]
+                        let h0 = Int(floor(hr))
+                        let w0 = Int(floor(wc))
+                        let h1 = min(h0 + 1, side - 1)
+                        let w1 = min(w0 + 1, side - 1)
+                        let dh = Float(hr - Double(h0))
+                        let dw = Float(wc - Double(w0))
+                        let w00 = (1 - dh) * (1 - dw)
+                        let w01 = (1 - dh) * dw
+                        let w10 = dh * (1 - dw)
+                        let w11 = dh * dw
+                        let p00 = pBase + (h0 * side + w0) * d
+                        let p01 = pBase + (h0 * side + w1) * d
+                        let p10 = pBase + (h1 * side + w0) * d
+                        let p11 = pBase + (h1 * side + w1) * d
+                        let out = hBase + p * d
+                        for j in 0..<d {
+                            out[j] += w00 * p00[j] + w01 * p01[j] + w10 * p10[j] + w11 * p11[j]
                         }
                     }
                 }

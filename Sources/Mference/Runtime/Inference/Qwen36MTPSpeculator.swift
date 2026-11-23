@@ -213,6 +213,11 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     private var pendingAcceptExpectedBonus: Int32 = -1
     private var pendingAcceptRCount: Int = 0
     private var emaPositionAccept: [Float] = [0.85, 0.75, 0.60, 0.45]
+    private var slowP0EMA: Float = 0.80
+    private var throttleCooldownRemaining: Int = 0
+    private var roundsSinceThrottleProbe: Int = 0
+    private var consecutiveK1Hits: Int = 0
+    private(set) var throttledTokensSkipped: Int = 0
 
     enum GenerationPhase: Equatable, Sendable {
         case thinking
@@ -333,12 +338,18 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         self.attnScale = config.attentionScale > 0 ? Float(config.attentionScale) : (1.0 / sqrtf(Float(headDim)))
         self.embedOutScale = config.embeddingScaledBySqrtHidden ? sqrtf(Float(d)) : 1.0
 
-        let specKEnv = ProcessInfo.processInfo.environment["MFERENCE_SPEC_K"]
-            ?? ProcessInfo.processInfo.environment["MFERENCE_MTP_K"]
-        let rawK = specKEnv.flatMap(Int.init) ?? 2
-        self.draftCount = min(Self.maxDraftSlots, max(1, rawK))
+        let env = ProcessInfo.processInfo.environment
+        let specKEnv = env["MFERENCE_SPEC_K"] ?? env["MFERENCE_MTP_K"]
+        let adaptiveEnv = env["MFERENCE_SPEC_ADAPTIVE"]
+        let explicitNumericK = specKEnv.flatMap(Int.init)
+        let cacheSlots = model.routedExpertCacheSlotCount(layer: 0)
+        let autoLowMemoryAdaptive = (explicitNumericK == nil)
+            && (adaptiveEnv != "0")
+            && (cacheSlots != nil && cacheSlots! <= 32 && config.numExperts >= 64)
+        self.draftCount = min(Self.maxDraftSlots, max(1, explicitNumericK ?? 2))
         self.adaptiveDraftEnabled = (specKEnv?.lowercased() == "auto")
-            || (ProcessInfo.processInfo.environment["MFERENCE_SPEC_ADAPTIVE"] == "1")
+            || (adaptiveEnv == "1")
+            || autoLowMemoryAdaptive
 
         let topKEnv = ProcessInfo.processInfo.environment["MFERENCE_MTP_TOP_K"].flatMap(Int.init)
         let resolvedDraftTopK: Int
@@ -450,6 +461,11 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         try? flushPendingAcceptIfNeeded()
         stats = MutableStats()
         emaPositionAccept = [0.85, 0.75, 0.60, 0.45]
+        slowP0EMA = 0.80
+        throttleCooldownRemaining = 0
+        roundsSinceThrottleProbe = 0
+        consecutiveK1Hits = 0
+        throttledTokensSkipped = 0
         currentPhase = .visibleProse
         insideToolCall = false
         insideCodeFence = false
@@ -468,6 +484,10 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         resetKVState()
         pending.removeAll(keepingCapacity: true)
         emaPositionAccept = [0.85, 0.75, 0.60, 0.45]
+        slowP0EMA = 0.80
+        throttleCooldownRemaining = 0
+        roundsSinceThrottleProbe = 0
+        consecutiveK1Hits = 0
         historyBasePosition = max(0, basePosition)
         tokenHistory = tokens
         recomputePhaseAndFenceState(boostEMA: true)
@@ -482,11 +502,17 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         case .thinking:
             break
         case .visibleProse:
+            throttleCooldownRemaining = 0
+            roundsSinceThrottleProbe = 0
+            slowP0EMA = max(slowP0EMA, 0.80)
             emaPositionAccept[0] = max(emaPositionAccept[0], 0.90)
             emaPositionAccept[1] = max(emaPositionAccept[1], 0.78)
             emaPositionAccept[2] = max(emaPositionAccept[2], 0.64)
             emaPositionAccept[3] = max(emaPositionAccept[3], 0.48)
         case .structuredCodeOrTool:
+            throttleCooldownRemaining = 0
+            roundsSinceThrottleProbe = 0
+            slowP0EMA = max(slowP0EMA, 0.80)
             emaPositionAccept[0] = max(emaPositionAccept[0], 0.94)
             emaPositionAccept[1] = max(emaPositionAccept[1], 0.86)
             emaPositionAccept[2] = max(emaPositionAccept[2], 0.74)
@@ -592,7 +618,9 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
     /// Selects draft depth `K` dynamically based on rolling per-position acceptance EMA,
     /// active generation phase (`.thinking`, `.visibleProse`, `.structuredCodeOrTool`),
     /// and the hardware/memory slot ceiling (`maxSlotSupportedK`).
-    func recommendedDraftCount(maxSlotSupportedK: Int = Qwen36MTPSpeculator.maxDraftSlots) -> Int {
+    func recommendedDraftCount(maxSlotSupportedK: Int = Qwen36MTPSpeculator.maxDraftSlots,
+                               lowMemorySlotProfile: Bool = false,
+                               allowThrottleToZero: Bool = false) -> Int {
         let cap = max(1, min(Self.maxDraftSlots, maxSlotSupportedK))
         guard adaptiveDraftEnabled else {
             return min(draftCount, cap)
@@ -600,6 +628,28 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         let p0 = emaPositionAccept[0]
         let p1 = emaPositionAccept[1]
         let p2 = emaPositionAccept[2]
+
+        if lowMemorySlotProfile {
+            if allowThrottleToZero {
+                if throttleCooldownRemaining > 0 {
+                    return 0
+                }
+                if stats.rounds >= 12 && roundsSinceThrottleProbe >= 8 && slowP0EMA < 0.50 {
+                    return 0
+                }
+            }
+            let k: Int
+            switch currentPhase {
+            case .structuredCodeOrTool:
+                k = (cap >= 2 && p0 >= 0.78 && p1 >= 0.56) ? 2 : 1
+            case .thinking:
+                k = (cap >= 2 && p0 >= 0.84 && p1 >= 0.62) ? 2 : 1
+            case .visibleProse:
+                k = (cap >= 2 && p0 >= 0.82 && p1 >= 0.62) ? 2 : 1
+            }
+            return min(k, cap)
+        }
+
         let k: Int
         switch currentPhase {
         case .structuredCodeOrTool:
@@ -622,9 +672,36 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         return min(k, cap)
     }
 
+    /// Resolves draft depth `K` and advances any active `K = 0` cooldown window.
+    func stepThrottleAndResolveDraftK(maxSlotSupportedK: Int,
+                                      lowMemorySlotProfile: Bool,
+                                      allowThrottleToZero: Bool) -> Int {
+        let k = recommendedDraftCount(maxSlotSupportedK: maxSlotSupportedK,
+                                      lowMemorySlotProfile: lowMemorySlotProfile,
+                                      allowThrottleToZero: allowThrottleToZero)
+        if k == 0 {
+            if throttleCooldownRemaining > 0 {
+                throttleCooldownRemaining -= 1
+                if throttleCooldownRemaining == 0 {
+                    slowP0EMA = max(slowP0EMA, 0.58)
+                    emaPositionAccept[0] = max(emaPositionAccept[0], 0.64)
+                    roundsSinceThrottleProbe = 0
+                }
+            } else {
+                throttleCooldownRemaining = 23
+            }
+            throttledTokensSkipped += 1
+            return 0
+        }
+        return k
+    }
+
     func prepareForContinuation(expectedPosition: Int) throws {
         try flushPendingAcceptIfNeeded()
         pending.removeAll(keepingCapacity: true)
+        throttleCooldownRemaining = 0
+        roundsSinceThrottleProbe = 0
+        consecutiveK1Hits = 0
         let relExpected = expectedPosition - historyBasePosition
         if relExpected <= 0 {
             tokenHistory.removeAll(keepingCapacity: true)
@@ -926,6 +1003,7 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
         }
 
         stats.rounds += 1
+        roundsSinceThrottleProbe += 1
         stats.draftedTokens += drafts.count
         stats.acceptedTokens += accepted
         stats.emittedTokens += emitted.count
@@ -933,6 +1011,9 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
             stats.rollbacks += 1
         }
         stats.verifyNanos += verifyNanos
+
+        let hit0: Float = (accepted > 0) ? 1.0 : 0.0
+        slowP0EMA = 0.94 * slowP0EMA + 0.06 * hit0
 
         let alpha: Float = 0.20
         for i in 0..<drafts.count {
@@ -947,9 +1028,21 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                 emaPositionAccept[i] = (1.0 - alpha) * emaPositionAccept[i] + alpha * hit
             }
         }
-        if accepted == drafts.count, drafts.count < emaPositionAccept.count {
-            let nextIdx = drafts.count
-            emaPositionAccept[nextIdx] = min(0.92, emaPositionAccept[nextIdx] + 0.10)
+        if drafts.count == 1 {
+            if accepted == 1 {
+                consecutiveK1Hits += 1
+                if emaPositionAccept[0] >= 0.84 && consecutiveK1Hits >= 3 {
+                    emaPositionAccept[1] = min(0.70, emaPositionAccept[1] + 0.03)
+                }
+            } else {
+                consecutiveK1Hits = 0
+            }
+        } else {
+            consecutiveK1Hits = 0
+            if accepted == drafts.count, drafts.count < emaPositionAccept.count {
+                let nextIdx = drafts.count
+                emaPositionAccept[nextIdx] = min(0.92, emaPositionAccept[nextIdx] + 0.10)
+            }
         }
     }
 
@@ -1385,24 +1478,22 @@ final class Qwen36MTPSpeculator: SpeculativeDrafter {
                                                      xStrideElements: d,
                                                      yStrideElements: d)
 
-        for r in 0..<rCount {
-            moe.encodeSlotMapGuardedFFN(commandBuffer: cb,
-                                        slab: slab,
-                                        slotOffsets: aSlotOffsets,
-                                        slotOffsetsOffset: r * draftTopK * u32Bytes,
-                                        allHit: aAllHit,
-                                        allHitOffset: 0,
-                                        routedOffsets: expertOffsets,
-                                        x: aMlpX, xOffset: r * dBytes,
-                                        acts: aMoeActs, actsOffset: r * draftTopK * moeF * halfBytes,
-                                        routingWeights: aRouteWeights, routingWeightsOffset: r * draftTopK * halfBytes,
-                                        residual: aH1, residualOffset: r * dBytes,
-                                        y: aH2, yOffset: r * dBytes,
-                                        hidden: aH, hiddenOffset: r * dBytes,
-                                        d: UInt32(d),
-                                        f: UInt32(moeF),
-                                        topK: UInt32(draftTopK))
-        }
+        moe.encodeSlotMapGuardedFFNBatch(commandBuffer: cb,
+                                         slab: slab,
+                                         slotOffsets: aSlotOffsets,
+                                         allHit: aAllHit,
+                                         allHitOffset: 0,
+                                         routedOffsets: expertOffsets,
+                                         x: aMlpX,
+                                         acts: aMoeActs,
+                                         routingWeights: aRouteWeights,
+                                         residual: aH1,
+                                         y: aH2,
+                                         hidden: aH,
+                                         d: UInt32(d),
+                                         f: UInt32(moeF),
+                                         topK: UInt32(draftTopK),
+                                         queryCount: rCount)
 
         let lastRowOffset = (rCount - 1) * dBytes
         rms.encodeBF16W(commandBuffer: cb,
