@@ -110,3 +110,51 @@ A few interesting systems problems we had to solve in pure Swift + Metal (buildi
 
 Everything compiles cleanly with Swift 6.1+ (`swift build -c release`) and ships with prebuilt Mference.app/CLI binaries, an OpenAI-compatible SwiftNIO server, CLI, and Open WebUI launcher. Happy to answer questions on the Metal kernels or surgery tradeoffs!
 ```
+
+---
+
+## 4. Qwen 3.6 Native Ephemeral Vision & Metal 4 Update
+
+### X Announcement Post (`@MferenceAI`)
+```text
+Mference 2.0 just added NATIVE EPHEMERAL VISION + VISUAL PDFs + Metal 4 acceleration for Qwen 3.6 35B-A3B on a 16 GB Mac 🧠👁️
+
+- `--attach-vision` streams 333 BF16 ViT tensors into `vision_weights.bin` (0 changes to INT4 surgery/MTP)
+- Mapped on demand via Metal 4 `matmul2d` (`vision.metal`) + AMX fallback, then immediately `munmap`ped before the 40-layer MoE trunk runs = 0 idle RAM overhead
+- Images & multi-page PDFs in `Mference.app`, OpenAI `/v1/chat/completions`, and CLI (`--image` / `--pdf`)
+- Plus lossless sampled MTP (64-TG GPU softmax) + hit/miss MoE verify pipelining
+
+Code & prebuilt v2.0.0 `.app`: https://github.com/fjw4cfv2fb-afk/Mference-2.0
+```
+
+### Updated Hacker News (`Show HN`)
+**Title:**
+> Show HN: Mference 2.0 – Qwen 3.6 35B-A3B + Vision in 16 GB RAM (Swift/Metal)
+
+**URL:** `https://github.com/fjw4cfv2fb-afk/Mference-2.0`
+
+**First Comment:**
+```text
+Hi HN — I wanted to run Qwen 3.6 35B-A3B (a 40-layer hybrid Gated-DeltaNet + full-attention MoE with 256 routed experts per layer, now with native ephemeral vision & visual PDFs) locally on a 16 GB Mac with zero swap thrashing and real coding/math accuracy.
+
+Repo: https://github.com/fjw4cfv2fb-afk/Mference-2.0
+Prebuilt macOS v2.0.0 binaries: https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0
+Hugging Face model card: https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
+Architecture & math writeup: https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
+
+A few interesting systems problems we had to solve in pure Swift + Metal (building on NeelM0906/Mference and TurboFieldfare):
+
+1. Speculative rollback across hybrid Gated-DeltaNet + Full Attention layers + sampled MTP:
+   Rewinding standard KV is just a cursor reset, but 30 of the 40 layers are linear GDN recurrent states. We capture a 4-slot GDN snapshot arena (plus an SSD-spilled GDN checkpoint ring) during the batched verify pass so rejecting a draft token restores the exact pre-rejection FP32 state without recomputing accepted tokens, supporting both bit-exact greedy verify and lossless sampled speculative decoding (64-TG GPU softmax, top-k 1...64).
+
+2. Lossless calibration of 4-bit weights ("weight surgery"):
+   On quantized Qwen 3.6, 6/8 tasks on our eval suite spun in <think> loops until hitting the token limit. Instead of re-quantizing or fine-tuning, we scale BF16 RMSNorms and BF16 group-64 affine scale/bias tables in place (since alpha * (s*q + b) = (alpha*s)*q + (alpha*b)), leaving the INT4 nibbles untouched and co-adapting the attached 19-tensor MTP drafter so draft/target calibration stays aligned. Pass@1 went from 25.0% (2/8) to 100.0% (8/8), averaging 16.47 tok/s decode (up to 18.36 tok/s on Swift coding, 83.1% MTP acceptance).
+
+3. Ephemeral 16 GB Vision & PDFs without idle RAM bloat:
+   `MferenceRepack --attach-vision` streams the 333 BF16 `vision_tower.*` tensors via HTTP Range requests into a standalone `vision_weights.bin` sidecar. When an image or PDF arrives (via Mference.app, OpenAI `image_url`/`file` parts, or CLI `--image`/`--pdf`), `Qwen36VisionEncoder` runs the 27-layer ViT + 2x2 merger on lazy-loaded Metal 4 `matmul2d` kernels (with Accelerate AMX fallback) and double-buffered `F_NOCACHE` pread staging, caches compact FP16 embeddings, and immediately `munmap`s the vision weights before the 40-layer MoE trunk prefill + 3D mRoPE indexing runs.
+
+4. 16 GB unified memory + kernel panic avoidance:
+   Bounded LFU/LRU expert slot caches (32–48 slots), Phase-1/Phase-2 hit/miss MoE verify pipelining with I/O-first ordering, POSIX_MADV_RANDOM slab-only mmap for MTP experts, async-pipelined accept passes, and single-pass 6-gram PLD over conversation history for verbatim code/tool blocks.
+
+Everything compiles cleanly with Swift 6.1+ (`swift build -c release`) and ships with prebuilt Mference.app/CLI binaries, an OpenAI-compatible SwiftNIO server, CLI, and Open WebUI launcher. Happy to answer questions on the Metal kernels, ephemeral ViT staging, or surgery tradeoffs!
+```

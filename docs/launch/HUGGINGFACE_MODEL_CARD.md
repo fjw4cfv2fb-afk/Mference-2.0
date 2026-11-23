@@ -15,6 +15,10 @@ tags:
   - weight-surgery
   - 4-bit
   - gturbo
+  - vision
+  - multimodal
+  - vlm
+  - pdf
 ---
 
 # Qwen3.6-35B-A3B-4bit-MTP-Surgery (.gturbo for Mference 2.0)
@@ -37,6 +41,11 @@ Run **[Qwen 3.6 35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (`40` hy
      - `--surgery-late-residual 0.98`
      - `--surgery-shared-expert 1.025 --surgery-shared-expert-start-ratio 0.5`
      - Automatic MTP co-adaptation (`coAdaptMTP = true`) on `mtp.norm.weight`, attention norms/output, router, and shared expert.
+
+3. **Optional Native Ephemeral Vision & Visual PDF Sidecar (`MferenceRepack --attach-vision`):**
+   - Run `.build/release/MferenceRepack --attach-vision --output scratch/qwen36-mtp.gturbo` to stream all `333` BF16 `vision_tower.*` tensors via HTTP Range requests into `vision_weights.bin` without modifying `model_weights.bin` or MTP/surgery calibration.
+   - `Qwen36VisionEncoder` executes the 27-layer ViT + `2×2` spatial merger using lazy-loaded Metal 4 `matmul2d` kernels (`vision.metal`) with automatic Accelerate AMX fallback and double-buffered `F_NOCACHE` `pread` staging, caches `[N_vis, 2048]` FP16 embeddings, and immediately `munmap`s `vision_weights.bin` before trunk prefill — zero idle RAM overhead for text prompts.
+   - Runtime also includes lossless sampled MTP speculative decoding (64-TG GPU softmax, `top-k` `1...64`), batched slot-map MoE verify with Phase-1/Phase-2 hit/miss pipelining, fused GDN verify updates, and an SSD-spilled GDN checkpoint ring.
 
 ## Measured A/B Benchmark Results (`16 GB Mac`, `32` Expert Cache Slots, `temp = 0`)
 
