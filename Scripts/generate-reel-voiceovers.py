@@ -121,6 +121,55 @@ REELS = [
             },
         ],
     },
+    {
+        "filename": "mference-reel-3-qwen-vision.mp4",
+        "scenes": [
+            {
+                "id": "reel3_c0",
+                "min_duration": 3.2,
+                "pad_after": 0.35,
+                "text": (
+                    "Qwen 3.6 35B just got native vision and PDF support on a sixteen gigabyte Mac—"
+                    "with zero extra idle RAM."
+                ),
+            },
+            {
+                "id": "reel3_c1",
+                "min_duration": 5.0,
+                "pad_after": 0.35,
+                "text": (
+                    "Three hundred thirty-three BF16 tensors stream via HTTP Range into a sidecar, "
+                    "map on demand, then munmap instantly before text generation runs."
+                ),
+            },
+            {
+                "id": "reel3_c2",
+                "min_duration": 4.8,
+                "pad_after": 0.35,
+                "text": (
+                    "The twenty-seven layer vision transformer runs on Metal 4 matmul2d Neural Accelerator kernels, "
+                    "with automatic Apple AMX CPU fallback."
+                ),
+            },
+            {
+                "id": "reel3_c3",
+                "min_duration": 4.5,
+                "pad_after": 0.35,
+                "text": (
+                    "Drop screenshots or multi-page PDFs into the Mac app, OpenAI API requests, "
+                    "or the command line with dash-dash image and PDF."
+                ),
+            },
+            {
+                "id": "reel3_c4",
+                "min_duration": 3.2,
+                "pad_after": 0.70,
+                "text": (
+                    "Pure Swift and Metal. Open source on GitHub today—check Mference 2.0, link in bio."
+                ),
+            },
+        ],
+    },
 ]
 
 

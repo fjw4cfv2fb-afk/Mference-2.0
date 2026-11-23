@@ -700,6 +700,158 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double, boundaries: [
     }
 }
 
+// MARK: - REEL 3: "Qwen 3.6 Native Ephemeral Vision + Visual PDFs on a 16 GB Mac"
+
+func renderReel3(_ ctx: CGContext, time: Double, duration: Double, boundaries: [Double]) {
+    let b = boundaries.count >= 6 ? boundaries : [0.0, 3.5, 9.0, 14.5, 19.5, duration]
+    drawBackground(ctx, time: time, duration: duration, subtitle: "NATIVE VISION + PDFs · METAL 4 + AMX")
+
+    if time < b[1] {
+        // SCENE 1: HOOK
+        let pChallenge = easeOutCubic(progressIn(time, b[0], 0.45))
+        let pHero = easeOutCubic(progressIn(time, b[0] + min(1.8, (b[1] - b[0]) * 0.28), 0.55))
+        let pPills = easeOutCubic(progressIn(time, b[0] + min(2.8, (b[1] - b[0]) * 0.45), 0.55))
+
+        drawRoundedRect(ctx, rect: CGRect(x: 72, y: 262, width: 880, height: 224), radius: 24, fill: cgColor(0x161B22, alpha: CGFloat(pChallenge)), stroke: cgColor(0xD29922, alpha: 0.55 * CGFloat(pChallenge)), lineWidth: 2.5)
+        drawText("THE 16 GB MULTIMODAL PROBLEM", rect: CGRect(x: 112, y: 294, width: 580, height: 28), size: 19, weight: .bold, colorHex: 0xD29922, alpha: CGFloat(pChallenge), mono: true)
+        drawText("Vision encoders usually pin gigabytes\nin RAM even for pure-text prompts.", rect: CGRect(x: 112, y: 340, width: 800, height: 116), size: 36, weight: .bold, colorHex: 0xC9D1D9, alpha: CGFloat(pChallenge), lineSpacing: 8)
+
+        drawText("↓", rect: CGRect(x: 72, y: 504, width: 880, height: 54), size: 46, weight: .black, colorHex: 0x3FB950, alpha: CGFloat(pHero), align: .center)
+
+        let heroY = 574 + CGFloat(1.0 - pHero) * 30
+        drawRoundedRect(ctx, rect: CGRect(x: 72, y: heroY, width: 880, height: 432), radius: 28, fill: cgColor(0x161B22, alpha: CGFloat(pHero)), stroke: cgColor(0x3FB950, alpha: 0.75 * CGFloat(pHero)), lineWidth: 3.0)
+        drawSingleLineBadge(ctx, text: "NEW IN MFERENCE 2.0", x: 112, y: heroY + 36, width: 300, height: 42, bgHex: 0x238636, bgAlpha: 0.25, borderHex: 0x3FB950, textHex: 0x3FB950, fontSize: 18, mono: true, alpha: CGFloat(pHero))
+        drawText("Qwen 3.6 35B\nNative Vision +\nVisual PDFs.", rect: CGRect(x: 112, y: heroY + 98, width: 800, height: 244), size: 58, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(pHero), lineSpacing: 6)
+        drawText("Zero idle RAM overhead  ·  16 GB unified memory safe", rect: CGRect(x: 112, y: heroY + 364, width: 800, height: 34), size: 22, weight: .semibold, colorHex: 0x58A6FF, alpha: CGFloat(pHero), mono: true)
+
+        let pills: [(String, UInt32)] = [
+            ("333 BF16 ViT Tensors", 0x58A6FF),
+            ("27-Layer + 2x2 Merger", 0xD2A8FF),
+            ("Metal 4 matmul2d + AMX", 0x3FB950),
+            ("Images & Multi-Page PDFs", 0xE6EDF3),
+        ]
+        for (i, item) in pills.enumerated() {
+            let col = i % 2
+            let row = i / 2
+            let px: CGFloat = col == 0 ? 72 : 524
+            let py: CGFloat = 1048 + CGFloat(row) * 96
+            drawRoundedRect(ctx, rect: CGRect(x: px, y: py, width: 428, height: 76), radius: 18, fill: cgColor(0x161B22, alpha: CGFloat(pPills)), stroke: cgColor(0x30363D, alpha: CGFloat(pPills)), lineWidth: 2.0)
+            drawText(item.0, rect: CGRect(x: px + 18, y: py + 21, width: 392, height: 36), size: 23, weight: .bold, colorHex: item.1, alpha: CGFloat(pPills), mono: true, align: .center)
+        }
+    } else if time < b[2] {
+        // SCENE 2: EPHEMERAL 16 GB LIFECYCLE
+        let lt = time - b[1]
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.4))
+        let s1 = easeOutCubic(progressIn(lt, 0.35, 0.45))
+        let s2 = easeOutCubic(progressIn(lt, 1.35, 0.45))
+        let s3 = easeOutCubic(progressIn(lt, 2.35, 0.45))
+        let s4 = easeOutCubic(progressIn(lt, 3.35, 0.45))
+
+        drawText("Ephemeral Sidecar Pipeline", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 44, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
+        drawText("Map on demand -> encode visual embeddings -> munmap immediately", rect: CGRect(x: 72, y: 306, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
+
+        let stages: [(String, String, String, UInt32, Double)] = [
+            ("01 · STREAM SIDECAR", "MferenceRepack --attach-vision", "HTTP Range coalesced download of 333 BF16 vision_tower.* tensors -> vision_weights.bin (0 changes to MTP/surgery).", 0x58A6FF, s1),
+            ("02 · DEMAND-PAGED PREAD", "mmap + F_NOCACHE + Double Buffer", "vision_weights.bin is opened only when an uncached image/PDF arrives — never loaded on text-only prompts.", 0xD2A8FF, s2),
+            ("03 · COMPACT FP16 EMBEDDINGS", "[N_vis, 2048] FP16 + .vpatch Cache", "ImageIO smart_resize (factor=32) + SHA-256 deduplication across Mference.app & MferenceDecodeService.", 0x3FB950, s3),
+            ("04 · INSTANT MUNMAP BEFORE MOE", "munmap(vision_weights.bin)", "Frees all ViT transient scratch & weight mappings BEFORE the 40-layer MoE trunk prefill + 3D mRoPE begins.", 0x3FB950, s4),
+        ]
+
+        for (i, st) in stages.enumerated() {
+            let cy = 374 + CGFloat(i) * 268
+            let a = CGFloat(st.4)
+            drawRoundedRect(ctx, rect: CGRect(x: 72, y: cy, width: 880, height: 240), radius: 22, fill: cgColor(0x161B22, alpha: a), stroke: cgColor(st.3, alpha: 0.6 * a), lineWidth: 2.5)
+            drawText(st.0, rect: CGRect(x: 112, y: cy + 24, width: 720, height: 28), size: 18, weight: .bold, colorHex: st.3, alpha: a, mono: true)
+            drawText(st.1, rect: CGRect(x: 112, y: cy + 60, width: 800, height: 42), size: 30, weight: .heavy, colorHex: 0xF0F6FC, alpha: a, mono: true)
+            drawText(st.2, rect: CGRect(x: 112, y: cy + 114, width: 800, height: 100), size: 22, weight: .medium, colorHex: 0xC9D1D9, alpha: a, lineSpacing: 5)
+        }
+    } else if time < b[3] {
+        // SCENE 3: METAL 4 + AMX KERNELS + SAMPLED MTP
+        let lt = time - b[2]
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.4))
+        let kFade = easeOutCubic(progressIn(lt, 0.5, 0.5))
+        let pFade = easeOutCubic(progressIn(lt, 2.0, 0.5))
+
+        drawText("Metal 4 Vision + AMX", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 46, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter))
+        drawText("Lazy-loaded vision.metal library + latest speculative runtime upgrades", rect: CGRect(x: 72, y: 306, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(enter))
+
+        // vision.metal card
+        drawRoundedRect(ctx, rect: CGRect(x: 72, y: 374, width: 880, height: 536), radius: 24, fill: cgColor(0x161B22, alpha: CGFloat(kFade)), stroke: cgColor(0x388BFD, alpha: 0.65 * CGFloat(kFade)), lineWidth: 2.5)
+        drawText("SOURCES/MFERENCE/METAL/VISION/VISION.METAL", rect: CGRect(x: 112, y: 408, width: 740, height: 28), size: 18, weight: .bold, colorHex: 0x58A6FF, alpha: CGFloat(kFade), mono: true)
+        drawText("27-Layer ViT (1152-d, 16 heads) + 2×2 Spatial Merger", rect: CGRect(x: 112, y: 446, width: 800, height: 42), size: 27, weight: .bold, colorHex: 0xF0F6FC, alpha: CGFloat(kFade))
+
+        let kernels: [(String, String)] = [
+            ("mpp_vision_bf16_gemm_f32", "Metal 4 matmul2d Neural Accelerator + fused bias/GELU/res"),
+            ("vision_layernorm_f32", "FP32 layer normalization inside threadgroup tiles"),
+            ("vision_rope_2d_f32", "2D spatial rotary embeddings for patch geometry"),
+            ("vision_attention_f32", "Multi-head self-attention -> [N_vis, 2048] FP16"),
+        ]
+        for (i, k) in kernels.enumerated() {
+            let ky = 514 + CGFloat(i) * 86
+            drawRoundedRect(ctx, rect: CGRect(x: 112, y: ky, width: 800, height: 70), radius: 14, fill: cgColor(0x0D1117, alpha: CGFloat(kFade)), stroke: cgColor(0x30363D, alpha: CGFloat(kFade)), lineWidth: 1.5)
+            drawText(k.0, rect: CGRect(x: 132, y: ky + 10, width: 760, height: 26), size: 20, weight: .bold, colorHex: 0x79C0FF, alpha: CGFloat(kFade), mono: true)
+            drawText(k.1, rect: CGRect(x: 132, y: ky + 38, width: 760, height: 24), size: 17, weight: .medium, colorHex: 0xC9D1D9, alpha: CGFloat(kFade))
+        }
+        drawSingleLineBadge(ctx, text: "AUTO FALLBACK: Accelerate AMX (cblas_sgemm) on Metal 3 Macs", x: 112, y: 856, width: 800, height: 36, bgHex: 0x238636, bgAlpha: 0.25, borderHex: 0x3FB950, textHex: 0x3FB950, fontSize: 16.5, mono: true, alpha: CGFloat(kFade))
+
+        // Sampled MTP + Hit/Miss card below
+        drawRoundedRect(ctx, rect: CGRect(x: 72, y: 944, width: 880, height: 484), radius: 24, fill: cgColor(0x161B22, alpha: CGFloat(pFade)), stroke: cgColor(0xA371F7, alpha: 0.65 * CGFloat(pFade)), lineWidth: 2.5)
+        drawText("RUNTIME SPECULATIVE + I/O ACCELERATION", rect: CGRect(x: 112, y: 978, width: 700, height: 28), size: 18, weight: .bold, colorHex: 0xD2A8FF, alpha: CGFloat(pFade), mono: true)
+        let upgrades: [(String, String, UInt32)] = [
+            ("64-TG GPU Softmax Sampled MTP", "Lossless speculative verify at temp > 0 & top-k 1...64", 0x3FB950),
+            ("Phase-1 / Phase-2 Hit-Miss Verify", "Zero-spill slot-map MoE verify with I/O-first miss ordering", 0x58A6FF),
+            ("Fused GDN Verify + SSD Ring", "Multi-token Gated-DeltaNet tail updates + checkpoint spill", 0xD2A8FF),
+        ]
+        for (i, u) in upgrades.enumerated() {
+            let uy = 1028 + CGFloat(i) * 126
+            drawRoundedRect(ctx, rect: CGRect(x: 112, y: uy, width: 800, height: 106), radius: 16, fill: cgColor(0x0D1117, alpha: CGFloat(pFade)), stroke: cgColor(0x30363D, alpha: CGFloat(pFade)), lineWidth: 1.5)
+            drawText(u.0, rect: CGRect(x: 134, y: uy + 18, width: 756, height: 34), size: 26, weight: .bold, colorHex: u.2, alpha: CGFloat(pFade))
+            drawText(u.1, rect: CGRect(x: 134, y: uy + 60, width: 756, height: 30), size: 20, weight: .medium, colorHex: 0xC9D1D9, alpha: CGFloat(pFade))
+        }
+    } else if time < b[4] {
+        // SCENE 4: IMAGES + PDFs EVERYWHERE
+        let lt = time - b[3]
+        let c1 = easeOutCubic(progressIn(lt, 0.0, 0.45))
+        let c2 = easeOutCubic(progressIn(lt, 0.9, 0.45))
+        let c3 = easeOutCubic(progressIn(lt, 1.8, 0.45))
+
+        drawText("Images & PDFs Everywhere", rect: CGRect(x: 72, y: 244, width: 880, height: 56), size: 46, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(c1))
+        drawText("Every frontend shares the same ephemeral ViT + mRoPE runtime", rect: CGRect(x: 72, y: 306, width: 880, height: 34), size: 21, weight: .medium, colorHex: 0x8B949E, alpha: CGFloat(c1))
+
+        let endpoints: [(String, String, String, UInt32, Double)] = [
+            ("01 · NATIVE MACOS APP", "Mference.app (PromptComposerView)", "Drag & drop PNG/JPEG screenshots or multi-page PDFs (up to 64 pages) into native chat bubbles.", 0x58A6FF, c1),
+            ("02 · OPENAI HTTP/SSE API", "POST /v1/chat/completions", "Standard multimodal parts: image_url, input_image, base64 data: URIs, and PDF file/file_data parts.", 0x3FB950, c2),
+            ("03 · COMMAND-LINE RUNNER", "MferenceCLI --image / --pdf", "MferenceCLI --model scratch/qwen36-mtp.gturbo \\\n  --pdf paper.pdf --prompt \"Summarize figures\"", 0xD2A8FF, c3),
+        ]
+        for (i, ep) in endpoints.enumerated() {
+            let cy = 382 + CGFloat(i) * 340
+            let a = CGFloat(ep.4)
+            drawRoundedRect(ctx, rect: CGRect(x: 72, y: cy, width: 880, height: 304), radius: 24, fill: cgColor(0x161B22, alpha: a), stroke: cgColor(ep.3, alpha: 0.65 * a), lineWidth: 2.5)
+            drawText(ep.0, rect: CGRect(x: 112, y: cy + 32, width: 640, height: 28), size: 19, weight: .bold, colorHex: ep.3, alpha: a, mono: true)
+            drawText(ep.1, rect: CGRect(x: 112, y: cy + 74, width: 800, height: 48), size: 36, weight: .heavy, colorHex: 0xF0F6FC, alpha: a)
+            drawRoundedRect(ctx, rect: CGRect(x: 112, y: cy + 144, width: 800, height: 122), radius: 16, fill: cgColor(0x0D1117, alpha: a), stroke: cgColor(0x30363D, alpha: a), lineWidth: 1.5)
+            drawText(ep.2, rect: CGRect(x: 136, y: cy + 166, width: 752, height: 84), size: 22, weight: .semibold, colorHex: 0xC9D1D9, alpha: a, mono: i == 2, lineSpacing: 6)
+        }
+    } else {
+        // SCENE 5: CTA
+        let lt = time - b[4]
+        let enter = easeOutCubic(progressIn(lt, 0.0, 0.45))
+
+        drawMetallicEmblem(ctx, x: 422, y: 316, size: 180, alpha: CGFloat(enter))
+        drawText("Mference 2.0", rect: CGRect(x: 72, y: 540, width: 880, height: 92), size: 78, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), align: .center)
+        drawText("Qwen 3.6 35B + Native Ephemeral Vision", rect: CGRect(x: 72, y: 644, width: 880, height: 48), size: 31, weight: .semibold, colorHex: 0xC9D1D9, alpha: CGFloat(enter), align: .center)
+
+        drawRoundedRect(ctx, rect: CGRect(x: 96, y: 742, width: 832, height: 340), radius: 26, fill: cgColor(0x161B22, alpha: CGFloat(enter)), stroke: cgColor(0x388BFD, alpha: 0.6 * CGFloat(enter)), lineWidth: 3.0)
+        drawSingleLineBadge(ctx, text: "PURE SWIFT + METAL  ·  16 GB MAC", x: 186, y: 784, width: 652, height: 50, bgHex: 0x238636, bgAlpha: 0.25, borderHex: 0x3FB950, textHex: 0x3FB950, fontSize: 21, mono: true, alpha: CGFloat(enter))
+        drawText("Attach Vision to Any Qwen 3.6\n.gturbo Install in Seconds", rect: CGRect(x: 126, y: 866, width: 772, height: 96), size: 34, weight: .bold, colorHex: 0xF0F6FC, alpha: CGFloat(enter), align: .center, lineSpacing: 8)
+        drawText("MferenceRepack --attach-vision --output ...", rect: CGRect(x: 112, y: 996, width: 800, height: 44), size: 22, weight: .bold, colorHex: 0x58A6FF, alpha: CGFloat(enter), mono: true, align: .center)
+
+        drawRoundedRect(ctx, rect: CGRect(x: 96, y: 1134, width: 832, height: 140), radius: 24, fill: cgColor(0x1F6FEB, alpha: 0.20 * CGFloat(enter)), stroke: cgColor(0x58A6FF, alpha: 0.75 * CGFloat(enter)), lineWidth: 2.5)
+        drawText("GITHUB REPO  ·  LINK IN BIO", rect: CGRect(x: 126, y: 1158, width: 772, height: 30), size: 19, weight: .bold, colorHex: 0x58A6FF, alpha: CGFloat(enter), mono: true, align: .center, letterSpacing: 1.5)
+        drawText("fjw4cfv2fb-afk / Mference-2.0", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
+    }
+}
+
 // MARK: - WAV Reader & Procedural Dark-Tech Synthesizer + Voiceover Ducking (44.1 kHz Stereo)
 
 func loadMonoWAVSamples(path: String) -> [Double] {
@@ -1210,6 +1362,13 @@ func main() throws {
             defaultBoundaries: [0.0, 2.5, 6.5, 11.5, 15.0, 17.0],
             manifest: manifest,
             renderer: renderReel2
+        ),
+        makeSpec(
+            filename: "mference-reel-3-qwen-vision.mp4",
+            prefix: "reel3",
+            defaultBoundaries: [0.0, 3.5, 9.0, 14.5, 19.5, 24.0],
+            manifest: manifest,
+            renderer: renderReel3
         ),
     ]
 
