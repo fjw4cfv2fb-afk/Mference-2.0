@@ -25,7 +25,7 @@ tags:
 
 *Hugging Face Repository:* **[`voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo`](https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo)**
 
-Run **[Qwen 3.6 35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (`40` hybrid Gated-DeltaNet + full-attention layers, `256` experts/layer, `top-8` routed + shared expert) on a **16 GB unified-memory Apple Silicon Mac** at **`100.0% (8/8)` Pass@1** and up to **`18.36 tok/s`** decode in pure **Swift 6.1 + Metal 3** via **[Mference 2.0](https://github.com/fjw4cfv2fb-afk/Mference-2.0)**.
+Run **[Qwen 3.6 35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (`40` hybrid Gated-DeltaNet + full-attention layers, `256` experts/layer, `top-8` routed + shared expert) on a **16 GB unified-memory Apple Silicon Mac** at **`100.0% (8/8)` Pass@1** and up to **`18.36 tok/s`** decode in pure **Swift 6.1 + Metal 3** via **[Mference 2.0](https://github.com/mference-ai/Mference)**.
 
 ## What Makes This Conversion Different?
 
@@ -49,7 +49,7 @@ Run **[Qwen 3.6 35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)** (`40` hy
 
 ## Measured A/B Benchmark Results (`16 GB Mac`, `32` Expert Cache Slots, `temp = 0`)
 
-From [`benchmarks/aa-scorecard-v2.json`](https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/benchmarks/aa-scorecard-v2.json) across 8 Coding (Python/Swift), Math/Physics (AIME/GPQA), Instruction Following (IFBench), and Tool-Calling tasks:
+From [`benchmarks/aa-scorecard-v2.json`](https://github.com/mference-ai/Mference/blob/main/benchmarks/aa-scorecard-v2.json) across 8 Coding (Python/Swift), Math/Physics (AIME/GPQA), Instruction Following (IFBench), and Tool-Calling tasks:
 
 | Metric | Raw INT4 Baseline | Mference 2.0 (Surgery + Hybrid MTP) | Impact |
 | :--- | ---: | ---: | :--- |
@@ -62,15 +62,15 @@ From [`benchmarks/aa-scorecard-v2.json`](https://github.com/fjw4cfv2fb-afk/Mfere
 ## One-Command Local Install & Run (Mference 2.0)
 
 ```bash
-git clone https://github.com/fjw4cfv2fb-afk/Mference-2.0.git && cd Mference-2.0
+git clone https://github.com/mference-ai/Mference.git && cd Mference-2.0
 ./mference-ui.sh install qwen36-mtp   # streams 4-bit base + guru87 MTP shard + applies lossless surgery
 ./mference-ui.sh                      # starts OpenAI server (:8080) + Open WebUI (:3000)
 ```
 
-Or install the prebuilt `Mference.app` from **[Release v2.1.0](https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.1.0)**.
+Or install the prebuilt `Mference.app` from **[Release v2.1.0](https://github.com/mference-ai/Mference/releases/tag/v2.1.0)**.
 
 ## Acknowledgments & Licensing
 
 - Base Model: [`Qwen/Qwen3.6-35B-A3B`](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) (Qwen Apache-2.0 / Qwen License) & [`mlx-community/Qwen3.6-35B-A3B-4bit`](https://huggingface.co/mlx-community/Qwen3.6-35B-A3B-4bit)
 - MTP Draft Sidecar: [`guru87/Qwen3.6-35B-A3B-MTP`](https://huggingface.co/guru87/Qwen3.6-35B-A3B-MTP)
-- Runtime: [Mference 2.0](https://github.com/fjw4cfv2fb-afk/Mference-2.0) (forked from [`NeelM0906/Mference`](https://github.com/NeelM0906/Mference), derived from [`TurboFieldfare`](https://github.com/drumih/turbo-fieldfare))
+- Runtime: [Mference 2.0](https://github.com/mference-ai/Mference) (forked from [`NeelM0906/Mference`](https://github.com/NeelM0906/Mference), derived from [`TurboFieldfare`](https://github.com/drumih/turbo-fieldfare))

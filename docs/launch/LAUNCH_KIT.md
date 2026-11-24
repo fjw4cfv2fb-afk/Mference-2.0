@@ -19,7 +19,7 @@ Attach [`docs/assets/mference-live-demo.png`](../assets/mference-live-demo.png) 
 ### Post 1 (The Hook + Demo)
 > I got Qwen 3.6 35B-A3B (4-bit, 256 MoE experts) running at **100% Pass@1 (8/8)** and up to **18.36 tok/s** on a **16 GB Mac** — in pure Swift 6.1 + Metal 3, streaming experts from NVMe with zero Python in inference.
 >
-> Prebuilt `.app` (v2.0.0) + code: https://github.com/fjw4cfv2fb-afk/Mference-2.0
+> Prebuilt `.app` (v2.0.0) + code: https://github.com/mference-ai/Mference
 >
 > 🧵 How it works 👇
 
@@ -44,7 +44,7 @@ Attach [`docs/assets/mference-live-demo.png`](../assets/mference-live-demo.png) 
 >
 > cc `@awnihannun` `@Alibaba_Qwen` `@JustinLin610` `@simonw` `@ggerganov`
 >
-> Full architecture writeup: https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
+> Full architecture writeup: https://github.com/mference-ai/Mference/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
 > Hugging Face card: https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
 
 ---
@@ -58,8 +58,8 @@ Attach [`docs/assets/mference-live-demo.png`](../assets/mference-live-demo.png) 
 ```markdown
 Built **Mference 2.0** (building on `NeelM0906/Mference` and `drumih/turbo-fieldfare`) to run **Qwen 3.6 35B-A3B (4-bit, 256 experts)** comfortably on a **16 GB unified-memory Mac** — without quantization collapse or swap storms.
 
-* Repo: https://github.com/fjw4cfv2fb-afk/Mference-2.0
-* Prebuilt `v2.0.0` macOS `.app` + CLI binaries: https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0
+* Repo: https://github.com/mference-ai/Mference
+* Prebuilt `v2.0.0` macOS `.app` + CLI binaries: https://github.com/mference-ai/Mference/releases/tag/v2.0.0
 * Hugging Face Model Card (`voodmany`): https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
 
 ### Results on a 16 GB Mac (8-task Coding / AIME Math / GPQA / IFBench / Tool-Call suite, `temp=0`, `32` expert cache slots)
@@ -86,16 +86,16 @@ Hardware reports welcome in GitHub Discussions! Repro benchmark harness (`Script
 **Title:**
 > Show HN: Mference 2.0 – Qwen 3.6 35B-A3B in 16 GB RAM (Swift/Metal, SSD MoE + MTP)
 
-**URL:** `https://github.com/fjw4cfv2fb-afk/Mference-2.0`
+**URL:** `https://github.com/mference-ai/Mference`
 
 **First Comment:**
 ```text
 Hi HN — I wanted to run Qwen 3.6 35B-A3B (a 40-layer hybrid Gated-DeltaNet + full-attention MoE with 256 routed experts per layer) locally on a 16 GB Mac with zero swap thrashing and real coding/math accuracy.
 
-Repo: https://github.com/fjw4cfv2fb-afk/Mference-2.0
-Prebuilt macOS v2.0.0 binaries: https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0
+Repo: https://github.com/mference-ai/Mference
+Prebuilt macOS v2.0.0 binaries: https://github.com/mference-ai/Mference/releases/tag/v2.0.0
 Hugging Face model card: https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
-Architecture & math writeup: https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
+Architecture & math writeup: https://github.com/mference-ai/Mference/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
 
 A few interesting systems problems we had to solve in pure Swift + Metal (building on NeelM0906/Mference and TurboFieldfare):
 
@@ -124,23 +124,23 @@ Mference 2.0 just added NATIVE EPHEMERAL VISION + VISUAL PDFs + Metal 4 accelera
 - Images & multi-page PDFs in `Mference.app`, OpenAI `/v1/chat/completions`, and CLI (`--image` / `--pdf`)
 - Plus lossless sampled MTP (64-TG GPU softmax) + hit/miss MoE verify pipelining
 
-Code & prebuilt v2.0.0 `.app`: https://github.com/fjw4cfv2fb-afk/Mference-2.0
+Code & prebuilt v2.0.0 `.app`: https://github.com/mference-ai/Mference
 ```
 
 ### Updated Hacker News (`Show HN`)
 **Title:**
 > Show HN: Mference 2.0 – Qwen 3.6 35B-A3B + Vision in 16 GB RAM (Swift/Metal)
 
-**URL:** `https://github.com/fjw4cfv2fb-afk/Mference-2.0`
+**URL:** `https://github.com/mference-ai/Mference`
 
 **First Comment:**
 ```text
 Hi HN — I wanted to run Qwen 3.6 35B-A3B (a 40-layer hybrid Gated-DeltaNet + full-attention MoE with 256 routed experts per layer, now with native ephemeral vision & visual PDFs) locally on a 16 GB Mac with zero swap thrashing and real coding/math accuracy.
 
-Repo: https://github.com/fjw4cfv2fb-afk/Mference-2.0
-Prebuilt macOS v2.0.0 binaries: https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0
+Repo: https://github.com/mference-ai/Mference
+Prebuilt macOS v2.0.0 binaries: https://github.com/mference-ai/Mference/releases/tag/v2.0.0
 Hugging Face model card: https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo
-Architecture & math writeup: https://github.com/fjw4cfv2fb-afk/Mference-2.0/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
+Architecture & math writeup: https://github.com/mference-ai/Mference/blob/main/MTP_WEIGHT_SURGERY_AND_ARCHITECTURE.md
 
 A few interesting systems problems we had to solve in pure Swift + Metal (building on NeelM0906/Mference and TurboFieldfare):
 

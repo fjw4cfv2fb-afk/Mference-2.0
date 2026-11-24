@@ -270,7 +270,7 @@ func drawBackground(_ ctx: CGContext, time: Double, duration: Double, subtitle: 
 
     // Safe bottom watermark above IG captions
     drawText(
-        "github.com/fjw4cfv2fb-afk/Mference-2.0  ·  Apache-2.0 / MIT",
+        "github.com/mference-ai/Mference  ·  Apache-2.0 / MIT",
         rect: CGRect(x: 72, y: 1500, width: 880, height: 32),
         size: 19,
         weight: .semibold,
@@ -559,7 +559,7 @@ func renderReel1(_ ctx: CGContext, time: Double, duration: Double, boundaries: [
 
         drawRoundedRect(ctx, rect: CGRect(x: 96, y: 1134, width: 832, height: 140), radius: 24, fill: cgColor(0x1F6FEB, alpha: 0.20 * CGFloat(enter)), stroke: cgColor(0x58A6FF, alpha: 0.75 * CGFloat(enter)), lineWidth: 2.5)
         drawText("GITHUB REPO  ·  LINK IN BIO", rect: CGRect(x: 126, y: 1158, width: 772, height: 30), size: 19, weight: .bold, colorHex: 0x58A6FF, alpha: CGFloat(enter), mono: true, align: .center, letterSpacing: 1.5)
-        drawText("fjw4cfv2fb-afk / Mference-2.0", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
+        drawText("mference-ai / Mference", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
     }
 }
 
@@ -696,7 +696,7 @@ func renderReel2(_ ctx: CGContext, time: Double, duration: Double, boundaries: [
 
         drawRoundedRect(ctx, rect: CGRect(x: 96, y: 1134, width: 832, height: 140), radius: 24, fill: cgColor(0x1F6FEB, alpha: 0.20 * CGFloat(enter)), stroke: cgColor(0x58A6FF, alpha: 0.75 * CGFloat(enter)), lineWidth: 2.5)
         drawText("GITHUB REPO  ·  LINK IN BIO", rect: CGRect(x: 126, y: 1158, width: 772, height: 30), size: 19, weight: .bold, colorHex: 0x58A6FF, alpha: CGFloat(enter), mono: true, align: .center, letterSpacing: 1.5)
-        drawText("fjw4cfv2fb-afk / Mference-2.0", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
+        drawText("mference-ai / Mference", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
     }
 }
 
@@ -848,7 +848,7 @@ func renderReel3(_ ctx: CGContext, time: Double, duration: Double, boundaries: [
 
         drawRoundedRect(ctx, rect: CGRect(x: 96, y: 1134, width: 832, height: 140), radius: 24, fill: cgColor(0x1F6FEB, alpha: 0.20 * CGFloat(enter)), stroke: cgColor(0x58A6FF, alpha: 0.75 * CGFloat(enter)), lineWidth: 2.5)
         drawText("GITHUB REPO  ·  LINK IN BIO", rect: CGRect(x: 126, y: 1158, width: 772, height: 30), size: 19, weight: .bold, colorHex: 0x58A6FF, alpha: CGFloat(enter), mono: true, align: .center, letterSpacing: 1.5)
-        drawText("fjw4cfv2fb-afk / Mference-2.0", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
+        drawText("mference-ai / Mference", rect: CGRect(x: 126, y: 1200, width: 772, height: 48), size: 34, weight: .heavy, colorHex: 0xF0F6FC, alpha: CGFloat(enter), mono: true, align: .center)
     }
 }
 
