@@ -67,7 +67,7 @@ git clone https://github.com/fjw4cfv2fb-afk/Mference-2.0.git && cd Mference-2.0
 ./mference-ui.sh                      # starts OpenAI server (:8080) + Open WebUI (:3000)
 ```
 
-Or install the prebuilt `Mference.app` from **[Release v2.0.0](https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0)**.
+Or install the prebuilt `Mference.app` from **[Release v2.1.0](https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.1.0)**.
 
 ## Acknowledgments & Licensing
 

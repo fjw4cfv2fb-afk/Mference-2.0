@@ -14,7 +14,7 @@
   <img alt="Swift 6.1 or later" src="https://img.shields.io/badge/Swift-6.1%2B-F05138?logo=swift&logoColor=white">
   <img alt="Metal 3 or later" src="https://img.shields.io/badge/Metal-3%2B-5E5CE6">
   <img alt="macOS 15 or later" src="https://img.shields.io/badge/macOS-15%2B-000000?logo=apple&logoColor=white">
-  <a href="https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0"><img alt="Release v2.0.0" src="https://img.shields.io/badge/Release-v2.0.0-3fb950?logo=github"></a>
+  <a href="https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.1.0"><img alt="Release v2.1.0" src="https://img.shields.io/badge/Release-v2.1.0-3fb950?logo=github"></a>
   <a href="https://huggingface.co/voodmany/Qwen3.6-35B-A3B-4bit-MTP-Surgery-GTurbo"><img alt="Hugging Face Model Card" src="https://img.shields.io/badge/Hugging%20Face-Model%20Card-FFD21E?logo=huggingface&logoColor=000"></a>
   <a href="https://github.com/fjw4cfv2fb-afk/Mference-2.0/discussions"><img alt="GitHub Discussions" src="https://img.shields.io/badge/Discussions-Community-8957e5?logo=github"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/License-MIT-2ea44f"></a>
@@ -170,7 +170,7 @@ Defined in [`Package.swift`](Package.swift):
 
 ## Try it
 
-Prebuilt binaries for Apple Silicon Macs (`arm64`, macOS 15+, Metal 3/4) are available on the **[v2.0.0 Releases page](https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.0.0)** (`Mference.app` + CLI/Server/Repack binaries), or you can build from source with Swift 6.1+. Install [`uv`](https://github.com/astral-sh/uv) (`brew install uv`) only if you want the Open WebUI browser UI; CLI, `Mference.app`, `MferenceServer`, and DeepSeek Harness need no Python.
+Prebuilt binaries for Apple Silicon Macs (`arm64`, macOS 15+, Metal 3/4) are available on the **[v2.1.0 Releases page](https://github.com/fjw4cfv2fb-afk/Mference-2.0/releases/tag/v2.1.0)** (`Mference.app` + CLI/Server/Repack binaries), or you can build from source with Swift 6.1+. Install [`uv`](https://github.com/astral-sh/uv) (`brew install uv`) only if you want the Open WebUI browser UI; CLI, `Mference.app`, `MferenceServer`, and DeepSeek Harness need no Python.
 
 ```bash
 git clone https://github.com/fjw4cfv2fb-afk/Mference-2.0.git
